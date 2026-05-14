@@ -4,7 +4,7 @@ The L1 layer of the four-project stack. Holds the Substrate-based blockchain (NR
 
 ## Status
 
-**PAUSED.** Extracted from `Prithvi-/` on 2026-05-14 for architectural hygiene. Active development resumes when Sthambha (L3) fabric Mode C is operational — that's when the network actually has untrusted peers to economize over.
+**PAUSED.** Extracted from `prithvi/` on 2026-05-14 for architectural hygiene. Active development resumes when Sthambha (L3) fabric Mode C is operational — that's when the network actually has untrusted peers to economize over.
 
 ## Where Neuron sits
 
@@ -13,7 +13,7 @@ The L1 layer of the four-project stack. Holds the Substrate-based blockchain (NR
 | **L1** | **Neuron** *(this repo)* | Chain & economic substrate (NRN token, on-chain accounting, validator) |
 | L2 | [Nakshatra](https://github.com/fthrvi/nakshatra) | Distributed inference engine |
 | L3 | [Sthambha](https://github.com/fthrvi/sthambha) | Substrate (registry, identity, fabric, layer cache) |
-| L4 | [Prithvi](https://github.com/fthrvi/Prithvi-) | Agent / consciousness / voice |
+| L4 | [Prithvi](https://github.com/fthrvi/prithvi) | Agent / consciousness / voice |
 
 ## Repo layout
 

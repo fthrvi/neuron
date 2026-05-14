@@ -4,14 +4,14 @@
 
 Neuron is the **L1 chain & economic substrate** in a four-project architecture. Holds the Substrate blockchain (FRAME pallets, NRN token, on-chain accounting) plus the Python-side chain integration that other layers (Nakshatra workers, Prithvi gateway) talk to.
 
-**Status:** PAUSED at the project level. Extracted from `Prithvi-/` on 2026-05-14 for architectural hygiene. Active development resumes when Sthambha (L3) fabric Mode C is operational. Until then, this code sits frozen — read it, don't add to it.
+**Status:** PAUSED at the project level. Extracted from `prithvi/` on 2026-05-14 for architectural hygiene. Active development resumes when Sthambha (L3) fabric Mode C is operational. Until then, this code sits frozen — read it, don't add to it.
 
 ## Where Neuron sits in the stack
 
 - **L1 Neuron** *(this repo)* — chain & economics. Substrate validator, NRN token, on-chain accounting.
 - **L2 Nakshatra** — distributed inference engine (`fthrvi/nakshatra`).
 - **L3 Sthambha** — substrate: registry, identity, fabric, layer cache (`fthrvi/sthambha`).
-- **L4 Prithvi** — agent / consciousness / voice (`fthrvi/Prithvi-`).
+- **L4 Prithvi** — agent / consciousness / voice (`fthrvi/prithvi`).
 
 The full architecture decision lives at `Sthambha/docs/four-project-architecture.md` (canonical, in the Sthambha repo).
 
@@ -50,7 +50,7 @@ cargo build --release             # x86_64
 ./deploy-pi.sh user@pi-ip         # cross-compile to ARM64 for Pi validator
 ```
 
-See `chain/README.md` for the pre-extraction-era setup notes; some paths reference `Prithvi-/neuron-chain/` and need updating once development resumes.
+See `chain/README.md` for the pre-extraction-era setup notes; some paths reference `prithvi/neuron-chain/` and need updating once development resumes.
 
 ## Sanskrit / vocabulary discipline
 
