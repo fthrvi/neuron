@@ -1,0 +1,46 @@
+[package]
+name = "pallet-emission"
+description = "NRN token emission — Proof of Useful Work block rewards"
+version = "0.1.0"
+license = "MIT-0"
+edition = "2021"
+publish = false
+
+[dependencies]
+codec = { version = "3.7.4", default-features = false, package = "parity-scale-codec", features = ["derive"] }
+scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }
+frame-support = { version = "40.1.0", default-features = false }
+frame-system = { version = "40.1.0", default-features = false }
+pallet-balances = { version = "41.1.0", default-features = false }
+pallet-aura = { version = "39.0.0", default-features = false }
+sp-runtime = { version = "41.1.0", default-features = false }
+sp-consensus-aura = { version = "0.42.0", default-features = false }
+sp-core = { version = "36.1.0", default-features = false }
+log = { version = "0.4", default-features = false }
+
+[features]
+default = ["std"]
+std = [
+    "codec/std",
+    "scale-info/std",
+    "frame-support/std",
+    "frame-system/std",
+    "pallet-balances/std",
+    "pallet-aura/std",
+    "sp-runtime/std",
+    "sp-consensus-aura/std",
+    "sp-core/std",
+    "log/std",
+]
+runtime-benchmarks = [
+    "frame-support/runtime-benchmarks",
+    "frame-system/runtime-benchmarks",
+    "pallet-balances/runtime-benchmarks",
+    "sp-runtime/runtime-benchmarks",
+]
+try-runtime = [
+    "frame-support/try-runtime",
+    "frame-system/try-runtime",
+    "pallet-balances/try-runtime",
+    "sp-runtime/try-runtime",
+]

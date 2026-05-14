@@ -1,0 +1,13 @@
+[Unit]
+Description=Neuron Chain — Production blockchain (Neuron Network)
+After=network.target
+
+[Service]
+Type=simple
+User=prithvi
+ExecStart=/home/operator/neuron-chain/target/release/neuron-node --base-path /home/operator/.neuron/chain --chain /tmp/neuron-chain-spec.json --validator --port 30333 --rpc-port 9944 --rpc-cors all
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

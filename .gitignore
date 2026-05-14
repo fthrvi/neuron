@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.coverage
+dist/
+build/
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp

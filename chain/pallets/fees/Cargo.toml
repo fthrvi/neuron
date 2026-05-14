@@ -1,0 +1,38 @@
+[package]
+name = "pallet-fees"
+description = "Neuron Network fees — on-chain inference fee recording, burn tracking, operator payments"
+version = "0.1.0"
+license = "MIT-0"
+edition = "2021"
+publish = false
+
+[dependencies]
+codec = { version = "3.7.4", default-features = false, package = "parity-scale-codec", features = ["derive", "max-encoded-len"] }
+scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }
+frame-support = { version = "40.1.0", default-features = false }
+frame-system = { version = "40.1.0", default-features = false }
+sp-runtime = { version = "41.1.0", default-features = false }
+sp-core = { version = "36.1.0", default-features = false }
+log = { version = "0.4", default-features = false }
+
+[features]
+default = ["std"]
+std = [
+    "codec/std",
+    "scale-info/std",
+    "frame-support/std",
+    "frame-system/std",
+    "sp-runtime/std",
+    "sp-core/std",
+    "log/std",
+]
+runtime-benchmarks = [
+    "frame-support/runtime-benchmarks",
+    "frame-system/runtime-benchmarks",
+    "sp-runtime/runtime-benchmarks",
+]
+try-runtime = [
+    "frame-support/try-runtime",
+    "frame-system/try-runtime",
+    "sp-runtime/try-runtime",
+]
