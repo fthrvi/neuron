@@ -34,5 +34,5 @@ When it un-pauses, the work is not "build from scratch" — most of the substrat
 
 ## See also
 
-- Project architecture: `Nakshatra/docs/three-project-architecture.md` (covers all four layers despite the name)
+- Project architecture: `Sthambha/docs/four-project-architecture.md` (canonical)
 - Mode C / public-network goal: `Sthambha/docs/network-fabric.md` §3 and §11

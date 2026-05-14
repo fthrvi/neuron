@@ -13,7 +13,7 @@ Neuron is the **L1 chain & economic substrate** in a four-project architecture. 
 - **L3 Sthambha** — substrate: registry, identity, fabric, layer cache (`fthrvi/sthambha`).
 - **L4 Prithvi** — agent / consciousness / voice (`fthrvi/Prithvi-`).
 
-The full architecture decision lives at `Nakshatra/docs/three-project-architecture.md` (yes, named "three" — written before Neuron was split out; will be renamed when convenient).
+The full architecture decision lives at `Sthambha/docs/four-project-architecture.md` (canonical, in the Sthambha repo).
 
 ## What belongs in Neuron, what does not
 
