@@ -20,3 +20,9 @@ Cargo.lock.bak
 .vscode/
 .idea/
 *.swp
+
+# Local secrets / rendered configs (ship .env.example + *.template instead)
+.env
+.env.local
+*.key
+chain/neuron-chain.service

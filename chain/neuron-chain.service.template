@@ -1,0 +1,18 @@
+# Neuron Chain systemd unit — TEMPLATE.
+# Render with your own values, e.g.:
+#   export SERVICE_USER=$(whoami) NEURON_DIR=/opt/neuron-chain NEURON_DATA=$HOME NEURON_CHAIN_SPEC=/etc/neuron/chain-spec.json
+#   envsubst < neuron-chain.service.template | sudo tee /etc/systemd/system/neuron-chain.service
+# (or copy this file and replace the ${...} placeholders by hand). See .env.example.
+[Unit]
+Description=Neuron Chain — blockchain node (Neuron Network)
+After=network.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+ExecStart=${NEURON_DIR}/target/release/neuron-node --base-path ${NEURON_DATA}/.neuron/chain --chain ${NEURON_CHAIN_SPEC} --validator --port 30333 --rpc-port 9944 --rpc-cors all
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

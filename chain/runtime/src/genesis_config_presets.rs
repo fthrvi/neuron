@@ -68,9 +68,9 @@ pub fn development_config_genesis() -> Value {
 }
 
 /// Return the Neuron Network production genesis config.
-/// Two validators: the operator's PC + Raspberry Pi 5 (chain guardian).
+/// Two validators: a GPU worker node + a Raspberry Pi 5 (chain guardian).
 pub fn neuron_config_genesis() -> Value {
-	// Validator 1: the operator's PC (203.0.113.20) — GPU worker + validator
+	// Validator 1: GPU worker + validator
 	let v1_aura: AuraId = sp_core::sr25519::Public::from_raw(
 		hex_literal::hex!("8cab4c4a39cb81f8e4126869d52681436ec067a06cf0919cfce2c220b73b9336")
 	).into();
@@ -95,7 +95,7 @@ pub fn neuron_config_genesis() -> Value {
 	testnet_genesis(
 		vec![(v1_aura, v1_grandpa), (v2_aura, v2_grandpa)],
 		vec![v1_account.clone(), v2_account.clone()],
-		v1_account, // the operator is sudo
+		v1_account, // Validator 1 is sudo
 	)
 }
 
