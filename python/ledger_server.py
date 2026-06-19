@@ -67,11 +67,23 @@ class LedgerService:
             raise
 
     # ---- operations (return JSON-able dicts) ----
-    def settle(self, receipt: dict, requester: str) -> dict:
-        d = self.led.settle(receipt, requester)   # raises CreditError on a bad receipt
+    def settle(self, receipt: dict, requester: str, own_nodes=None) -> dict:
+        # own_nodes = the requester's OWN worker node-ids → that work is free (local doesn't cost).
+        own = set(own_nodes or [])
+        op_of = (lambda nid: requester if nid in own else nid) if own else None
+        d = self.led.settle(receipt, requester, operator_of=op_of)   # raises CreditError on bad receipt
         self._save()
         return {"run_id": d.run_id, "credited": d.credited, "requester": d.requester,
                 "debited": d.debited, "total": d.total}
+
+    def transfer(self, frm: str, to: str, amount: int, memo: str = "") -> dict:
+        rec = self.led.transfer(frm, to, int(amount), memo=memo)
+        self._save()
+        return {**rec, "balances": {frm: self.led.balance(frm), to: self.led.balance(to)}}
+
+    def history(self, account: str, limit: int = 50) -> dict:
+        return {"account": account, "balance": self.led.balance(account),
+                "history": self.led.history(account, limit=limit)}
 
     def can_consume(self, account: str, cost: int) -> dict:
         return {"account": account, "cost": int(cost),
@@ -119,6 +131,9 @@ def _make_handler(svc: LedgerService):
                     return self._send(200, svc.balance(q.get("account", [""])[0]))
                 if u.path == "/balances":
                     return self._send(200, svc.balances())
+                if u.path == "/history":
+                    return self._send(200, svc.history(q.get("account", [""])[0],
+                                                       int(q.get("limit", ["50"])[0])))
                 if u.path == "/health":
                     return self._send(200, {"ok": True})
                 return self._send(404, {"error": "not found"})
@@ -131,9 +146,16 @@ def _make_handler(svc: LedgerService):
                 b = self._body()
                 if u.path == "/settle":
                     try:
-                        return self._send(200, {"delta": svc.settle(b["receipt"], b["requester"])})
+                        return self._send(200, {"delta": svc.settle(
+                            b["receipt"], b["requester"], own_nodes=b.get("own_nodes"))})
                     except CreditError as e:
                         return self._send(422, {"error": str(e)})   # bad/forged receipt
+                if u.path == "/transfer":
+                    try:
+                        return self._send(200, svc.transfer(b["from"], b["to"], b["amount"],
+                                                            b.get("memo", "")))
+                    except CreditError as e:
+                        return self._send(422, {"error": str(e)})
                 if u.path == "/dispute":
                     return self._send(200, svc.dispute(b["run_id"]))
                 return self._send(404, {"error": "not found"})

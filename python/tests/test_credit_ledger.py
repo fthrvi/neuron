@@ -147,6 +147,68 @@ def test_dispute_claws_back():
     assert led.balance("wA") == 64
 
 
+def test_local_infra_is_free():
+    # all serving workers belong to the requester's operator → local run costs NOTHING.
+    led = CreditLedger()
+    own = {"wA": "alice", "wB": "alice"}
+    d = led.settle(_receipt(), requester="alice", operator_of=lambda n: own.get(n, n))
+    assert d.total == 0 and d.credited == {}          # free
+    assert led.balance("alice") == 0                  # not charged for own GPUs
+
+
+def test_network_infra_pays_only_for_others():
+    # alice runs on her own wA (free) + bob's wB (paid). She pays only for bob's 16 layers.
+    led = CreditLedger()
+    op = {"wA": "alice", "wB": "bob"}
+    d = led.settle(_receipt(), requester="alice", operator_of=lambda n: op.get(n, n))
+    assert d.credited == {"bob": 64}                  # bob earns; alice's own work is free
+    assert d.total == 64                              # alice pays only for bob's share
+    assert led.balance("alice") == -64 and led.balance("bob") == 64
+
+
+def test_earnings_accrue_to_operator_not_node():
+    # bob runs two nodes; both earn into bob's single operator balance.
+    led = CreditLedger()
+    chain = [{"node_id": "n1", "layer_start": 0, "layer_end": 16},
+             {"node_id": "n2", "layer_start": 16, "layer_end": 32}]
+    op = {"n1": "bob", "n2": "bob"}
+    led.settle(_receipt(chain=chain), requester="alice", operator_of=lambda n: op.get(n, n))
+    assert led.balance("bob") == 128                  # both nodes → one operator balance
+
+
+def test_transfer_send_receive():
+    led = CreditLedger()
+    led.settle(_receipt(), requester="op")            # wA, wB each +64
+    led.transfer("wA", "carol", 50, memo="thanks")
+    assert led.balance("wA") == 14 and led.balance("carol") == 50
+    with pytest.raises(CreditError):
+        led.transfer("wA", "carol", 999)              # overdraw refused
+    with pytest.raises(CreditError):
+        led.transfer("wA", "wA", 5)                   # self-transfer refused
+
+
+def test_history_shows_earn_spend_send_receive():
+    led = CreditLedger()
+    led.settle(_receipt(), requester="op")
+    led.transfer("wA", "carol", 10)
+    h_wA = led.history("wA")
+    kinds = [e["kind"] for e in h_wA]
+    assert "earn" in kinds and "send" in kinds        # wA earned then sent
+    assert led.history("op")[0]["kind"] == "spend"
+    assert led.history("carol")[0] == {"kind": "receive", "amount": 10,
+                                       "counterparty": "wA", "memo": ""}
+
+
+def test_journal_survives_snapshot_restore():
+    led = CreditLedger()
+    led.settle(_receipt(), requester="op")
+    led.transfer("wA", "carol", 5)
+    led2 = CreditLedger()
+    led2.restore(led.snapshot())
+    assert led2.balance("carol") == 5
+    assert [e["kind"] for e in led2.history("carol")] == ["receive"]
+
+
 def test_estimate_cost_matches_settle_total():
     led = CreditLedger()
     r = _receipt(tokens=(1, 2, 3))          # 3 tokens, 32-block model

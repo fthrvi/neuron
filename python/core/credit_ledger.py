@@ -74,6 +74,7 @@ class CreditLedger:
                  min_earn_tier: str = "known", grace: int = 0):
         self._bal: Dict[str, int] = defaultdict(int)
         self._settled: Dict[str, CreditDelta] = {}     # run_id -> delta (idempotency + dispute)
+        self._journal: List[dict] = []                 # append-only activity log (for hub history)
         self._tier_of = tier_of
         self._min_earn_rank = TIER_RANK[min_earn_tier]
         self.grace = int(grace)                         # bootstrap allowance for a fresh consumer
@@ -113,9 +114,15 @@ class CreditLedger:
         return TIER_RANK.get(self._tier_of(node_id), 0) >= self._min_earn_rank
 
     # ---- settlement ----
-    def settle(self, receipt: dict, requester: str) -> CreditDelta:
+    def settle(self, receipt: dict, requester: str,
+               operator_of: Optional[Callable[[str], str]] = None) -> CreditDelta:
         """Verify a run receipt and apply credits. Idempotent per run_id. Raises CreditError on
-        an invalid receipt (no credit). The requester always pays; only admission-eligible
+        an invalid receipt (no credit). Earnings accrue to the worker's OPERATOR.
+
+        LOCAL = FREE, NETWORK = PAY: work served by a worker whose operator IS the requester
+        (your own GPUs) costs nothing — no debit, no credit. The requester pays only for work
+        served by OTHER operators' infra. `operator_of(node_id) -> operator` provides the map
+        (from the roster); default = each node is its own operator. Only admission-eligible
         workers earn (ineligible ones do the work but aren't credited — anti-Sybil)."""
         run_id = receipt.get("run_id")
         if run_id is None:
@@ -126,30 +133,71 @@ class CreditLedger:
         if not ok:
             raise CreditError(f"unverifiable receipt {run_id!r}: {'; '.join(problems)}")
 
+        op_of = operator_of or (lambda nid: nid)
         n = int(receipt["n_generated"])
-        credited: Dict[str, int] = {}
-        total = 0
+        credited: Dict[str, int] = {}                   # operator -> units earned
+        charged = 0                                     # what the requester pays (CROSS-operator only)
         for c in receipt["chain"]:
             units = n * (int(c["layer_end"]) - int(c["layer_start"]))
-            total += units                              # requester pays for ALL work served
+            worker_op = op_of(c["node_id"])
+            if worker_op == requester:
+                continue                                # own infra → free; local never costs
+            charged += units                            # network infra → requester pays
             if self._earns(c["node_id"]):
-                credited[c["node_id"]] = credited.get(c["node_id"], 0) + units
-        for node_id, units in credited.items():
-            self._bal[node_id] += units
-        self._bal[requester] -= total
+                credited[worker_op] = credited.get(worker_op, 0) + units
+        for op, units in credited.items():
+            self._bal[op] += units
+        self._bal[requester] -= charged
         delta = CreditDelta(run_id=run_id, credited=credited, requester=requester,
-                            debited=total, total=total)
+                            debited=charged, total=charged)
         self._settled[run_id] = delta
+        self._journal.append({"kind": "settle", "run_id": run_id, "requester": requester,
+                              "charged": charged, "credited": dict(credited)})
         return delta
+
+    def transfer(self, frm: str, to: str, amount: int, *, memo: str = "") -> dict:
+        """Send credits between accounts (the hub's send/receive). Refuses to overdraw."""
+        amount = int(amount)
+        if amount <= 0:
+            raise CreditError("transfer amount must be positive")
+        if frm == to:
+            raise CreditError("cannot transfer to self")
+        if self.balance(frm) < amount:
+            raise CreditError(f"insufficient balance: {frm} has {self.balance(frm)}, needs {amount}")
+        self._bal[frm] -= amount
+        self._bal[to] += amount
+        rec = {"kind": "transfer", "from": frm, "to": to, "amount": amount, "memo": memo}
+        self._journal.append(rec)
+        return rec
+
+    def history(self, account: str, limit: int = 50) -> List[dict]:
+        """Per-account activity (newest first) for the hub: earn / spend / send / receive."""
+        out: List[dict] = []
+        for e in reversed(self._journal):
+            if e["kind"] == "settle":
+                if e["requester"] == account and e["charged"]:
+                    out.append({"kind": "spend", "amount": -e["charged"], "run_id": e["run_id"]})
+                elif account in e["credited"]:
+                    out.append({"kind": "earn", "amount": e["credited"][account], "run_id": e["run_id"]})
+            elif e["kind"] == "transfer":
+                if e["from"] == account:
+                    out.append({"kind": "send", "amount": -e["amount"], "counterparty": e["to"], "memo": e["memo"]})
+                elif e["to"] == account:
+                    out.append({"kind": "receive", "amount": e["amount"], "counterparty": e["from"], "memo": e["memo"]})
+            if len(out) >= limit:
+                break
+        return out
 
     def dispute(self, run_id: str) -> bool:
         """Claw back a settled receipt (a spot-check re-execution failed). Reverses the deltas."""
         delta = self._settled.pop(run_id, None)
         if delta is None:
             return False
-        for node_id, units in delta.credited.items():
-            self._bal[node_id] -= units
+        for op, units in delta.credited.items():
+            self._bal[op] -= units
         self._bal[delta.requester] += delta.debited
+        self._journal.append({"kind": "dispute", "run_id": run_id, "requester": delta.requester,
+                              "charged": delta.debited, "credited": dict(delta.credited)})
         return True
 
     # ---- queries / gates ----
@@ -176,10 +224,12 @@ class CreditLedger:
             "settled": {rid: {"credited": d.credited, "requester": d.requester,
                               "debited": d.debited, "total": d.total}
                         for rid, d in self._settled.items()},
+            "journal": self._journal,
         }
 
     def restore(self, snap: dict) -> None:
         self._bal = defaultdict(int, {k: int(v) for k, v in snap.get("balances", {}).items()})
+        self._journal = list(snap.get("journal", []))
         self._settled = {}
         for rid, d in snap.get("settled", {}).items():
             self._settled[rid] = CreditDelta(
