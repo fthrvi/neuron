@@ -122,5 +122,29 @@ def test_http_full_flow(server):
     assert _get(server, "/balance?account=wA")[1]["balance"] == 0
 
 
+def test_http_local_free_and_transfer_and_history(server):
+    # LOCAL run: own_nodes = both workers → free (charged 0)
+    code, body = _post(server, "/settle",
+                       {"receipt": _receipt(run_id="local"), "requester": "alice",
+                        "own_nodes": ["wA", "wB"]})
+    assert code == 200 and body["delta"]["total"] == 0
+    assert _get(server, "/balance?account=alice")[1]["balance"] == 0   # not charged for own GPUs
+    # NETWORK run: alice uses bob's wB (own = wA only) → pays for wB
+    _post(server, "/settle", {"receipt": _receipt(run_id="net"), "requester": "alice",
+                              "own_nodes": ["wA"]})
+    assert _get(server, "/balance?account=wB")[1]["balance"] == 64
+    assert _get(server, "/balance?account=alice")[1]["balance"] == -64
+    # transfer (send/receive)
+    code, body = _post(server, "/transfer", {"from": "wB", "to": "carol", "amount": 20, "memo": "tip"})
+    assert code == 200 and body["balances"]["carol"] == 20
+    code, body = _post(server, "/transfer", {"from": "wB", "to": "carol", "amount": 9999})
+    assert code == 422                                        # overdraw refused
+    # history
+    h = _get(server, "/history?account=wB")[1]
+    assert h["balance"] == 44
+    kinds = [e["kind"] for e in h["history"]]
+    assert "earn" in kinds and "send" in kinds
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
