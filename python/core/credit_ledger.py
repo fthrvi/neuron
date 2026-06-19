@@ -168,3 +168,20 @@ class CreditLedger:
 
     def balances(self) -> Dict[str, int]:
         return {k: v for k, v in self._bal.items() if v != 0}
+
+    # ---- persistence (snapshot/restore; the service writes these to disk) ----
+    def snapshot(self) -> dict:
+        return {
+            "balances": dict(self._bal),
+            "settled": {rid: {"credited": d.credited, "requester": d.requester,
+                              "debited": d.debited, "total": d.total}
+                        for rid, d in self._settled.items()},
+        }
+
+    def restore(self, snap: dict) -> None:
+        self._bal = defaultdict(int, {k: int(v) for k, v in snap.get("balances", {}).items()})
+        self._settled = {}
+        for rid, d in snap.get("settled", {}).items():
+            self._settled[rid] = CreditDelta(
+                run_id=rid, credited={k: int(v) for k, v in d["credited"].items()},
+                requester=d["requester"], debited=int(d["debited"]), total=int(d["total"]))
