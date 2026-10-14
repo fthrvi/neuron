@@ -1,0 +1,268 @@
+"""Pure tests for signed ledger envelopes and Nakshatra run receipts."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import sys
+
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
+
+HERE = os.path.dirname(__file__)
+sys.path.insert(0, os.path.join(HERE, ".."))
+
+from ledger_auth import (  # noqa: E402
+    InMemoryNonceStore,
+    ReceiptError,
+    canonical_string,
+    load_roster,
+    verify_envelope,
+    verify_receipt,
+)
+
+
+def _keypair():
+    private = ed25519.Ed25519PrivateKey.generate()
+    public_hex = private.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+    return private, public_hex
+
+
+def _row(pubkey, name, operator, tier="known"):
+    return {
+        "pubkey": pubkey,
+        "name": name,
+        "operator": operator,
+        "tier": tier,
+        "tenant": "test",
+        "coord": None,
+    }
+
+
+def _auth_header(private, keyid, method, path, body, timestamp):
+    signature = private.sign(canonical_string(method, path, body, timestamp))
+    encoded = base64.b64encode(signature).decode("ascii")
+    return f'Sthambha-Ed25519 keyid="{keyid}",sig="{encoded}",ts="{timestamp}"'
+
+
+def _receipt(run_id="run-1", tokens=(10, 11, 12, 13)):
+    generated = list(tokens)
+    output_hash = hashlib.sha256(
+        ",".join(str(token) for token in generated).encode("utf-8")
+    ).hexdigest()
+    return {
+        "run_id": run_id,
+        "n_generated": len(generated),
+        "generated_tokens": generated,
+        "output_sha256": output_hash,
+        "chain": [
+            {"node_id": "worker-a", "layer_start": 0, "layer_end": 8},
+            {"node_id": "worker-b", "layer_start": 8, "layer_end": 24},
+        ],
+        "worker_signatures": [],
+    }
+
+
+def _participation(private, pubkey, receipt, node_id, start, end, *, output_hash=None):
+    output_hash = output_hash or receipt["output_sha256"]
+    message = (
+        f'{receipt["run_id"]}|{node_id}|[{start},{end})|{output_hash}'
+    ).encode("utf-8")
+    return {
+        "node_id": node_id,
+        "pubkey": pubkey,
+        "layer_start": start,
+        "layer_end": end,
+        "sig": base64.b64encode(private.sign(message)).decode("ascii"),
+    }
+
+
+@pytest.fixture
+def identities():
+    requester_private, requester_pub = _keypair()
+    worker_a_private, worker_a_pub = _keypair()
+    worker_b_private, worker_b_pub = _keypair()
+    roster = {
+        requester_pub: _row(requester_pub, "requester-node", "alice", "trusted"),
+        worker_a_pub: _row(worker_a_pub, "worker-a", "bob"),
+        worker_b_pub: _row(worker_b_pub, "worker-b", "carol"),
+    }
+    return {
+        "requester": (requester_private, requester_pub),
+        "worker_a": (worker_a_private, worker_a_pub),
+        "worker_b": (worker_b_private, worker_b_pub),
+        "roster": roster,
+    }
+
+
+def test_unsigned_envelope_gives_none(identities):
+    _, requester_pub = identities["requester"]
+    assert verify_envelope(
+        {}, "POST", "/settle", b"{}", identities["roster"], InMemoryNonceStore(), 100
+    ) is None
+
+
+def test_wrong_key_gives_none(identities):
+    wrong_private, _ = _keypair()
+    _, requester_pub = identities["requester"]
+    body = b'{"receipt":{}}'
+    headers = {
+        "Authorization": _auth_header(
+            wrong_private, requester_pub, "POST", "/settle", body, 100
+        )
+    }
+    assert verify_envelope(
+        headers, "POST", "/settle", body, identities["roster"], InMemoryNonceStore(), 100
+    ) is None
+
+
+def test_stale_timestamp_gives_none(identities):
+    private, requester_pub = identities["requester"]
+    body = b"{}"
+    headers = {
+        "Authorization": _auth_header(private, requester_pub, "POST", "/settle", body, 100)
+    }
+    assert verify_envelope(
+        headers, "POST", "/settle", body, identities["roster"], InMemoryNonceStore(), 161
+    ) is None
+
+
+def test_replayed_signature_gives_none(identities):
+    private, requester_pub = identities["requester"]
+    body = b"{}"
+    headers = {
+        "authorization": _auth_header(private, requester_pub, "POST", "/settle", body, 100)
+    }
+    nonces = InMemoryNonceStore()
+    assert verify_envelope(
+        headers, "POST", "/settle", body, identities["roster"], nonces, 100
+    ) == requester_pub
+    assert verify_envelope(
+        headers, "POST", "/settle", body, identities["roster"], nonces, 100
+    ) is None
+
+
+def test_tampered_body_gives_none(identities):
+    private, requester_pub = identities["requester"]
+    signed_body = json.dumps({"amount": 1}).encode("utf-8")
+    headers = {
+        "Authorization": _auth_header(
+            private, requester_pub, "POST", "/transfer", signed_body, 100
+        )
+    }
+    assert verify_envelope(
+        headers,
+        "POST",
+        "/transfer",
+        json.dumps({"amount": 2}).encode("utf-8"),
+        identities["roster"],
+        InMemoryNonceStore(),
+        100,
+    ) is None
+
+
+def test_unrostered_signer_gives_none(identities):
+    private, public = _keypair()
+    body = b"{}"
+    headers = {
+        "Authorization": _auth_header(private, public, "POST", "/settle", body, 100)
+    }
+    assert verify_envelope(
+        headers, "POST", "/settle", body, identities["roster"], InMemoryNonceStore(), 100
+    ) is None
+
+
+def test_forged_receipt_without_worker_signatures_credits_nothing(identities):
+    _, requester_pub = identities["requester"]
+    receipt = _receipt()
+    receipt_id, credited, units = verify_receipt(receipt, requester_pub, identities["roster"])
+    assert len(receipt_id) == 64
+    assert credited == {}
+    assert units == 0
+
+
+def test_unrostered_worker_key_credits_nothing(identities):
+    _, requester_pub = identities["requester"]
+    outsider_private, outsider_pub = _keypair()
+    receipt = _receipt()
+    receipt["worker_signatures"] = [
+        _participation(outsider_private, outsider_pub, receipt, "worker-a", 0, 8)
+    ]
+    _, credited, units = verify_receipt(receipt, requester_pub, identities["roster"])
+    assert credited == {}
+    assert units == 0
+
+
+def test_valid_receipt_credits_exactly_signed_stages(identities):
+    _, requester_pub = identities["requester"]
+    worker_a_private, worker_a_pub = identities["worker_a"]
+    receipt = _receipt()
+    receipt["worker_signatures"] = [
+        _participation(worker_a_private, worker_a_pub, receipt, "worker-a", 0, 8)
+    ]
+    _, credited, units = verify_receipt(receipt, requester_pub, identities["roster"])
+    assert credited == {"bob": 4 * 8}
+    assert units == 4 * 8
+
+
+def test_same_work_under_two_run_ids_has_same_receipt_id(identities):
+    _, requester_pub = identities["requester"]
+    first_id, _, _ = verify_receipt(_receipt("run-one"), requester_pub, identities["roster"])
+    second_id, _, _ = verify_receipt(_receipt("run-two"), requester_pub, identities["roster"])
+    assert first_id == second_id
+
+
+def test_signature_for_different_output_hash_is_rejected(identities):
+    _, requester_pub = identities["requester"]
+    worker_a_private, worker_a_pub = identities["worker_a"]
+    receipt = _receipt()
+    receipt["worker_signatures"] = [
+        _participation(
+            worker_a_private,
+            worker_a_pub,
+            receipt,
+            "worker-a",
+            0,
+            8,
+            output_hash="0" * 64,
+        )
+    ]
+    _, credited, units = verify_receipt(receipt, requester_pub, identities["roster"])
+    assert credited == {}
+    assert units == 0
+
+
+def test_structurally_invalid_receipt_is_rejected(identities):
+    _, requester_pub = identities["requester"]
+    receipt = _receipt()
+    receipt["chain"][1]["layer_start"] = 9
+    with pytest.raises(ReceiptError, match="gap or overlap"):
+        verify_receipt(receipt, requester_pub, identities["roster"])
+
+
+def test_roster_loader_skips_comments_blank_and_short_rows(tmp_path):
+    _, first_pub = _keypair()
+    _, second_pub = _keypair()
+    roster_path = tmp_path / "peers.tsv"
+    roster_path.write_text(
+        "# admission roster\n\n"
+        f"{first_pub}\tworker-a\tbob\ttrusted\ttenant-a\t10.0.0.1:9000\n"
+        "too short\n"
+        f"{second_pub} worker-b carol mystery tenant-b\n",
+        encoding="utf-8",
+    )
+    roster = load_roster(roster_path)
+    assert roster[first_pub] == {
+        "pubkey": first_pub,
+        "name": "worker-a",
+        "operator": "bob",
+        "tier": "trusted",
+        "tenant": "tenant-a",
+        "coord": "10.0.0.1:9000",
+    }
+    assert roster[second_pub]["tier"] == "stranger"
+    assert roster[second_pub]["coord"] is None
