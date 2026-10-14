@@ -1,3 +1,3 @@
-# S3 uses only the standard library. S4 deliberately uses the installed pinned
-# solana/spl-token CLIs for offline transaction construction, so the keyholder
-# adds no Python dependency and never writes a persistent signer venv/key file.
+jsonalias==0.1.1 --hash=sha256:a56d2888e6397812c606156504e861e8ec00e188005af149f003c787db3d3f18
+solders==0.23.0 --hash=sha256:b1ba84ec23fc7af821dc7e5b48a6d247ae36b86457f930cbc64afa79587e4caf
+typing-extensions==4.12.2 --hash=sha256:04e5ca0351e0f3f85c6853954072df659d0d13fac324d0072316b67d7794700d

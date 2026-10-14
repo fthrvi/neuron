@@ -1,22 +1,31 @@
 """Unit tests for the fail-closed treasury payout state machine."""
 import base64
-import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from solders.hash import Hash
+from solders.instruction import AccountMeta, Instruction
+from solders.keypair import Keypair
+from solders.message import Message
+from solders.pubkey import Pubkey
+from solders.token import ID as TOKEN_PROGRAM_ID
+from solders.token.associated import get_associated_token_address
+from solders.transaction import Transaction
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from chain.indexer import DEVNET_GENESIS_HASH  # noqa: E402
 from chain.payout import (  # noqa: E402
-    CLITreasuryBackend,
     MICRO_USDC,
+    PayoutError,
     PayoutConfig,
     PayoutEngine,
+    PayoutProcessLock,
     SignedTransaction,
+    SoldersTreasuryBackend,
 )
 import core.ledger_store as ledger_store_module  # noqa: E402
 from core.ledger_store import (  # noqa: E402
@@ -53,6 +62,7 @@ class FakeRPC:
         self.broadcasts = []
         self.existing_accounts = {RECIPIENT_ATA}
         self.before_send = None
+        self.status_calls = []
 
     def pin_genesis(self, expected=None):
         assert expected in (None, DEVNET_GENESIS_HASH)
@@ -67,6 +77,7 @@ class FakeRPC:
         return {"blockhash": blockhash, "last_valid_block_height": self.height + 2}
 
     def get_signature_status(self, signature):
+        self.status_calls.append(signature)
         return self.statuses.get(signature)
 
     def get_block_height(self):
@@ -90,12 +101,14 @@ class FakeBackend:
         assert owner == RECIPIENT
         return RECIPIENT_ATA
 
-    def create_recipient_ata(self, owner):
+    def create_recipient_ata(self, owner, may_act):
+        may_act()
         self.created_atas.append(owner)
         self.rpc.existing_accounts.add(RECIPIENT_ATA)
         return RECIPIENT_ATA
 
-    def build_transfer(self, destination, micro_usdc, blockhash, last_valid):
+    def build_transfer(self, recipient, destination, micro_usdc, blockhash, last_valid):
+        assert recipient == RECIPIENT
         attempt = len(self.builds) + 1
         signature = f"signature-{attempt}"
         wire = f"wire-{attempt}"
@@ -104,7 +117,8 @@ class FakeBackend:
         self.builds.append((destination, micro_usdc, signed))
         return signed
 
-    def create_deposit_account(self):
+    def create_deposit_account(self, may_act):
+        may_act()
         account = BLOCKHASHES[len(self.deposit_accounts)]
         self.deposit_accounts.append(account)
         self.rpc.existing_accounts.add(account)
@@ -174,46 +188,77 @@ def test_store_payout_transitions_are_strict_and_attempts_are_durable(tmp_path):
             store.withdraw_mark_expired("withdrawal-1")
 
 
-def test_fake_vault_secret_uses_only_0600_ephemeral_keyfiles(tmp_path):
+def test_vault_secret_stays_in_memory_and_real_signature_verifies():
     loaded = []
-    observed_paths = []
-    secret = json.dumps(list(range(64)))
+    treasury = Keypair()
+    mint = Pubkey.new_unique()
+    vault = Pubkey.new_unique()
+    recipient = Pubkey.new_unique()
+    recipient_ata = get_associated_token_address(recipient, mint)
+    blockhash = str(Hash.new_unique())
 
     def fake_vault(name):
         loaded.append(name)
-        return secret
+        return treasury.to_json()
 
-    def fake_run(argv, **kwargs):
-        assert secret not in argv
-        key_paths = [Path(value) for value in argv if "nak-treasury-" in value]
-        for path in key_paths:
-            if path.name == "treasury.json":
-                assert (path.stat().st_mode & 0o777) == 0o600
-                assert path.read_text() == secret
-                observed_paths.append(path)
-        if Path(argv[0]).name == "solana-keygen":
-            return subprocess.CompletedProcess(argv, 0, VAULT_ACCOUNT + "\n", "")
-        payload = {
-            "message": base64.b64encode(b"signed-message").decode(),
-            "signers": [VAULT_ACCOUNT + "=" + ("1" * 64)],
-        }
-        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
-
-    backend = CLITreasuryBackend(
-        "http://127.0.0.1:18899",
-        MINT,
-        VAULT_ACCOUNT,
+    backend = SoldersTreasuryBackend(
+        FakeRPC(),
+        str(mint),
+        str(vault),
         secret_loader=fake_vault,
-        run=fake_run,
     )
     signed = backend.build_transfer(
-        RECIPIENT_ATA, 1, BLOCKHASHES[0], 10
+        str(recipient), str(recipient_ata), 1, blockhash, 10
     )
     assert loaded == ["nak-treasury-secret"]
-    assert signed.signature == "1" * 64
-    assert len(base64.b64decode(signed.wire_b64)) == 1 + 64 + len(b"signed-message")
-    assert observed_paths
-    assert all(not path.exists() for path in observed_paths)
+    transaction = Transaction.from_bytes(base64.b64decode(signed.wire_b64))
+    assert str(transaction.signatures[0]) == signed.signature
+    assert transaction.signatures[0].verify(treasury.pubkey(), bytes(transaction.message))
+    assert transaction.verify_with_results() == [True]
+
+
+def test_tampered_transfer_messages_are_refused():
+    treasury = Keypair()
+    mint = Pubkey.new_unique()
+    vault = Pubkey.new_unique()
+    recipient = Pubkey.new_unique()
+    destination = get_associated_token_address(recipient, mint)
+    blockhash = Hash.new_unique()
+    backend = SoldersTreasuryBackend(
+        FakeRPC(),
+        str(mint),
+        str(vault),
+        secret_loader=lambda _name: treasury.to_json(),
+    )
+
+    def message(*, program=TOKEN_PROGRAM_ID, ix_mint=mint, amount=7):
+        instruction = Instruction(
+            program,
+            b"\x0c" + amount.to_bytes(8, "little") + b"\x06",
+            [
+                AccountMeta(vault, False, True),
+                AccountMeta(ix_mint, False, False),
+                AccountMeta(destination, False, True),
+                AccountMeta(treasury.pubkey(), True, False),
+            ],
+        )
+        return Message.new_with_blockhash([instruction], treasury.pubkey(), blockhash)
+
+    cases = [
+        (message(), str(Pubkey.new_unique())),
+        (message(amount=8), str(recipient)),
+        (message(ix_mint=Pubkey.new_unique()), str(recipient)),
+        (message(program=Pubkey.new_unique()), str(recipient)),
+    ]
+    for tampered, expected_recipient in cases:
+        with pytest.raises(PayoutError):
+            backend._assert_transfer_message(
+                tampered,
+                expected_recipient,
+                str(destination),
+                7,
+                str(blockhash),
+            )
 
 
 def test_auto_cap_day_cap_and_injected_presence(tmp_path):
@@ -292,6 +337,24 @@ def test_kill_file_halts_before_approval_or_broadcast(tmp_path):
         assert backend.builds == []
 
 
+def test_mid_pass_kill_stops_all_further_broadcasts(tmp_path):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    kill = tmp_path / "payout.off"
+    with LedgerStore(tmp_path / "ledger.sqlite") as store:
+        held(store, credits(1), "a-first", "alice")
+        held(store, credits(1), "b-second", "bob")
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+
+        def kill_after_first_send(_wire):
+            kill.write_text("stop")
+
+        rpc.before_send = kill_after_first_send
+        with pytest.raises(PayoutError, match="kill file"):
+            engine.poll_once()
+        assert rpc.broadcasts == ["wire-1"]
+
+
 def test_dry_run_never_loads_signer_or_broadcasts(tmp_path):
     rpc = FakeRPC()
     loaded = []
@@ -331,6 +394,7 @@ def test_expired_blockhash_rebuilds_and_exactly_one_transfer_lands(tmp_path):
 
         rpc.height = first["last_valid_block_height"] + 1
         engine.poll_once()
+        assert rpc.status_calls.count("signature-1") == 2
         second = row(store)
         assert second["state"] == "sent"
         assert second["tx_sig"] == "signature-2"
@@ -354,6 +418,42 @@ def test_expired_blockhash_rebuilds_and_exactly_one_transfer_lands(tmp_path):
         assert store._db.execute(
             "SELECT COALESCE(SUM(balance), 0) FROM accounts"
         ).fetchone()[0] == 0
+
+
+def test_processed_failure_stays_sent_and_is_not_rebroadcast(tmp_path):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    with LedgerStore(tmp_path / "ledger.sqlite") as store:
+        held(store, credits(1))
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+        engine.poll_once()
+        rpc.statuses["signature-1"] = {
+            "confirmationStatus": "processed",
+            "err": {"InstructionError": [0, "Custom"]},
+        }
+        engine.poll_once()
+        assert row(store)["state"] == "sent"
+        assert row(store)["tx_sig"] == "signature-1"
+        assert rpc.broadcasts == ["wire-1"]
+        assert len(backend.builds) == 1
+
+
+def test_finalized_failure_rebuilds_under_existing_attempt_limit(tmp_path):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    with LedgerStore(tmp_path / "ledger.sqlite") as store:
+        held(store, credits(1))
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+        engine.poll_once()
+        rpc.statuses["signature-1"] = {
+            "confirmationStatus": "finalized",
+            "err": {"InstructionError": [0, "Custom"]},
+        }
+        engine.poll_once()
+        assert row(store)["state"] == "sent"
+        assert row(store)["tx_sig"] == "signature-2"
+        assert row(store)["expiry_count"] == 1
+        assert rpc.broadcasts == ["wire-1", "wire-2"]
 
 
 def test_recipient_ata_creation_is_idempotent(tmp_path):
@@ -434,3 +534,28 @@ def test_stranger_can_withdraw_deposit_but_not_matured_earnings(tmp_path, monkey
             store.withdraw_hold("stranger", credits(2), RECIPIENT, "earnings")
         store._db.execute("UPDATE accounts SET tier='known' WHERE id='stranger'")
         store.withdraw_hold("stranger", credits(2), RECIPIENT, "known-earnings")
+
+
+def test_second_process_exits_zero_when_singleton_lock_is_held(tmp_path):
+    lock_path = tmp_path / "payout.lock"
+    first = PayoutProcessLock.acquire(lock_path)
+    assert first is not None
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).parents[1] / "chain" / "payout.py"),
+                "--once",
+                "--lock-file",
+                str(lock_path),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode == 0
+        assert "payout worker already running" in result.stderr
+    finally:
+        first.close()

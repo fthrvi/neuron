@@ -214,6 +214,19 @@ class SolanaRPC:
             raise RPCError("getBlockHeight result is not a non-negative integer")
         return result
 
+    def get_minimum_balance_for_rent_exemption(self, size: int) -> int:
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise ValueError("account size must be a positive integer")
+        result = self.call(
+            "getMinimumBalanceForRentExemption",
+            [size, {"commitment": "finalized"}],
+        )
+        if isinstance(result, bool) or not isinstance(result, int) or result < 0:
+            raise RPCError(
+                "getMinimumBalanceForRentExemption result is not a non-negative integer"
+            )
+        return result
+
     def get_signature_status(self, signature: str) -> dict[str, Any] | None:
         result = self.call(
             "getSignatureStatuses",

@@ -7,15 +7,13 @@ Wants=network-online.target
 Type=simple
 Environment=PYTHONUNBUFFERED=1
 Environment=NAK_FUNDS=off
-Environment=PATH=%h/.local/share/solana/install/active_release/bin:/usr/local/bin:/usr/bin
 EnvironmentFile=%h/.config/nakshatra/payout.env
 ExecStart=/usr/bin/python3 /opt/neuron/python/chain/payout.py --store %h/.neuron/credits/ledger.sqlite
 Restart=on-failure
 RestartSec=5
 UMask=0077
 NoNewPrivileges=yes
-# Treasury and generated account key files exist only inside this service's
-# private /tmp namespace and are deleted after each CLI operation.
+# Treasury and generated account keypairs remain in process memory only.
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
@@ -31,7 +29,8 @@ SystemCallFilter=@system-service
 # NAK_SOLANA_RPC=<explicit HTTPS devnet RPC URL>
 # NAK_TREASURY_USDC_ACCOUNT=<treasury vault token account>
 # NAK_FUNDS=off|on (off is the safe default)
-# Optional: NAK_PAYOUT_AUTO_CAP=5, NAK_PAYOUT_DAY_CAP=50
+# Optional: NAK_PAYOUT_AUTO_CAP=5, NAK_PAYOUT_DAY_CAP=50,
+# NAK_PAYOUT_LOCK_FILE=%h/.neuron/credits/payout.lock
 
 [Install]
 WantedBy=default.target

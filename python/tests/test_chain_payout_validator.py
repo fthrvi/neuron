@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from chain.indexer import DepositIndexer, IndexerConfig  # noqa: E402
-from chain.payout import CLITreasuryBackend, PayoutConfig, PayoutEngine  # noqa: E402
+from chain.payout import PayoutConfig, PayoutEngine, SoldersTreasuryBackend  # noqa: E402
 from chain.solana_rpc import RPCError, SolanaRPC  # noqa: E402
 from core.ledger_store import RATE, LedgerStore  # noqa: E402
 
@@ -208,6 +208,15 @@ def test_real_deposit_hold_send_finalize_is_zero_sum(tmp_path):
             + ["mint", mint, "1", vault_account, "--mint-authority", str(treasury)],
             env,
         )
+        # The payout RPC intentionally preflights at finalized commitment.
+        # Wait for CLI-created fixtures to reach that bank before exercising it.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if rpc.account_exists(mint) and rpc.account_exists(vault_account):
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail("mint and vault account did not finalize")
 
         config = PayoutConfig(
             cluster="localnet",
@@ -218,8 +227,8 @@ def test_real_deposit_hold_send_finalize_is_zero_sum(tmp_path):
             kill_file=tmp_path / "payout.off",
         )
         secret = treasury.read_text()
-        backend = CLITreasuryBackend(
-            rpc_url,
+        backend = SoldersTreasuryBackend(
+            rpc,
             mint,
             vault_account,
             secret_loader=lambda name: secret if name == "nak-treasury-secret" else "",
