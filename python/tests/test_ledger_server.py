@@ -385,20 +385,25 @@ def test_v2_valid_receipt_settles_and_replay_is_idempotent(
 def test_v2_new_run_id_for_same_work_does_not_double_credit(
     v2_server, v2_identities, timestamps
 ):
+    """Two genuinely worker-signed runs of identical output are BOTH paid; replaying one run's
+    signatures under an invented run_id pays nothing (the signature binds the real run_id)."""
     base, service = v2_server
     first = _sign_receipt(_v2_receipt("first-run"), v2_identities)
     second = _sign_receipt(_v2_receipt("second-run"), v2_identities)
+    replay = _v2_receipt("invented-run")
+    replay["worker_signatures"] = first["worker_signatures"]
     results = []
-    for receipt in (first, second):
+    for receipt in (first, second, replay):
         code, result = _v2_request(
             base, "POST", "/settle", v2_identities["alice"], {"receipt": receipt},
             timestamp=timestamps.next(),
         )
         assert code == 200
         results.append(result)
-    assert results[0]["receipt_id"] == results[1]["receipt_id"]
-    assert service.store.balance("bob") == 20
-    assert service.store.balance("carol") == 20
+    assert results[0]["receipt_id"] != results[1]["receipt_id"]
+    assert results[2]["credited"] == {} and results[2]["charged"] == 0
+    assert service.store.balance("bob") == 40
+    assert service.store.balance("carol") == 40
 
 
 def test_v2_own_node_receipt_is_free(v2_server, v2_identities, timestamps):

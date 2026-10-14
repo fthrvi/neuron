@@ -297,12 +297,26 @@ def _valid_participation(
         return None
     if not all(isinstance(value, str) and value for value in (node_id, pubkey, signature_b64)):
         return None
-    if (node_id, start, end) not in stages:
+    # Match the signature to its chain stage. Real receipts name a stage by the node's SHORT id
+    # (client.py truncates to 14 hex chars) while the worker signs with its full node id, and a
+    # release worker's node id IS its public key (bro, 2026-10-13: every real signature failed
+    # here and earned nothing). Same layer range required; a short id must be >= 12 hex chars.
+    matched = None
+    for chain_id, chain_start, chain_end in stages:
+        if (chain_start, chain_end) != (start, end):
+            continue
+        if chain_id == node_id or (len(chain_id) >= 12 and node_id.startswith(chain_id)):
+            matched = chain_id
+            break
+    if matched is None:
         return None
     row = roster.get(pubkey)
     if not isinstance(row, Mapping):
         return None
-    if row.get("pubkey", pubkey) != pubkey or row.get("name") != node_id:
+    # The signer is bound to the rostered key either because its node id IS that key (release
+    # workers) or because the roster names it (legacy named nodes). The roster name of a
+    # pubkey-identified worker is a human label ("bro"), never its node id.
+    if row.get("pubkey", pubkey) != pubkey or (node_id != pubkey and row.get("name") != node_id):
         return None
     message = _participation_message(run_id, node_id, start, end, output_sha256)
     try:
@@ -316,7 +330,7 @@ def _valid_participation(
     operator = row.get("operator")
     if not isinstance(operator, str) or not operator:
         return None
-    return node_id, operator, start, end
+    return matched, operator, start, end
 
 
 def verify_receipt(
@@ -343,11 +357,16 @@ def verify_receipt(
 
     run_id, n_generated, output_hash, chain = _validated_receipt(receipt)
     canonical_chain = sorted(chain, key=lambda stage: (stage[0], stage[1], stage[2]))
+    # run_id IS part of the identity. Model output is deterministic, so two genuine runs of the
+    # same prompt have identical content; without run_id the second was never paid. Including it
+    # is safe because a worker signs a (run_id, output) only for a run its own Inference() served:
+    # replaying one real run under an invented run_id carries no valid signature and credits nothing.
     content = {
         "chain": canonical_chain,
         "n_generated": n_generated,
         "output_sha256": output_hash,
         "requester": requester,
+        "run_id": run_id,
     }
     canonical = json.dumps(content, sort_keys=True, separators=(",", ":"))
     receipt_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()

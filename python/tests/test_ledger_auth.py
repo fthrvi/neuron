@@ -209,11 +209,23 @@ def test_valid_receipt_credits_exactly_signed_stages(identities):
     assert units == 4 * 8
 
 
-def test_same_work_under_two_run_ids_has_same_receipt_id(identities):
+def test_two_genuine_runs_of_identical_output_are_distinct_receipts(identities):
+    """Deterministic output: two real runs of one prompt must both be payable (distinct ids)."""
     _, requester_pub = identities["requester"]
     first_id, _, _ = verify_receipt(_receipt("run-one"), requester_pub, identities["roster"])
     second_id, _, _ = verify_receipt(_receipt("run-two"), requester_pub, identities["roster"])
-    assert first_id == second_id
+    assert first_id != second_id
+
+
+def test_replaying_one_signed_run_under_a_new_run_id_credits_nothing(identities):
+    """The double-credit attack the old content key prevented: still prevented, by the signature."""
+    _, requester_pub = identities["requester"]
+    worker_a_private, worker_a_pub = identities["worker_a"]
+    real = _receipt("run-real")
+    sig = _participation(worker_a_private, worker_a_pub, real, "worker-a", 0, 8)
+    replay = _receipt("run-invented")
+    replay["worker_signatures"] = [sig]          # the signature binds run-real, not run-invented
+    assert verify_receipt(replay, requester_pub, identities["roster"])[1] == {}
 
 
 def test_signature_for_different_output_hash_is_rejected(identities):
@@ -266,3 +278,48 @@ def test_roster_loader_skips_comments_blank_and_short_rows(tmp_path):
     }
     assert roster[second_pub]["tier"] == "stranger"
     assert roster[second_pub]["coord"] is None
+
+
+def test_release_worker_shape_short_chain_id_and_pubkey_node_id_is_credited():
+    """The real shape (bro, 2026-10-13): the chain names the stage by a 14-hex SHORT id, the worker
+    signs with its full node id == its public key, and the roster name is a human label."""
+    req_private, req_pub = _keypair()
+    w_private, w_pub = _keypair()
+    roster = {req_pub: _row(req_pub, "hub-node", "self", "self"),
+              w_pub: _row(w_pub, "bro", "op-bro", "known")}
+    receipt = _receipt()
+    receipt["chain"] = [{"node_id": w_pub[:14], "layer_start": 0, "layer_end": 28}]
+    receipt["worker_signatures"] = [_participation(w_private, w_pub, receipt, w_pub, 0, 28)]
+    _, credited, units = verify_receipt(receipt, req_pub, roster)
+    assert credited == {"op-bro": 4 * 28} and units == 4 * 28
+
+
+def test_short_id_match_never_crosses_layer_ranges_or_short_prefixes():
+    req_private, req_pub = _keypair()
+    w_private, w_pub = _keypair()
+    roster = {req_pub: _row(req_pub, "hub-node", "self", "self"),
+              w_pub: _row(w_pub, "bro", "op-bro", "known")}
+    receipt = _receipt()
+    # a different layer range than the signed one: nothing is credited
+    receipt["chain"] = [{"node_id": w_pub[:14], "layer_start": 0, "layer_end": 20},
+                        {"node_id": "other-node", "layer_start": 20, "layer_end": 28}]
+    receipt["worker_signatures"] = [_participation(w_private, w_pub, receipt, w_pub, 0, 28)]
+    assert verify_receipt(receipt, req_pub, roster)[1] == {}
+    # an id prefix shorter than 12 hex chars never matches
+    receipt["chain"] = [{"node_id": w_pub[:8], "layer_start": 0, "layer_end": 28}]
+    receipt["worker_signatures"] = [_participation(w_private, w_pub, receipt, w_pub, 0, 28)]
+    assert verify_receipt(receipt, req_pub, roster)[1] == {}
+
+
+def test_a_signer_cannot_claim_another_nodes_short_id():
+    """A rostered key signing as a node id that is NOT its own key and NOT its roster name earns nothing."""
+    req_private, req_pub = _keypair()
+    w_private, w_pub = _keypair()
+    victim_private, victim_pub = _keypair()
+    roster = {req_pub: _row(req_pub, "hub-node", "self", "self"),
+              w_pub: _row(w_pub, "bro", "op-bro", "known"),
+              victim_pub: _row(victim_pub, "victim", "op-victim", "known")}
+    receipt = _receipt()
+    receipt["chain"] = [{"node_id": victim_pub[:14], "layer_start": 0, "layer_end": 28}]
+    receipt["worker_signatures"] = [_participation(w_private, w_pub, receipt, victim_pub, 0, 28)]
+    assert verify_receipt(receipt, req_pub, roster)[1] == {}
