@@ -571,7 +571,9 @@ def test_migration_refuses_nonempty_target_without_force(tmp_path):
     source = tmp_path / "ledger.json"
     target = tmp_path / "ledger.sqlite"
     source.write_text(
-        json.dumps({"balances": {"alice": 5}, "settled": {}, "journal": []}),
+        json.dumps(
+            {"balances": {"alice": 5, "bob": -5}, "settled": {}, "journal": []}
+        ),
         encoding="utf-8",
     )
     target.write_bytes(b"do not overwrite")
@@ -582,6 +584,7 @@ def test_migration_refuses_nonempty_target_without_force(tmp_path):
     migrate(source, target, force=True)
     with LedgerStore(target) as store:
         assert store.balance("alice") == 5
+        assert store.balance("bob") == -5
 
 
 if __name__ == "__main__":

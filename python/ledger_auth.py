@@ -13,11 +13,14 @@ import math
 import re
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import Mapping, Protocol
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
+
+from core.ledger_store import is_reserved
 
 
 AUTH_SCHEME = "Sthambha-Ed25519"
@@ -174,6 +177,13 @@ def load_roster(path: str | Path) -> dict[str, dict[str, str | None]]:
         if len(fields) < 5:
             continue
         pubkey, name, operator, tier, tenant = fields[:5]
+        if is_reserved(operator):
+            warnings.warn(
+                f"ignoring roster row for {name!r}: operator {operator!r} is reserved",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
         roster[pubkey] = {
             "pubkey": pubkey,
             "name": name,

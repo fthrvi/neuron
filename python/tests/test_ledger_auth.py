@@ -280,6 +280,26 @@ def test_roster_loader_skips_comments_blank_and_short_rows(tmp_path):
     assert roster[second_pub]["coord"] is None
 
 
+def test_roster_loader_warns_and_ignores_reserved_operators(tmp_path):
+    _, treasury_pub = _keypair()
+    _, hold_pub = _keypair()
+    _, valid_pub = _keypair()
+    roster_path = tmp_path / "peers.tsv"
+    roster_path.write_text(
+        f"{treasury_pub}\tnode-a\ttreasury\tself\ttenant-a\n"
+        f"{hold_pub}\tnode-b\t__withdrawal_hold__spoof\tknown\ttenant-b\n"
+        f"{valid_pub}\tnode-c\talice\ttrusted\ttenant-c\n",
+        encoding="utf-8",
+    )
+
+    with pytest.warns(RuntimeWarning, match="operator .* is reserved") as caught:
+        roster = load_roster(roster_path)
+
+    assert len(caught) == 2
+    assert set(roster) == {valid_pub}
+    assert roster[valid_pub]["operator"] == "alice"
+
+
 def test_release_worker_shape_short_chain_id_and_pubkey_node_id_is_credited():
     """The real shape (bro, 2026-10-13): the chain names the stage by a 14-hex SHORT id, the worker
     signs with its full node id == its public key, and the roster name is a human label."""

@@ -16,10 +16,13 @@ from core.ledger_store import (  # noqa: E402
     RATE,
     TIER_LIMITS,
     CreditLimitError,
+    DepositConflict,
     LedgerStore,
     LedgerValueError,
     ReceiptStateError,
+    WithdrawalStateError,
     import_legacy_snapshot,
+    is_reserved,
 )
 
 
@@ -253,6 +256,62 @@ def test_import_legacy_snapshot_preserves_balances_and_marks_receipts(tmp_path):
         assert db.execute("SELECT SUM(balance) FROM accounts").fetchone()[0] == 0
 
 
+def test_import_legacy_snapshot_rejects_non_zero_sum_balances(tmp_path):
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        with pytest.raises(LedgerValueError, match="must sum to zero"):
+            import_legacy_snapshot(
+                {"balances": {"alice": 5}, "settled": {}}, store
+            )
+        assert store._db.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0
+
+
+def test_import_legacy_snapshot_rejects_unbalanced_receipt(tmp_path):
+    snapshot = {
+        "balances": {"worker": 10, "consumer": -10},
+        "settled": {
+            "legacy-run": {
+                "credited": {"worker": 5},
+                "requester": "consumer",
+                "debited": 10,
+            }
+        },
+    }
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        with pytest.raises(LedgerValueError, match="credited amounts must sum"):
+            import_legacy_snapshot(snapshot, store)
+        assert store._db.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0
+
+
+def test_dispute_rolls_back_if_legacy_reversal_would_break_zero_sum(tmp_path):
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        store._db.executemany(
+            "INSERT INTO accounts(id, balance) VALUES (?, ?)",
+            (("consumer", -10), ("worker", 10)),
+        )
+        store._db.execute(
+            "INSERT INTO receipts(receipt_id, requester, credited, charged, delta, "
+            "tier, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "bad-legacy",
+                "consumer",
+                json.dumps({"worker": 5}),
+                10,
+                -10,
+                "stranger",
+                "legacy_unsigned",
+                1,
+            ),
+        )
+
+        with pytest.raises(AssertionError, match="balance invariant"):
+            store.dispute("bad-legacy")
+
+        assert store.balance("consumer") == -10
+        assert store.balance("worker") == 10
+        assert store.receipt_state("bad-legacy") == "legacy_unsigned"
+        assert store._db.execute("SELECT COUNT(*) FROM journal").fetchone()[0] == 0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
 
@@ -303,10 +362,10 @@ def test_deposit_is_idempotent_by_ref_and_preserves_zero_sum(tmp_path):
         _assert_zero_sum(store)
         assert store.balance("alice") == 12_300
         assert store.balance("bob") == 0
-        assert store.balance("treasury") == -12_300
+        assert store._balance_in(store._db, "treasury") == -12_300
 
-        # The chain reference is authoritative on replay; no balances or rows move twice.
-        assert store.deposit("sig:0", "bob", 99, 999) == 12_300
+        # An exact replay returns the original result without moving balances twice.
+        assert store.deposit("sig:0", "alice", 12_300, 42) == 12_300
         _assert_zero_sum(store)
         assert store.balance("alice") == 12_300
         assert store._db.execute("SELECT COUNT(*) FROM chain_refs").fetchone()[0] == 1
@@ -315,6 +374,23 @@ def test_deposit_is_idempotent_by_ref_and_preserves_zero_sum(tmp_path):
         ).fetchone()[0] == 1
         detail = json.loads(store.history("alice")[0]["detail"])
         assert detail == {"rate": RATE, "ref": "sig:0", "slot": 42}
+
+
+@pytest.mark.parametrize(
+    ("operator", "credits", "slot"),
+    (("bob", 12_300, 42), ("alice", 99, 42), ("alice", 12_300, 999)),
+)
+def test_deposit_ref_replay_with_different_details_conflicts(
+    tmp_path, operator, credits, slot
+):
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        store.deposit("sig:0", "alice", 12_300, 42)
+        with pytest.raises(DepositConflict, match="different details"):
+            store.deposit("sig:0", operator, credits, slot)
+        assert store.balance("alice") == 12_300
+        assert store.balance("bob") == 0
+        assert store._db.execute("SELECT COUNT(*) FROM chain_refs").fetchone()[0] == 1
+        _assert_zero_sum(store)
 
 
 def test_unfunded_earnings_are_never_withdrawable(tmp_path, monkeypatch):
@@ -371,16 +447,20 @@ def test_withdraw_hold_release_and_finalize_preserve_zero_sum(tmp_path):
             "alice", 50, "address-a", withdrawal_id="finalize-me"
         ) == "finalize-me"
         _assert_zero_sum(store)
-        with pytest.raises(ReceiptStateError):
+        with pytest.raises(WithdrawalStateError):
             store.withdraw_finalize("finalize-me")
         store._db.execute(
             "UPDATE withdrawals SET state='sent', tx_sig='finalize-signature' "
             "WHERE id='finalize-me'"
         )
         assert store.withdraw_finalize("finalize-me") == 50
+        with pytest.raises(WithdrawalStateError, match="finalized"):
+            store.withdraw_finalize("finalize-me")
+        with pytest.raises(WithdrawalStateError, match="finalized"):
+            store.withdraw_release("finalize-me")
         _assert_zero_sum(store)
         assert store.balance("alice") == 50
-        assert store.balance("treasury") == -50
+        assert store._balance_in(store._db, "treasury") == -50
         assert store.withdrawable("alice") == 50
         states = dict(store._db.execute("SELECT id, state FROM withdrawals"))
         assert states == {"release-me": "released", "finalize-me": "finalized"}
@@ -397,20 +477,24 @@ def test_withdrawal_state_machine_and_unique_transaction_signature(tmp_path):
             "UPDATE withdrawals SET state='sent', tx_sig='signature-a' WHERE id=?",
             (sent_id,),
         )
-        with pytest.raises(ReceiptStateError):
+        with pytest.raises(WithdrawalStateError):
             store.withdraw_release(sent_id)
         assert store.withdraw_finalize(sent_id) == 10
-        assert store.withdraw_finalize(sent_id) == 10
+        with pytest.raises(WithdrawalStateError, match="finalized"):
+            store.withdraw_finalize(sent_id)
         _assert_zero_sum(store)
 
         expired_id = store.withdraw_hold("alice", 10, "address-a")
         store._db.execute(
             "UPDATE withdrawals SET state='expired' WHERE id=?", (expired_id,)
         )
-        with pytest.raises(ReceiptStateError):
+        with pytest.raises(WithdrawalStateError):
             store.withdraw_finalize(expired_id)
         assert store.withdraw_release(expired_id) == 10
-        assert store.withdraw_release(expired_id) == 10
+        with pytest.raises(WithdrawalStateError, match="released"):
+            store.withdraw_release(expired_id)
+        with pytest.raises(WithdrawalStateError, match="released"):
+            store.withdraw_finalize(expired_id)
         with pytest.raises(sqlite3.IntegrityError):
             store._db.execute(
                 "UPDATE withdrawals SET tx_sig='signature-a' WHERE id=?", (expired_id,)
@@ -440,10 +524,54 @@ def test_money_operations_enforce_max_units_without_partial_writes(tmp_path):
         store.withdraw_finalize("max-withdrawal")
         _assert_zero_sum(store)
         assert store.balance("alice") == 0
-        assert store.balance("treasury") == 0
+        assert store._balance_in(store._db, "treasury") == 0
 
     with LedgerStore(tmp_path / "invalid.db") as store:
         for value in (-1, 0, 1.5, True, MAX_UNITS + 1):
             with pytest.raises(LedgerValueError):
                 store.deposit("bad:0", "alice", value, 1)
         _assert_zero_sum(store)
+
+
+@pytest.mark.parametrize(
+    "account", ("treasury", "__withdrawal_hold__:id", "__withdrawal_hold__spoof")
+)
+def test_reserved_accounts_are_refused_by_all_user_facing_reads(tmp_path, account):
+    assert is_reserved(account)
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        for read in (store.balance, store.history, store.withdrawable):
+            with pytest.raises(LedgerValueError, match="reserved"):
+                read(account)
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    (
+        {"balances": {"treasury": 0}, "settled": {}},
+        {
+            "balances": {"alice": 0},
+            "settled": {
+                "receipt": {
+                    "requester": "__withdrawal_hold__:id",
+                    "credited": {"worker": 1},
+                    "debited": 1,
+                }
+            },
+        },
+        {
+            "balances": {"alice": 0},
+            "settled": {
+                "receipt": {
+                    "requester": "alice",
+                    "credited": {"__withdrawal_hold__spoof": 1},
+                    "debited": 1,
+                }
+            },
+        },
+    ),
+)
+def test_import_legacy_snapshot_refuses_reserved_accounts(tmp_path, snapshot):
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        with pytest.raises(LedgerValueError, match="reserved"):
+            import_legacy_snapshot(snapshot, store)
+        assert store._db.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0

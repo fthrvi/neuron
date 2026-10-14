@@ -35,7 +35,8 @@ RATE = 100
 HOLD_S = 7 * 24 * 60 * 60
 
 TREASURY_ACCOUNT = "treasury"
-_WITHDRAWAL_HOLD_PREFIX = "__withdrawal_hold__:"
+_WITHDRAWAL_HOLD_STEM = "__withdrawal_hold__"
+_WITHDRAWAL_HOLD_PREFIX = f"{_WITHDRAWAL_HOLD_STEM}:"
 
 # These limits mirror nakshatra/scripts/creditlimit.py.  Unknown tiers are
 # intentionally treated as strangers (the tightest policy).
@@ -61,6 +62,21 @@ class CreditLimitError(LedgerError):
 
 class ReceiptStateError(LedgerError):
     """A receipt exists but its durable state forbids the requested action."""
+
+
+class DepositConflict(LedgerError):
+    """A chain reference was replayed with details that do not match its deposit."""
+
+
+class WithdrawalStateError(ReceiptStateError):
+    """A withdrawal does not exist or cannot make the requested state transition."""
+
+
+def is_reserved(account: object) -> bool:
+    """Return whether an account name belongs to ledger-internal accounting."""
+    return isinstance(account, str) and (
+        account == TREASURY_ACCOUNT or account.startswith(_WITHDRAWAL_HOLD_STEM)
+    )
 
 
 def _amount(value: Any, name: str = "amount", *, allow_zero: bool = False) -> int:
@@ -258,6 +274,10 @@ class LedgerStore:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 result = operation(self._db)
+                total = self._db.execute(
+                    "SELECT COALESCE(SUM(balance), 0) FROM accounts"
+                ).fetchone()[0]
+                assert total == 0, f"ledger balance invariant violated: sum={total}"
                 self._db.execute("COMMIT")
                 return result
             except BaseException:
@@ -351,7 +371,7 @@ class LedgerStore:
         """
         receipt_id = _identifier(receipt_id, "receipt_id")
         requester = _identifier(requester, "requester")
-        if requester == TREASURY_ACCOUNT or requester.startswith(_WITHDRAWAL_HOLD_PREFIX):
+        if is_reserved(requester):
             raise LedgerValueError("requester is reserved")
         # Work on the requester's OWN nodes is free (local = free) but is still recorded for the audit.
         charged = _amount(charged, "charged", allow_zero=True)
@@ -361,7 +381,7 @@ class LedgerStore:
         clean_credits: dict[str, int] = {}
         for account, amount in credited.items():
             account = _identifier(account, "credited account")
-            if account == TREASURY_ACCOUNT or account.startswith(_WITHDRAWAL_HOLD_PREFIX):
+            if is_reserved(account):
                 raise LedgerValueError("credited account is reserved")
             clean_credits[account] = _amount(amount, f"credit for {account}")
         if sum(clean_credits.values()) != charged:
@@ -454,7 +474,7 @@ class LedgerStore:
         """Credit one finalized chain deposit exactly once and return its credits."""
         ref = _identifier(ref, "ref")
         operator = _identifier(operator, "operator")
-        if operator == TREASURY_ACCOUNT or operator.startswith(_WITHDRAWAL_HOLD_PREFIX):
+        if is_reserved(operator):
             raise LedgerValueError("operator is reserved")
         credits = _amount(credits, "credits")
         if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
@@ -465,9 +485,18 @@ class LedgerStore:
 
         def operation(db: sqlite3.Connection) -> int:
             existing = db.execute(
-                "SELECT amount FROM chain_refs WHERE ref=?", (ref,)
+                "SELECT kind, account, amount, slot FROM chain_refs WHERE ref=?", (ref,)
             ).fetchone()
             if existing is not None:
+                if (
+                    existing["kind"] != "deposit"
+                    or existing["account"] != operator
+                    or int(existing["amount"]) != credits
+                    or int(existing["slot"]) != slot
+                ):
+                    raise DepositConflict(
+                        f"deposit reference {ref!r} already has different details"
+                    )
                 return int(existing["amount"])
 
             treasury_new = self._checked_balance(
@@ -507,6 +536,8 @@ class LedgerStore:
     def withdrawable(self, operator: str) -> int:
         """Return cashable credits: net deposits plus funded, matured earnings."""
         operator = _identifier(operator, "operator")
+        if is_reserved(operator):
+            raise LedgerValueError("operator is reserved")
         with self._lock:
             return self._withdrawable_in(self._db, operator, int(time.time()))
 
@@ -520,7 +551,7 @@ class LedgerStore:
         """Debit an operator into a pending hold and return its withdrawal id."""
         operator = _identifier(operator, "operator")
         address = _identifier(address, "address")
-        if operator == TREASURY_ACCOUNT or operator.startswith(_WITHDRAWAL_HOLD_PREFIX):
+        if is_reserved(operator):
             raise LedgerValueError("operator is reserved")
         amount = _amount(amount)
         if withdrawal_id is None:
@@ -589,12 +620,12 @@ class LedgerStore:
                 (withdrawal_id,),
             ).fetchone()
             if row is None:
-                raise ReceiptStateError(f"withdrawal {withdrawal_id!r} does not exist")
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} does not exist"
+                )
             amount = int(row["amount"])
-            if row["state"] == "finalized":
-                return amount
             if row["state"] != "sent":
-                raise ReceiptStateError(
+                raise WithdrawalStateError(
                     f"withdrawal {withdrawal_id!r} is {row['state']} and cannot finalize"
                 )
             if self._balance_in(db, hold_account) != amount:
@@ -643,12 +674,12 @@ class LedgerStore:
                 (withdrawal_id,),
             ).fetchone()
             if row is None:
-                raise ReceiptStateError(f"withdrawal {withdrawal_id!r} does not exist")
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} does not exist"
+                )
             amount = int(row["amount"])
-            if row["state"] == "released":
-                return amount
             if row["state"] not in ("pending", "approved", "expired"):
-                raise ReceiptStateError(
+                raise WithdrawalStateError(
                     f"withdrawal {withdrawal_id!r} is {row['state']} and cannot release"
                 )
             if self._balance_in(db, hold_account) != amount:
@@ -685,12 +716,7 @@ class LedgerStore:
         """Move units atomically, allowing debt only within ``src``'s tier."""
         src = _identifier(src, "src")
         dst = _identifier(dst, "dst")
-        if (
-            src == TREASURY_ACCOUNT
-            or dst == TREASURY_ACCOUNT
-            or src.startswith(_WITHDRAWAL_HOLD_PREFIX)
-            or dst.startswith(_WITHDRAWAL_HOLD_PREFIX)
-        ):
+        if is_reserved(src) or is_reserved(dst):
             raise LedgerValueError("cannot transfer to or from a reserved account")
         if src == dst:
             raise LedgerValueError("cannot transfer to the same account")
@@ -777,11 +803,15 @@ class LedgerStore:
 
     def balance(self, account: str) -> int:
         account = _identifier(account, "account")
+        if is_reserved(account):
+            raise LedgerValueError("account is reserved")
         with self._lock:
             return self._balance_in(self._db, account)
 
     def history(self, account: str, limit: int = 50) -> list[dict[str, Any]]:
         account = _identifier(account, "account")
+        if is_reserved(account):
+            raise LedgerValueError("account is reserved")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise LedgerValueError("limit must be a positive integer")
         with self._lock:
@@ -844,7 +874,11 @@ def import_legacy_snapshot(snapshot: dict[str, Any], store: LedgerStore) -> None
     balances: dict[str, int] = {}
     for account, value in raw_balances.items():
         account = _identifier(account, "legacy account")
+        if is_reserved(account):
+            raise LedgerValueError("legacy account is reserved")
         balances[account] = _stored_integer(value, f"legacy balance for {account}")
+    if sum(balances.values()) != 0:
+        raise LedgerValueError("legacy balances must sum to zero")
 
     receipts: list[tuple[str, str, str, int, int]] = []
     for receipt_id, raw in raw_settled.items():
@@ -852,6 +886,8 @@ def import_legacy_snapshot(snapshot: dict[str, Any], store: LedgerStore) -> None
         if not isinstance(raw, dict):
             raise LedgerValueError(f"legacy receipt {receipt_id!r} must be a dict")
         requester = _identifier(raw.get("requester"), "legacy requester")
+        if is_reserved(requester):
+            raise LedgerValueError("legacy requester is reserved")
         charged = _stored_integer(raw.get("debited"), "legacy debited")
         if charged < 0:
             raise LedgerValueError("legacy debited must not be negative")
@@ -861,7 +897,13 @@ def import_legacy_snapshot(snapshot: dict[str, Any], store: LedgerStore) -> None
         credited: dict[str, int] = {}
         for account, amount in raw_credited.items():
             account = _identifier(account, "legacy credited account")
+            if is_reserved(account):
+                raise LedgerValueError("legacy credited account is reserved")
             credited[account] = _amount(amount, f"legacy credit for {account}")
+        if sum(credited.values()) != charged:
+            raise LedgerValueError(
+                f"legacy receipt {receipt_id!r} credited amounts must sum to debited"
+            )
         receipts.append(
             (
                 receipt_id,
@@ -915,10 +957,13 @@ __all__ = [
     "HOLD_S",
     "TREASURY_ACCOUNT",
     "TIER_LIMITS",
+    "is_reserved",
     "LedgerError",
     "LedgerValueError",
     "CreditLimitError",
     "ReceiptStateError",
+    "DepositConflict",
+    "WithdrawalStateError",
     "LedgerStore",
     "import_legacy_snapshot",
 ]
