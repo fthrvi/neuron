@@ -1,0 +1,26 @@
+# Example user unit. Copying this file does not enable it; an operator must
+# configure the environment file and explicitly run `systemctl --user enable`.
+[Unit]
+Description=Nakshatra finalized Solana deposit indexer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/nakshatra/indexer.env
+ExecStart=/usr/bin/python3 /home/prithvi/neuron/python/chain/indexer.py --store %h/.neuron/credits/ledger.sqlite
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.neuron/credits
+
+# Required in indexer.env:
+# NAK_SOLANA_CLUSTER=devnet|localnet
+# NAK_USDC_MINT=<base58 mint pubkey>
+# NAK_SOLANA_RPC=<explicit http(s) RPC URL>
+# mainnet-beta is refused by the process in v1.
+
+[Install]
+WantedBy=default.target

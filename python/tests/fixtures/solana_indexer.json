@@ -1,0 +1,64 @@
+{
+  "addresses": {
+    "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "other_mint": "So11111111111111111111111111111111111111112",
+    "deposit": "11111111111111111111111111111111",
+    "source": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  },
+  "signatures": [
+    {"signature": "sig-failed", "slot": 15, "err": {"InstructionError": [0, "Custom"]}, "confirmationStatus": "finalized"},
+    {"signature": "sig-outgoing", "slot": 14, "err": null, "confirmationStatus": "finalized"},
+    {"signature": "sig-wrong-mint", "slot": 13, "err": null, "confirmationStatus": "finalized"},
+    {"signature": "sig-inner", "slot": 12, "err": null, "confirmationStatus": "finalized"},
+    {"signature": "sig-checked", "slot": 11, "err": null, "confirmationStatus": "finalized"},
+    {"signature": "sig-transfer", "slot": 10, "err": null, "confirmationStatus": "finalized"}
+  ],
+  "transactions": {
+    "sig-transfer": {
+      "slot": 10,
+      "transaction": {"signatures": ["sig-transfer"], "message": {"accountKeys": [], "recentBlockhash": "hash", "instructions": [
+        {"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "parsed": {"type": "transfer", "info": {"source": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "destination": "11111111111111111111111111111111", "authority": "authority", "amount": "3"}}, "stackHeight": null}
+      ]}},
+      "meta": {"err": null, "innerInstructions": [], "logMessages": []}
+    },
+    "sig-checked": {
+      "slot": 11,
+      "transaction": {"signatures": ["sig-checked"], "message": {"accountKeys": [], "recentBlockhash": "hash", "instructions": [
+        {"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "parsed": {"type": "transferChecked", "info": {"source": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "destination": "11111111111111111111111111111111", "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "authority": "authority", "tokenAmount": {"amount": "5", "decimals": 6, "uiAmount": 0.000005, "uiAmountString": "0.000005"}}}, "stackHeight": null},
+        {"program": "spl-memo", "programId": "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", "parsed": "memo noise", "stackHeight": null}
+      ]}},
+      "meta": {"err": null, "innerInstructions": [], "logMessages": []}
+    },
+    "sig-inner": {
+      "slot": 12,
+      "transaction": {"signatures": ["sig-inner"], "message": {"accountKeys": [], "recentBlockhash": "hash", "instructions": [
+        {"program": "spl-memo", "programId": "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", "parsed": "outer memo", "stackHeight": null},
+        {"program": "system", "programId": "11111111111111111111111111111111", "parsed": {"type": "transfer", "info": {"source": "payer", "destination": "other", "lamports": 1}}, "stackHeight": null}
+      ]}},
+      "meta": {"err": null, "innerInstructions": [{"index": 1, "instructions": [
+        {"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "parsed": {"type": "transferChecked", "info": {"source": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "destination": "11111111111111111111111111111111", "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "authority": "authority", "tokenAmount": {"amount": "7", "decimals": 6, "uiAmount": 0.000007, "uiAmountString": "0.000007"}}}, "stackHeight": 2}
+      ]}], "logMessages": []}
+    },
+    "sig-wrong-mint": {
+      "slot": 13,
+      "transaction": {"signatures": ["sig-wrong-mint"], "message": {"accountKeys": [], "recentBlockhash": "hash", "instructions": [
+        {"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "parsed": {"type": "transferChecked", "info": {"source": "source", "destination": "11111111111111111111111111111111", "mint": "So11111111111111111111111111111111111111112", "authority": "authority", "tokenAmount": {"amount": "9", "decimals": 6, "uiAmount": 0.000009, "uiAmountString": "0.000009"}}}, "stackHeight": null}
+      ]}},
+      "meta": {"err": null, "innerInstructions": [], "logMessages": []}
+    },
+    "sig-outgoing": {
+      "slot": 14,
+      "transaction": {"signatures": ["sig-outgoing"], "message": {"accountKeys": [], "recentBlockhash": "hash", "instructions": [
+        {"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "parsed": {"type": "transfer", "info": {"source": "11111111111111111111111111111111", "destination": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "authority": "authority", "amount": "2"}}, "stackHeight": null}
+      ]}},
+      "meta": {"err": null, "innerInstructions": [], "logMessages": []}
+    },
+    "sig-failed": {
+      "slot": 15,
+      "transaction": {"signatures": ["sig-failed"], "message": {"accountKeys": [], "recentBlockhash": "hash", "instructions": [
+        {"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "parsed": {"type": "transferChecked", "info": {"source": "source", "destination": "11111111111111111111111111111111", "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "authority": "authority", "tokenAmount": {"amount": "11", "decimals": 6, "uiAmount": 0.000011, "uiAmountString": "0.000011"}}}, "stackHeight": null}
+      ]}},
+      "meta": {"err": {"InstructionError": [0, {"Custom": 1}]}, "innerInstructions": [], "logMessages": []}
+    }
+  }
+}
