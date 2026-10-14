@@ -131,6 +131,10 @@ def _write_signing_key(path):
     path.parent.mkdir(parents=True)
     path.write_bytes(raw)
     path.chmod(0o600)
+    return private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    ).hex()
 
 
 def _no_buzz(_helper, _message):
@@ -255,7 +259,7 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
         _wait_finalized(rpc, deposit_signature)
 
         signing_key = home / ".nakshatra" / "keys" / "worker.ed25519"
-        _write_signing_key(signing_key)
+        signing_public_key = _write_signing_key(signing_key)
         ledger_path = tmp_path / "ledger.sqlite"
         with LedgerStore(ledger_path) as store:
             store._db.execute(
@@ -285,14 +289,15 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
                 )
 
             envelope, report_path = Reconciler(
-                store,
+                ledger_path,
                 rpc,
                 reconcile_config("reports-ok"),
                 notify=_no_buzz,
             ).run()
             assert envelope["report"]["ok"] is True
-            assert verify_report(envelope) is True
-            assert verify_report(json.loads(report_path.read_text())) is True
+            assert verify_report(envelope, signing_public_key) is True
+            assert verify_report(envelope, None) is False
+            assert verify_report(json.loads(report_path.read_text()), signing_public_key) is True
             assert envelope["report"]["finalized_withdrawal_verification"] == "all"
             assert not (tmp_path / "payout.off").exists()
 
@@ -311,7 +316,7 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
                     (RATE,),
                 )
                 mismatch_envelope, mismatch_path = Reconciler(
-                    bogus,
+                    bogus_path,
                     rpc,
                     reconcile_config("reports-mismatch", "mismatch-payout.off"),
                     notify=_no_buzz,
@@ -319,11 +324,15 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
             mismatch = mismatch_envelope["report"]
             assert mismatch["ok"] is False
             assert next(
-                check for check in mismatch["checks"] if check["id"] == "deposit_journal"
+                check
+                for check in mismatch["checks"]
+                if check["id"] == "deposit_provenance"
             )["ok"] is False
             assert (tmp_path / "mismatch-payout.off").is_file()
             assert mismatch["alerts"][0]["event"] == "nak_reconcile_mismatch"
-            assert verify_report(json.loads(mismatch_path.read_text())) is True
+            assert verify_report(
+                json.loads(mismatch_path.read_text()), signing_public_key
+            ) is True
 
             payout_config = PayoutConfig(
                 cluster="localnet",
@@ -360,7 +369,7 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
             _wait_finalized(rpc, sent["tx_sig"])
 
             sent_envelope, _ = Reconciler(
-                store,
+                ledger_path,
                 rpc,
                 reconcile_config("reports-sent", "sent-payout.off"),
                 notify=_no_buzz,
@@ -375,7 +384,7 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
 
             store.withdraw_finalize("sent-withdrawal")
             final_envelope, _ = Reconciler(
-                store,
+                ledger_path,
                 rpc,
                 reconcile_config("reports-final", "final-payout.off"),
                 notify=_no_buzz,

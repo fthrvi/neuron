@@ -194,6 +194,42 @@ class SolanaRPC:
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise RPCError(f"{address} is not a parsed SPL token account") from exc
 
+    def get_token_accounts(self, addresses: list[str]) -> dict[str, Any]:
+        """Read token accounts atomically at one finalized RPC context slot."""
+        if not addresses:
+            raise ValueError("at least one token account is required")
+        if len(set(addresses)) != len(addresses):
+            raise ValueError("token account addresses must be unique")
+        result = self.call(
+            "getMultipleAccounts",
+            [addresses, {"commitment": "finalized", "encoding": "jsonParsed"}],
+        )
+        try:
+            slot = int(result["context"]["slot"])
+            values = result["value"]
+            if slot < 0 or not isinstance(values, list) or len(values) != len(addresses):
+                raise ValueError("invalid context or account count")
+            accounts: list[dict[str, Any]] = []
+            for address, value in zip(addresses, values, strict=True):
+                parsed = value["data"]["parsed"]
+                if parsed["type"] != "account":
+                    raise KeyError("type")
+                info = parsed["info"]
+                token_amount = info["tokenAmount"]
+                account = {
+                    "token_account": address,
+                    "mint": info["mint"],
+                    "amount": int(token_amount["amount"]),
+                    "decimals": int(token_amount["decimals"]),
+                    "owner": info["owner"],
+                }
+                if account["amount"] < 0:
+                    raise ValueError("negative token amount")
+                accounts.append(account)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise RPCError("getMultipleAccounts returned malformed token accounts") from exc
+        return {"slot": slot, "accounts": accounts}
+
     def get_latest_blockhash(self) -> dict[str, Any]:
         result = self.call(
             "getLatestBlockhash", [{"commitment": "finalized"}]
@@ -240,6 +276,29 @@ class SolanaRPC:
         if status is not None and not isinstance(status, dict):
             raise RPCError("signature status is neither an object nor null")
         return status
+
+    def get_signature_statuses(
+        self, signatures: list[str]
+    ) -> dict[str, dict[str, Any] | None]:
+        """Read all requested statuses in one RPC call."""
+        if len(set(signatures)) != len(signatures):
+            raise ValueError("signatures must be unique")
+        if not signatures:
+            return {}
+        result = self.call(
+            "getSignatureStatuses",
+            [signatures, {"searchTransactionHistory": True}],
+        )
+        try:
+            values = result["value"]
+            if not isinstance(values, list) or len(values) != len(signatures):
+                raise TypeError("invalid status count")
+            statuses = dict(zip(signatures, values, strict=True))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RPCError("getSignatureStatuses returned malformed data") from exc
+        if any(value is not None and not isinstance(value, dict) for value in values):
+            raise RPCError("signature status is neither an object nor null")
+        return statuses
 
     def send_transaction(self, transaction_b64: str) -> str:
         result = self.call(

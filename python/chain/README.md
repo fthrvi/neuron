@@ -19,17 +19,38 @@ repository.
 Indexer, treasury, and reconcile must use the same ledger, cluster, mint, RPC, and vault
 configuration. Reconcile writes `~/.neuron/credits/reconcile/<UTC-date>.json`, signs it
 with `~/.nakshatra/keys/worker.ed25519`, checks every finalized withdrawal (not a sample),
-and appends mismatches to `reconcile/alerts.jsonl`. It uses only read RPC methods and does
-not need `solders`; `/usr/bin/python3` is sufficient when Neuron's normal Python
-dependencies are installed. `NAK_SOLANA_RPC_CONFIRM` enables an independent second read
-for account, status, and transaction agreement.
+validates every pending/approved/sent/expired/finalized/released hold and lifecycle journal,
+and appends mismatches or inconclusive collections to `reconcile/alerts.jsonl`. It opens
+the existing ledger through SQLite's `file:...?mode=ro` URI, performs the complete ledger
+read in an explicit read transaction, and never runs `LedgerStore` initialization or
+migrations. A missing, unreadable, or old-schema ledger is therefore a collection error
+and creates the payout kill file rather than a new database.
 
-Verify a report without contacting Solana:
+It uses only read RPC methods and does not need `solders`; `/usr/bin/python3` is sufficient
+when Neuron's normal Python dependencies are installed. Every collection brackets one
+transactional ledger image with two finalized `getMultipleAccounts` reads and batches all
+withdrawal statuses into one `getSignatureStatuses` call. A changing chain/ledger view or
+a deposit visible on chain before the indexer records it is `inconclusive`, not a mismatch.
+The service retries three times by default, alerts without killing after an inconclusive
+run, and creates the kill file after three consecutive inconclusive runs. Configure these
+budgets with `NAK_RECONCILE_SNAPSHOT_ATTEMPTS`, `NAK_RECONCILE_RETRY_DELAY_S`, and
+`NAK_RECONCILE_INCONCLUSIVE_KILL_RUNS`. `NAK_SOLANA_RPC_CONFIRM` enables an independent
+second read for account, status, and transaction agreement.
+
+Verification must use a hub public key pinned independently of the report. The report's
+embedded `keyid` is informational and is never a trust root. Store the expected raw
+32-byte Ed25519 public key as 64 lowercase hex characters in a root/operator-managed
+configuration file, then verify without contacting Solana:
 
 ```bash
 python3 /opt/neuron/python/chain/reconcile.py \
-  --verify-report "$HOME/.neuron/credits/reconcile/$(date -u +%F).json"
+  --verify-report "$HOME/.neuron/credits/reconcile/$(date -u +%F).json" \
+  --expect-pubkey-file "$HOME/.config/nakshatra/reconcile-hub.pub"
 ```
+
+`--expect-pubkey <hex>` is equivalent for automation. Verification requires the pinned
+key and also checks the fixed `Sthambha-Ed25519` scheme, `REPORT` method, reconciliation
+path, and `nak-credit-reconciliation-v1` purpose inside the signed payload.
 
 ## Safety switches
 
@@ -37,7 +58,10 @@ python3 /opt/neuron/python/chain/reconcile.py \
 - `NAK_FUNDS_ROUTES=on` exposes the wallet/withdraw HTTP routes. Leave it unset or `off`
   until the indexer, treasury, and first reconciliation are healthy.
 - `NAK_PAYOUT_KILL_FILE` defaults to `~/.neuron/credits/payout.off`. Its presence halts
-  payouts immediately. Reconciliation creates it on any mismatch and never removes it.
+  payouts immediately. Reconciliation creates it on any stable mismatch, collection
+  exception, or repeated inconclusive result and never removes it. Creation is exclusive,
+  does not follow symlinks, and replaces a symlink/special-file obstruction with a real
+  regular kill file.
 
 The reconcile alert path calls Trisul's existing
 `/home/prithvi/trisul/infra/mesh-agent/buzz-say.sh` helper when present. That helper reuses
