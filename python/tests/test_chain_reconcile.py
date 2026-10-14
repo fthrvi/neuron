@@ -353,3 +353,37 @@ def test_report_verification_requires_pinned_key_scheme_and_purpose(tmp_path):
     forged = deepcopy(envelope)
     forged["report"]["signature_contract"]["purpose"] = "something-else"
     assert verify_report(forged, attacker_public) is False
+
+
+
+def test_unwritable_inconclusive_counter_fails_closed(tmp_path):
+    # Reviewer's counterexample: the streak file is a directory, so reading/writing it fails every run.
+    # That failure must itself turn payouts off instead of silently keeping a real problem un-killed.
+    path = tmp_path / "ledger.sqlite"
+    with _ledger(path):
+        pass
+    _write_key(tmp_path / "worker.ed25519")
+    config = _config(tmp_path, inconclusive_kill_runs=3)
+    config.report_dir.mkdir(parents=True, exist_ok=True)
+    (config.report_dir / ".inconclusive-state.json").mkdir()
+
+    rpc = FakeReconcileRPC({VAULT: 101})   # the same lag that makes a run inconclusive above
+    with pytest.raises(Exception):
+        Reconciler(path, rpc, config, notify=lambda *_: {"attempted": False}).run()
+    assert (tmp_path / "payout.off").is_file()
+    assert "nak_reconcile_post_collection_error" in (config.report_dir / "alerts.jsonl").read_text()
+
+
+def test_corrupt_inconclusive_counter_fails_closed(tmp_path):
+    path = tmp_path / "ledger.sqlite"
+    with _ledger(path):
+        pass
+    _write_key(tmp_path / "worker.ed25519")
+    config = _config(tmp_path, inconclusive_kill_runs=3)
+    config.report_dir.mkdir(parents=True, exist_ok=True)
+    (config.report_dir / ".inconclusive-state.json").write_text('{"consecutive": "lots"}')
+
+    rpc = FakeReconcileRPC({VAULT: 101})
+    with pytest.raises(Exception):
+        Reconciler(path, rpc, config, notify=lambda *_: {"attempted": False}).run()
+    assert (tmp_path / "payout.off").is_file()

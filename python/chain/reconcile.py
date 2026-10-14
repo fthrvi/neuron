@@ -1250,12 +1250,15 @@ class Reconciler:
 
     def _inconclusive_count(self) -> int:
         path = self.config.report_dir / ".inconclusive-state.json"
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-            count = value.get("consecutive", 0)
-            return count if isinstance(count, int) and count >= 0 else 0
-        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        # Only a missing file means "no streak". Anything unreadable raises, and run() turns that into a
+        # kill: a counter we cannot trust must never be what keeps payouts on.
+        if not path.exists() and not path.is_symlink():
             return 0
+        value = json.loads(path.read_text(encoding="utf-8"))
+        count = value.get("consecutive") if isinstance(value, dict) else None
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(f"corrupt inconclusive counter in {path}")
+        return count
 
     def _set_inconclusive_count(self, count: int) -> None:
         _atomic_json(
@@ -1299,6 +1302,26 @@ class Reconciler:
             )
             raise
 
+        try:
+            return self._finish(report)
+        except Exception as exc:
+            # Fail closed after collection too: a counter/report/signing failure must leave payouts OFF.
+            generated = int(self.now())
+            stamp = dt.datetime.fromtimestamp(generated, tz=dt.timezone.utc)
+            self._alert(
+                {
+                    "event": "nak_reconcile_post_collection_error",
+                    "timestamp": stamp.isoformat().replace("+00:00", "Z"),
+                    "error_type": type(exc).__name__,
+                    "detail": str(exc),
+                    "kill_file": str(self.config.kill_file),
+                },
+                "🔴 Nakshatra reconciliation failed after collection. Payouts are off.",
+                kill=True,
+            )
+            raise
+
+    def _finish(self, report: dict[str, Any]) -> tuple[dict[str, Any], Path]:
         report_path = self.config.report_dir / f"{report['date']}.json"
         outcome = report["outcome"]
         if outcome == "inconclusive":
@@ -1322,7 +1345,6 @@ class Reconciler:
             )
             report["alerts"].append(self._alert(alert, message, kill=kill))
         else:
-            self._set_inconclusive_count(0)
             if outcome == "mismatch":
                 failed = [
                     check["id"] for check in report["checks"] if not check["ok"]
@@ -1340,6 +1362,8 @@ class Reconciler:
                     f"{', '.join(failed)}. Payouts are off. Report: {report_path}"
                 )
                 report["alerts"].append(self._alert(alert, message, kill=True))
+            # reset the streak only AFTER any kill for this run is already on disk
+            self._set_inconclusive_count(0)
         envelope = sign_report(report, self.config.signing_key)
         _atomic_json(report_path, envelope)
         return envelope, report_path
