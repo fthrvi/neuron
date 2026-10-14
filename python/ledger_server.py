@@ -370,9 +370,9 @@ def _make_v2_handler(svc: V2LedgerService):
             try:
                 operator, tier = _row_identity(keyid, roster)
                 query = parse_qs(target.query, keep_blank_values=True)
-                requested = query.get("account", [operator])[0]
-                if requested != operator:
-                    raise PermissionError("accounts may query only their own ledger entry")
+                # The answer is ALWAYS about the signer's own operator account; a v1-era client still
+                # sends ?account=<old requester name> (Prithvi's gateway: "prithvi"), and refusing it
+                # silently disabled the credit gate (fail-open). Ignoring it cannot reveal anyone else.
                 if target.path == "/balance":
                     result = svc.balance(operator)
                 elif target.path == "/history":

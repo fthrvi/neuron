@@ -496,10 +496,13 @@ def test_v2_signed_gets_are_own_only_and_balances_is_refused(
         base, "GET", own_path, v2_identities["alice"], timestamp=timestamps.next()
     )
     assert code == 200 and result["account"] == "alice"
+    # Asking about someone else answers about YOURSELF: it never reveals bob's entry
+    # (a v1-era ?account= parameter must not disable the gate either).
     other_path = "/balance?account=bob"
-    assert _v2_request(
+    code, result = _v2_request(
         base, "GET", other_path, v2_identities["alice"], timestamp=timestamps.next()
-    )[0] == 403
+    )
+    assert code == 200 and result["account"] == "alice"
     assert _v2_request(base, "GET", "/balances")[0] == 403
     assert _v2_request(base, "GET", "/health")[1] == {
         "ok": True, "store": "sqlite", "signed": True
