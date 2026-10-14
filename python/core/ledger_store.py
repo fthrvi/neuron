@@ -15,6 +15,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -25,12 +26,23 @@ from typing import Any, Mapping
 # malformed or hostile amount can never approach integer overflow in balances.
 MAX_UNITS = 10 ** 12
 
+# Permanent conversion between the ledger's token-layer credits and the SPL
+# token's smallest unit. Price changes belong in the model multiplier, not
+# here: changing this value would re-price every existing balance.
+RATE = 100
+
+# Earnings remain reversible for the full receipt dispute window.
+HOLD_S = 7 * 24 * 60 * 60
+
+TREASURY_ACCOUNT = "treasury"
+_WITHDRAWAL_HOLD_PREFIX = "__withdrawal_hold__:"
+
 # These limits mirror nakshatra/scripts/creditlimit.py.  Unknown tiers are
 # intentionally treated as strangers (the tightest policy).
 TIER_LIMITS: dict[str, int | None] = {
-    "stranger": 100,
-    "known": 500,
-    "trusted": 5_000,
+    "stranger": 1_000_000,
+    "known": 25_000_000,
+    "trusted": 250_000_000,
     "self": None,
 }
 
@@ -174,6 +186,45 @@ class LedgerStore:
                 detail TEXT NOT NULL DEFAULT '{{}}'
             );
 
+            CREATE TABLE IF NOT EXISTS chain_refs (
+                ref TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                account TEXT NOT NULL,
+                amount INTEGER NOT NULL
+                    CHECK(typeof(amount) = 'integer'
+                          AND amount BETWEEN 1 AND {max_units}),
+                slot INTEGER NOT NULL CHECK(typeof(slot) = 'integer' AND slot >= 0),
+                ts INTEGER NOT NULL CHECK(typeof(ts) = 'integer')
+            );
+
+            CREATE TABLE IF NOT EXISTS deposit_accounts (
+                operator TEXT PRIMARY KEY,
+                token_account TEXT NOT NULL,
+                created_ts INTEGER NOT NULL CHECK(typeof(created_ts) = 'integer')
+            );
+
+            CREATE TABLE IF NOT EXISTS payout_addresses (
+                operator TEXT PRIMARY KEY,
+                address TEXT NOT NULL,
+                bound_ts INTEGER NOT NULL CHECK(typeof(bound_ts) = 'integer'),
+                previous TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id TEXT PRIMARY KEY,
+                operator TEXT NOT NULL,
+                amount INTEGER NOT NULL
+                    CHECK(typeof(amount) = 'integer'
+                          AND amount BETWEEN 1 AND {max_units}),
+                address TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN
+                    ('pending','approved','sent','finalized','released','expired')),
+                tx_sig TEXT UNIQUE,
+                approval_ref TEXT,
+                created_ts INTEGER NOT NULL CHECK(typeof(created_ts) = 'integer'),
+                updated_ts INTEGER NOT NULL CHECK(typeof(updated_ts) = 'integer')
+            );
+
             CREATE TRIGGER IF NOT EXISTS journal_no_update
             BEFORE UPDATE ON journal
             BEGIN
@@ -236,6 +287,53 @@ class LedgerStore:
     def _set_balance(db: sqlite3.Connection, account: str, balance: int) -> None:
         db.execute("UPDATE accounts SET balance=? WHERE id=?", (balance, account))
 
+    @staticmethod
+    def _withdrawal_hold_account(withdrawal_id: str) -> str:
+        return f"{_WITHDRAWAL_HOLD_PREFIX}{withdrawal_id}"
+
+    @staticmethod
+    def _withdrawable_in(db: sqlite3.Connection, operator: str, now: int) -> int:
+        balance = LedgerStore._balance_in(db, operator)
+        deposited = int(
+            db.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM chain_refs "
+                "WHERE kind='deposit' AND account=?",
+                (operator,),
+            ).fetchone()[0]
+        )
+        withdrawn = int(
+            db.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM withdrawals "
+                "WHERE operator=? AND state='finalized'",
+                (operator,),
+            ).fetchone()[0]
+        )
+        held = int(
+            db.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM withdrawals "
+                "WHERE operator=? AND state IN ('pending','approved','sent','expired')",
+                (operator,),
+            ).fetchone()[0]
+        )
+
+        matured_earnings = 0
+        rows = db.execute(
+            "SELECT j.amount, j.detail FROM journal AS j "
+            "JOIN receipts AS r ON r.receipt_id=j.receipt_id "
+            "WHERE j.account=? AND j.kind='earn' AND j.ts<=? AND r.state='settled'",
+            (operator, now - HOLD_S),
+        ).fetchall()
+        for row in rows:
+            try:
+                funded = json.loads(row["detail"]).get("funded") is True
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                funded = False
+            if funded:
+                matured_earnings += int(row["amount"])
+
+        entitlement = deposited - withdrawn - held + matured_earnings
+        return max(0, min(balance, entitlement))
+
     def settle(
         self,
         receipt_id: str,
@@ -253,6 +351,8 @@ class LedgerStore:
         """
         receipt_id = _identifier(receipt_id, "receipt_id")
         requester = _identifier(requester, "requester")
+        if requester == TREASURY_ACCOUNT or requester.startswith(_WITHDRAWAL_HOLD_PREFIX):
+            raise LedgerValueError("requester is reserved")
         # Work on the requester's OWN nodes is free (local = free) but is still recorded for the audit.
         charged = _amount(charged, "charged", allow_zero=True)
         tier = _tier(tier)
@@ -261,7 +361,11 @@ class LedgerStore:
         clean_credits: dict[str, int] = {}
         for account, amount in credited.items():
             account = _identifier(account, "credited account")
+            if account == TREASURY_ACCOUNT or account.startswith(_WITHDRAWAL_HOLD_PREFIX):
+                raise LedgerValueError("credited account is reserved")
             clean_credits[account] = _amount(amount, f"credit for {account}")
+        if sum(clean_credits.values()) != charged:
+            raise LedgerValueError("credited amounts must sum to charged")
         clean_account_tiers = {
             account: _tier(account_tiers[account])
             for account in clean_credits
@@ -289,6 +393,7 @@ class LedgerStore:
                 )
 
             old_requester_balance = self._balance_in(db, requester)
+            funded = old_requester_balance >= charged
             if not _may_debit(old_requester_balance, charged, tier):
                 limit = TIER_LIMITS[tier]
                 raise CreditLimitError(
@@ -324,9 +429,16 @@ class LedgerStore:
                 self._set_balance(db, account, balance)
             for account, amount in clean_credits.items():
                 db.execute(
-                    "INSERT INTO journal(ts, kind, receipt_id, account, counterparty, amount) "
-                    "VALUES (?, 'earn', ?, ?, ?, ?)",
-                    (now, receipt_id, account, requester, amount),
+                    "INSERT INTO journal(ts, kind, receipt_id, account, counterparty, amount, detail) "
+                    "VALUES (?, 'earn', ?, ?, ?, ?, ?)",
+                    (
+                        now,
+                        receipt_id,
+                        account,
+                        requester,
+                        amount,
+                        json.dumps({"funded": funded}, separators=(",", ":")),
+                    ),
                 )
             if charged:  # a free own-node settle has no spend row; its receipts row is the record
                 db.execute(
@@ -338,10 +450,248 @@ class LedgerStore:
 
         return self._tx(operation)
 
+    def deposit(self, ref: str, operator: str, credits: int, slot: int) -> int:
+        """Credit one finalized chain deposit exactly once and return its credits."""
+        ref = _identifier(ref, "ref")
+        operator = _identifier(operator, "operator")
+        if operator == TREASURY_ACCOUNT or operator.startswith(_WITHDRAWAL_HOLD_PREFIX):
+            raise LedgerValueError("operator is reserved")
+        credits = _amount(credits, "credits")
+        if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
+            raise LedgerValueError("slot must be a non-negative integer")
+        if slot > 2 ** 63 - 1:
+            raise LedgerValueError("slot is outside SQLite integer bounds")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> int:
+            existing = db.execute(
+                "SELECT amount FROM chain_refs WHERE ref=?", (ref,)
+            ).fetchone()
+            if existing is not None:
+                return int(existing["amount"])
+
+            treasury_new = self._checked_balance(
+                self._balance_in(db, TREASURY_ACCOUNT) - credits,
+                TREASURY_ACCOUNT,
+            )
+            operator_new = self._checked_balance(
+                self._balance_in(db, operator) + credits,
+                operator,
+            )
+            self._ensure_account(db, TREASURY_ACCOUNT, "self")
+            self._ensure_account(db, operator)
+            db.execute(
+                "UPDATE accounts SET tier='self' WHERE id=?", (TREASURY_ACCOUNT,)
+            )
+            self._set_balance(db, TREASURY_ACCOUNT, treasury_new)
+            self._set_balance(db, operator, operator_new)
+            db.execute(
+                "INSERT INTO chain_refs(ref, kind, account, amount, slot, ts) "
+                "VALUES (?, 'deposit', ?, ?, ?, ?)",
+                (ref, operator, credits, slot, now),
+            )
+            detail = json.dumps(
+                {"rate": RATE, "ref": ref, "slot": slot},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            db.execute(
+                "INSERT INTO journal(ts, kind, account, counterparty, amount, detail) "
+                "VALUES (?, 'deposit', ?, ?, ?, ?)",
+                (now, operator, TREASURY_ACCOUNT, credits, detail),
+            )
+            return credits
+
+        return self._tx(operation)
+
+    def withdrawable(self, operator: str) -> int:
+        """Return cashable credits: net deposits plus funded, matured earnings."""
+        operator = _identifier(operator, "operator")
+        with self._lock:
+            return self._withdrawable_in(self._db, operator, int(time.time()))
+
+    def withdraw_hold(
+        self,
+        operator: str,
+        amount: int,
+        address: str,
+        withdrawal_id: str | None = None,
+    ) -> str:
+        """Debit an operator into a pending hold and return its withdrawal id."""
+        operator = _identifier(operator, "operator")
+        address = _identifier(address, "address")
+        if operator == TREASURY_ACCOUNT or operator.startswith(_WITHDRAWAL_HOLD_PREFIX):
+            raise LedgerValueError("operator is reserved")
+        amount = _amount(amount)
+        if withdrawal_id is None:
+            withdrawal_id = uuid.uuid4().hex
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        now = int(time.time())
+        hold_account = self._withdrawal_hold_account(withdrawal_id)
+
+        def operation(db: sqlite3.Connection) -> str:
+            existing = db.execute(
+                "SELECT operator, amount, address FROM withdrawals WHERE id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["operator"] == operator
+                    and int(existing["amount"]) == amount
+                    and existing["address"] == address
+                ):
+                    return withdrawal_id
+                raise LedgerValueError("withdrawal_id already has different details")
+
+            available = self._withdrawable_in(db, operator, now)
+            if amount > available:
+                raise CreditLimitError(
+                    f"withdrawal exceeds withdrawable balance {available}: {amount}"
+                )
+            operator_new = self._checked_balance(
+                self._balance_in(db, operator) - amount, operator
+            )
+            hold_new = self._checked_balance(
+                self._balance_in(db, hold_account) + amount, hold_account
+            )
+            self._ensure_account(db, operator)
+            self._ensure_account(db, hold_account, "self")
+            self._set_balance(db, operator, operator_new)
+            self._set_balance(db, hold_account, hold_new)
+            db.execute(
+                "INSERT INTO withdrawals(id, operator, amount, address, state, "
+                "created_ts, updated_ts) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                (withdrawal_id, operator, amount, address, now, now),
+            )
+            detail = json.dumps(
+                {"address": address, "rate": RATE, "withdrawal_id": withdrawal_id},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            db.execute(
+                "INSERT INTO journal(ts, kind, account, counterparty, amount, detail) "
+                "VALUES (?, 'withdraw_hold', ?, ?, ?, ?)",
+                (now, operator, hold_account, -amount, detail),
+            )
+            return withdrawal_id
+
+        return self._tx(operation)
+
+    def withdraw_finalize(self, withdrawal_id: str) -> int:
+        """Finalize an active hold by moving it to the treasury."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        now = int(time.time())
+        hold_account = self._withdrawal_hold_account(withdrawal_id)
+
+        def operation(db: sqlite3.Connection) -> int:
+            row = db.execute(
+                "SELECT operator, amount, address, state FROM withdrawals WHERE id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if row is None:
+                raise ReceiptStateError(f"withdrawal {withdrawal_id!r} does not exist")
+            amount = int(row["amount"])
+            if row["state"] == "finalized":
+                return amount
+            if row["state"] != "sent":
+                raise ReceiptStateError(
+                    f"withdrawal {withdrawal_id!r} is {row['state']} and cannot finalize"
+                )
+            if self._balance_in(db, hold_account) != amount:
+                raise LedgerError(f"withdrawal {withdrawal_id!r} hold balance is inconsistent")
+            treasury_new = self._checked_balance(
+                self._balance_in(db, TREASURY_ACCOUNT) + amount,
+                TREASURY_ACCOUNT,
+            )
+            self._ensure_account(db, TREASURY_ACCOUNT, "self")
+            db.execute(
+                "UPDATE accounts SET tier='self' WHERE id=?", (TREASURY_ACCOUNT,)
+            )
+            self._set_balance(db, hold_account, 0)
+            self._set_balance(db, TREASURY_ACCOUNT, treasury_new)
+            db.execute(
+                "UPDATE withdrawals SET state='finalized', updated_ts=? WHERE id=?",
+                (now, withdrawal_id),
+            )
+            detail = json.dumps(
+                {
+                    "address": row["address"],
+                    "rate": RATE,
+                    "withdrawal_id": withdrawal_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            db.execute(
+                "INSERT INTO journal(ts, kind, account, counterparty, amount, detail) "
+                "VALUES (?, 'withdraw', ?, ?, ?, ?)",
+                (now, TREASURY_ACCOUNT, row["operator"], amount, detail),
+            )
+            return amount
+
+        return self._tx(operation)
+
+    def withdraw_release(self, withdrawal_id: str) -> int:
+        """Release a non-sent withdrawal hold back to its operator."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        now = int(time.time())
+        hold_account = self._withdrawal_hold_account(withdrawal_id)
+
+        def operation(db: sqlite3.Connection) -> int:
+            row = db.execute(
+                "SELECT operator, amount, address, state FROM withdrawals WHERE id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if row is None:
+                raise ReceiptStateError(f"withdrawal {withdrawal_id!r} does not exist")
+            amount = int(row["amount"])
+            if row["state"] == "released":
+                return amount
+            if row["state"] not in ("pending", "approved", "expired"):
+                raise ReceiptStateError(
+                    f"withdrawal {withdrawal_id!r} is {row['state']} and cannot release"
+                )
+            if self._balance_in(db, hold_account) != amount:
+                raise LedgerError(f"withdrawal {withdrawal_id!r} hold balance is inconsistent")
+            operator_new = self._checked_balance(
+                self._balance_in(db, row["operator"]) + amount,
+                row["operator"],
+            )
+            self._set_balance(db, hold_account, 0)
+            self._set_balance(db, row["operator"], operator_new)
+            db.execute(
+                "UPDATE withdrawals SET state='released', updated_ts=? WHERE id=?",
+                (now, withdrawal_id),
+            )
+            detail = json.dumps(
+                {
+                    "address": row["address"],
+                    "rate": RATE,
+                    "withdrawal_id": withdrawal_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            db.execute(
+                "INSERT INTO journal(ts, kind, account, counterparty, amount, detail) "
+                "VALUES (?, 'withdraw_release', ?, ?, ?, ?)",
+                (now, row["operator"], hold_account, amount, detail),
+            )
+            return amount
+
+        return self._tx(operation)
+
     def transfer(self, src: str, dst: str, amount: int, tier: str) -> int:
         """Move units atomically, allowing debt only within ``src``'s tier."""
         src = _identifier(src, "src")
         dst = _identifier(dst, "dst")
+        if (
+            src == TREASURY_ACCOUNT
+            or dst == TREASURY_ACCOUNT
+            or src.startswith(_WITHDRAWAL_HOLD_PREFIX)
+            or dst.startswith(_WITHDRAWAL_HOLD_PREFIX)
+        ):
+            raise LedgerValueError("cannot transfer to or from a reserved account")
         if src == dst:
             raise LedgerValueError("cannot transfer to the same account")
         amount = _amount(amount)
@@ -561,6 +911,9 @@ def import_legacy_snapshot(snapshot: dict[str, Any], store: LedgerStore) -> None
 
 __all__ = [
     "MAX_UNITS",
+    "RATE",
+    "HOLD_S",
+    "TREASURY_ACCOUNT",
     "TIER_LIMITS",
     "LedgerError",
     "LedgerValueError",

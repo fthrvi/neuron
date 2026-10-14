@@ -452,8 +452,8 @@ def test_v2_own_node_receipt_is_free(v2_server, v2_identities, timestamps):
 
 def test_v2_over_limit_is_402(v2_server, v2_identities, timestamps):
     base, service = v2_server
-    receipt = _v2_receipt(tokens=range(11), stages=[
-        {"node_id": "worker-bob", "layer_start": 0, "layer_end": 10}
+    receipt = _v2_receipt(tokens=(1, 2), stages=[
+        {"node_id": "worker-bob", "layer_start": 0, "layer_end": 500_001}
     ])
     _sign_receipt(receipt, v2_identities)
     code, _ = _v2_request(
