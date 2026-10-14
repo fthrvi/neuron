@@ -1,0 +1,14 @@
+# Example only; never installed automatically. neuron-ledger is a systemd --user unit on the hub.
+# Install (as prithvi):
+#   python3 ~/neuron/python/ledger_migrate.py --from ~/.neuron/credits/ledger.json --to ~/.neuron/credits/ledger.sqlite
+#   install -D -m 0644 10-v2.conf.example ~/.config/systemd/user/neuron-ledger.service.d/10-v2.conf
+#   systemctl --user daemon-reload && systemctl --user restart neuron-ledger.service
+#   curl -s http://10.42.0.1:8097/health   # expect "store": "sqlite", "signed": true
+#
+# Roll back to the unchanged JSON v1 command (v2 never writes ledger.json):
+#   rm ~/.config/systemd/user/neuron-ledger.service.d/10-v2.conf
+#   systemctl --user daemon-reload && systemctl --user restart neuron-ledger.service
+
+[Service]
+ExecStart=
+ExecStart=/usr/bin/python3 /home/prithvi/neuron/python/ledger_server.py --host 10.42.0.1 --port 8097 --store /home/prithvi/.neuron/credits/ledger.sqlite --roster /home/prithvi/.nakshatra/admission-peers.tsv

@@ -10,6 +10,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolated_game_dir(tmp_path, monkeypatch):
+    """Keep every game read/write beneath pytest's disposable HOME."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import core.game as game
+
+    game_dir = tmp_path / ".neuron" / "game"
+    monkeypatch.setattr(game, "GAME_DIR", game_dir)
+    assert game.GAME_DIR.is_relative_to(tmp_path)
+    yield
+
+
+def test_game_dir_is_beneath_temporary_home(tmp_path):
+    from core.game import GAME_DIR
+
+    assert GAME_DIR.is_relative_to(tmp_path)
+
+
 class TestChallenges:
     def setup_method(self):
         from core.game import ChallengeEngine, GAME_DIR

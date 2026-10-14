@@ -435,6 +435,15 @@ class LedgerStore:
             ).fetchone()
         return str(row[0]) if row else None
 
+    def receipt_requester(self, receipt_id: str) -> str | None:
+        """Return the immutable owner of a receipt for authorization checks."""
+        receipt_id = _identifier(receipt_id, "receipt_id")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT requester FROM receipts WHERE receipt_id=?", (receipt_id,)
+            ).fetchone()
+        return str(row[0]) if row else None
+
     def claim_nonce(self, sig_hash: str, ts: int) -> bool:
         """Atomically claim an authenticated envelope signature for replay defense."""
         sig_hash = _identifier(sig_hash, "sig_hash")
