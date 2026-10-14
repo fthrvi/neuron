@@ -13,6 +13,9 @@ import urllib.request
 from typing import Any
 
 
+MAINNET_BETA_GENESIS_HASH = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+
+
 class RPCError(RuntimeError):
     """A transport, protocol, or Solana JSON-RPC error."""
 
@@ -45,7 +48,13 @@ def validate_pubkey(value: str, name: str = "public key") -> str:
 
 
 class SolanaRPC:
-    """Synchronous stdlib client for the indexer's finalized RPC reads."""
+    """Synchronous stdlib client for the indexer's finalized RPC reads.
+
+    ``urllib`` does not expose a durable connection contract, so a pinned
+    client verifies ``getGenesisHash`` before every subsequent RPC request.
+    That is deliberately stricter than merely checking after a detectable
+    reconnect: every HTTP connection is treated as a possible reconnect.
+    """
 
     def __init__(self, url: str, *, timeout: float = 25.0):
         parsed = urllib.parse.urlparse(url)
@@ -56,8 +65,9 @@ class SolanaRPC:
         self.url = url
         self.timeout = timeout
         self._ids = itertools.count(1)
+        self._pinned_genesis: str | None = None
 
-    def call(self, method: str, params: list[Any]) -> Any:
+    def _request(self, method: str, params: list[Any]) -> Any:
         body = json.dumps(
             {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params},
             separators=(",", ":"),
@@ -94,6 +104,38 @@ class SolanaRPC:
         if "result" not in payload:
             raise RPCError(f"{method} response has no result")
         return payload["result"]
+
+    def _read_genesis_hash(self) -> str:
+        result = self._request("getGenesisHash", [])
+        if not isinstance(result, str) or not result:
+            raise RPCError("getGenesisHash result is not a non-empty string")
+        try:
+            validate_pubkey(result, "genesis hash")
+        except ValueError as exc:
+            raise RPCError(str(exc)) from exc
+        return result
+
+    def pin_genesis(self, expected: str | None = None) -> str:
+        """Pin this endpoint to its current genesis, optionally requiring one."""
+        actual = self._read_genesis_hash()
+        if expected is not None and actual != expected:
+            raise RPCError(f"genesis hash {actual} does not match expected {expected}")
+        self._pinned_genesis = actual
+        return actual
+
+    def get_genesis_hash(self) -> str:
+        return self._read_genesis_hash()
+
+    def call(self, method: str, params: list[Any]) -> Any:
+        if method != "getGenesisHash" and self._pinned_genesis is not None:
+            actual = self._read_genesis_hash()
+            if actual == MAINNET_BETA_GENESIS_HASH:
+                raise RPCError("RPC reconnected to explicitly refused mainnet-beta genesis")
+            if actual != self._pinned_genesis:
+                raise RPCError(
+                    f"RPC genesis changed from {self._pinned_genesis} to {actual}"
+                )
+        return self._request(method, params)
 
     def get_signatures_for_address(
         self,

@@ -12,6 +12,9 @@ import chain.solana_rpc as solana_rpc  # noqa: E402
 from chain.solana_rpc import RPCError, SolanaRPC  # noqa: E402
 
 
+DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
+
+
 class _Response(io.BytesIO):
     def __enter__(self):
         return self
@@ -99,3 +102,42 @@ def test_parses_token_account_raw_amount(monkeypatch):
         "decimals": 6,
         "slot": 99,
     }
+
+
+def test_pinned_client_checks_genesis_before_each_connection(monkeypatch):
+    methods = []
+
+    def urlopen(request, timeout):
+        payload = json.loads(request.data)
+        methods.append(payload["method"])
+        result = (
+            DEVNET_GENESIS
+            if payload["method"] == "getGenesisHash"
+            else {"slot": 1, "meta": {"err": None}}
+        )
+        return _Response(
+            json.dumps({"jsonrpc": "2.0", "id": payload["id"], "result": result}).encode()
+        )
+
+    monkeypatch.setattr(solana_rpc.urllib.request, "urlopen", urlopen)
+    client = SolanaRPC("https://rpc.example.invalid")
+    assert client.pin_genesis(DEVNET_GENESIS) == DEVNET_GENESIS
+    assert client.get_transaction("signature")["slot"] == 1
+    assert methods == ["getGenesisHash", "getGenesisHash", "getTransaction"]
+
+
+def test_pinned_client_refuses_changed_genesis(monkeypatch):
+    genesis = iter([DEVNET_GENESIS, "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"])
+
+    def urlopen(request, timeout):
+        payload = json.loads(request.data)
+        result = next(genesis)
+        return _Response(
+            json.dumps({"jsonrpc": "2.0", "id": payload["id"], "result": result}).encode()
+        )
+
+    monkeypatch.setattr(solana_rpc.urllib.request, "urlopen", urlopen)
+    client = SolanaRPC("https://rpc.example.invalid")
+    client.pin_genesis(DEVNET_GENESIS)
+    with pytest.raises(RPCError, match="mainnet-beta genesis"):
+        client.get_transaction("signature")

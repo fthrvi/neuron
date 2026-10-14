@@ -8,19 +8,37 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/nakshatra/indexer.env
-ExecStart=/usr/bin/python3 /home/prithvi/neuron/python/chain/indexer.py --store %h/.neuron/credits/ledger.sqlite
+# Code is installed outside $HOME so hosts that can enforce ProtectHome need
+# only the explicit ledger bind below. The manager reads EnvironmentFile=
+# before constructing the service mount namespace.
+ExecStart=/usr/bin/python3 /opt/neuron/python/chain/indexer.py --store %h/.neuron/credits/ledger.sqlite
 Restart=on-failure
 RestartSec=15
-NoNewPrivileges=true
-PrivateTmp=true
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+# PrivateDevices=yes fails in this host's user manager at 218/CAPABILITIES.
+# A closed device policy plus a best-effort /dev path mask is the closest
+# user-unit-compatible substitute; standard pseudo-devices remain usable.
+DevicePolicy=closed
+InaccessiblePaths=/dev
 ProtectSystem=strict
-ReadWritePaths=%h/.neuron/credits
+ProtectHome=tmpfs
+# Indexer cursor/alert state is stored in the ledger SQLite DB, so this is the
+# only state directory the process needs from the otherwise hidden home.
+BindPaths=%h/.neuron/credits
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallFilter=@system-service
 
 # Required in indexer.env:
 # NAK_SOLANA_CLUSTER=devnet|localnet
 # NAK_USDC_MINT=<base58 mint pubkey>
 # NAK_SOLANA_RPC=<explicit http(s) RPC URL>
-# mainnet-beta is refused by the process in v1.
+# NAK_SOLANA_RPC_CONFIRM=<optional independent RPC URL>
+# Remote endpoints require HTTPS. Localnet requires a loopback URL. The
+# process pins getGenesisHash and explicitly refuses mainnet-beta.
 
 [Install]
 WantedBy=default.target

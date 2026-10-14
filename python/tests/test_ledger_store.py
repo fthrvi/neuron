@@ -16,6 +16,7 @@ from core.ledger_store import (  # noqa: E402
     RATE,
     TIER_LIMITS,
     CreditLimitError,
+    DepositBalanceMismatch,
     DepositConflict,
     LedgerStore,
     LedgerValueError,
@@ -391,6 +392,146 @@ def test_deposit_ref_replay_with_different_details_conflicts(
         assert store.balance("bob") == 0
         assert store._db.execute("SELECT COUNT(*) FROM chain_refs").fetchone()[0] == 1
         _assert_zero_sum(store)
+
+
+def test_deposit_batch_commits_all_refs_and_cursor_atomically(tmp_path):
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        store._db.execute(
+            "CREATE TABLE chain_indexer_accounts "
+            "(token_account TEXT PRIMARY KEY, cursor TEXT, updated_ts INTEGER NOT NULL)"
+        )
+        store._db.execute(
+            "INSERT INTO chain_indexer_accounts VALUES ('token', NULL, 1)"
+        )
+        added = store.deposit_batch(
+            "alice",
+            "token",
+            [("sig-a:0", 100, 4), ("sig-b:0", 200, 5)],
+            300,
+            cursor="sig-b",
+        )
+        assert added == 300
+        assert store.balance("alice") == 300
+        assert store._balance_in(store._db, "treasury") == -300
+        assert store._db.execute(
+            "SELECT cursor FROM chain_indexer_accounts"
+        ).fetchone()[0] == "sig-b"
+        assert store._db.execute("SELECT COUNT(*) FROM chain_refs").fetchone()[0] == 2
+        _assert_zero_sum(store)
+
+
+def test_deposit_batch_mismatch_rolls_back_refs_balances_and_cursor(tmp_path):
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        store._db.execute(
+            "CREATE TABLE chain_indexer_accounts "
+            "(token_account TEXT PRIMARY KEY, cursor TEXT, updated_ts INTEGER NOT NULL)"
+        )
+        store._db.execute(
+            "INSERT INTO chain_indexer_accounts VALUES ('token', NULL, 1)"
+        )
+        with pytest.raises(DepositBalanceMismatch) as raised:
+            store.deposit_batch(
+                "alice",
+                "token",
+                [("sig-a:0", 100, 4), ("sig-b:0", 200, 5)],
+                299,
+                cursor="sig-b",
+            )
+        assert (raised.value.expected, raised.value.actual) == (299, 300)
+        assert store.balance("alice") == 0
+        assert store._balance_in(store._db, "treasury") == 0
+        assert store._db.execute("SELECT COUNT(*) FROM chain_refs").fetchone()[0] == 0
+        assert store._db.execute(
+            "SELECT cursor FROM chain_indexer_accounts"
+        ).fetchone()[0] is None
+        _assert_zero_sum(store)
+
+
+def test_deposit_batch_exact_replay_updates_only_cursor_and_conflicts_still_fail(
+    tmp_path,
+):
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        store._db.execute(
+            "CREATE TABLE chain_indexer_accounts "
+            "(token_account TEXT PRIMARY KEY, cursor TEXT, updated_ts INTEGER NOT NULL)"
+        )
+        store._db.execute(
+            "INSERT INTO chain_indexer_accounts VALUES ('token', NULL, 1)"
+        )
+        assert store.deposit_batch(
+            "alice", "token", [("sig:0", 100, 7)], 100, cursor="sig"
+        ) == 100
+        store._db.execute(
+            "UPDATE chain_indexer_accounts SET cursor=NULL WHERE token_account='token'"
+        )
+        assert store.deposit_batch(
+            "alice", "token", [("sig:0", 100, 7)], 100, cursor="sig"
+        ) == 0
+        assert store.balance("alice") == 100
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM journal WHERE kind='deposit'"
+        ).fetchone()[0] == 1
+        assert store._db.execute(
+            "SELECT cursor FROM chain_indexer_accounts"
+        ).fetchone()[0] == "sig"
+
+        with pytest.raises(DepositConflict, match="different details"):
+            store.deposit_batch("alice", "token", [("sig:0", 101, 7)], 100)
+        assert store.balance("alice") == 100
+        _assert_zero_sum(store)
+
+
+def test_deposit_batch_reconciles_per_token_account(tmp_path):
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        store._db.execute(
+            "CREATE TABLE chain_indexer_accounts "
+            "(token_account TEXT PRIMARY KEY, cursor TEXT, updated_ts INTEGER NOT NULL)"
+        )
+        store._db.executemany(
+            "INSERT INTO chain_indexer_accounts VALUES (?, NULL, 1)",
+            [("token-a",), ("token-b",)],
+        )
+        store.deposit_batch("alice", "token-a", [("a:0", 100, 1)], 100)
+        assert store.deposit_batch("alice", "token-b", [], 0) == 0
+        store.deposit_batch("alice", "token-b", [("b:0", 200, 2)], 200)
+        assert store.balance("alice") == 300
+        totals = dict(
+            store._db.execute(
+                "SELECT token_account, SUM(amount) FROM chain_refs "
+                "GROUP BY token_account ORDER BY token_account"
+            )
+        )
+        assert totals == {"token-a": 100, "token-b": 200}
+        _assert_zero_sum(store)
+
+
+def test_deposit_token_accounts_are_unique(tmp_path):
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        store._db.execute(
+            "INSERT INTO deposit_accounts VALUES ('alice', 'token', 1)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            store._db.execute(
+                "INSERT INTO deposit_accounts VALUES ('bob', 'token', 1)"
+            )
+
+
+def test_existing_s1_chain_refs_schema_is_upgraded_for_account_provenance(tmp_path):
+    path = tmp_path / "ledger.db"
+    db = sqlite3.connect(path)
+    db.execute(
+        "CREATE TABLE chain_refs ("
+        "ref TEXT PRIMARY KEY, kind TEXT NOT NULL, account TEXT NOT NULL, "
+        "amount INTEGER NOT NULL, slot INTEGER NOT NULL, ts INTEGER NOT NULL)"
+    )
+    db.commit()
+    db.close()
+
+    with LedgerStore(path) as store:
+        columns = {
+            row[1] for row in store._db.execute("PRAGMA table_info(chain_refs)")
+        }
+        assert "token_account" in columns
 
 
 def test_unfunded_earnings_are_never_withdrawable(tmp_path, monkeypatch):

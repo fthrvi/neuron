@@ -9,7 +9,12 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from chain.indexer import DepositIndexer, IndexerConfig  # noqa: E402
+from chain.indexer import (  # noqa: E402
+    DEVNET_GENESIS_HASH,
+    MAINNET_GENESIS_HASH,
+    DepositIndexer,
+    IndexerConfig,
+)
 from chain.solana_rpc import RPCError, decode_base58, validate_pubkey  # noqa: E402
 from core.ledger_store import RATE, LedgerStore  # noqa: E402
 
@@ -18,12 +23,17 @@ FIXTURE = Path(__file__).parent / "fixtures" / "solana_indexer.json"
 
 
 class FakeRPC:
-    def __init__(self, fixture, *, balance=15):
+    def __init__(self, fixture, *, balance=15, genesis=None):
         self.addresses = fixture["addresses"]
         self.signatures = deepcopy(fixture["signatures"])
         self.transactions = deepcopy(fixture["transactions"])
         self.balance = balance
+        self.genesis = genesis or fixture["addresses"]["mint"]
         self.calls = []
+
+    def get_genesis_hash(self):
+        self.calls.append(("genesis",))
+        return self.genesis
 
     def get_signatures_for_address(self, address, *, before=None, until=None, limit=1000):
         self.calls.append(("signatures", address, before, until, limit))
@@ -144,12 +154,14 @@ def test_balance_mismatch_pauses_account_and_writes_alert(recorded, tmp_path, ca
     with LedgerStore(tmp_path / "ledger.sqlite") as store:
         _register(store, recorded)
         indexer = DepositIndexer(store, rpc, _config(recorded))
-        assert indexer.poll_once() == 1
+        assert indexer.poll_once() == 0
 
         state = store._db.execute(
             "SELECT paused, cursor FROM chain_indexer_accounts"
         ).fetchone()
-        assert tuple(state) == (1, "sig-checked")
+        assert tuple(state) == (1, None)
+        assert store._db.execute("SELECT COUNT(*) FROM chain_refs").fetchone()[0] == 0
+        assert store.balance("alice") == 0
         alert = store._db.execute(
             "SELECT kind, expected, actual, detail FROM chain_indexer_alerts"
         ).fetchone()
@@ -165,11 +177,31 @@ def test_balance_mismatch_pauses_account_and_writes_alert(recorded, tmp_path, ca
         assert "chain_indexer_alert" in caplog.text
 
 
-def test_mainnet_and_malformed_keys_are_refused(recorded):
+def test_mainnet_and_malformed_keys_are_refused(recorded, tmp_path):
     with pytest.raises(ValueError, match="mainnet-beta is refused"):
         _config(recorded, cluster="mainnet-beta")
-    with pytest.raises(ValueError, match="mainnet RPC"):
+    with pytest.raises(ValueError, match="loopback"):
         _config(recorded, rpc_url="https://api.mainnet-beta.solana.com")
+    with pytest.raises(ValueError, match="must use https"):
+        IndexerConfig(
+            cluster="devnet",
+            mint=recorded["addresses"]["mint"],
+            rpc_url="http://rpc.example.invalid",
+        )
+    with pytest.raises(ValueError, match="loopback"):
+        _config(recorded, rpc_url="https://rpc.example.invalid")
+    with pytest.raises(ValueError, match="different endpoint"):
+        _config(
+            recorded,
+            confirm_rpc_url="http://127.0.0.1:18899/",
+        )
+    with LedgerStore(tmp_path / "mainnet.sqlite") as store:
+        with pytest.raises(ValueError, match="mainnet-beta genesis"):
+            DepositIndexer(
+                store,
+                FakeRPC(recorded, genesis=MAINNET_GENESIS_HASH),
+                _config(recorded),
+            )
     with pytest.raises(ValueError, match="32 bytes"):
         validate_pubkey("1234")
     assert len(decode_base58(recorded["addresses"]["mint"])) == 32
@@ -204,3 +236,152 @@ def test_transient_rpc_failure_does_not_pause_account(recorded, tmp_path):
         assert store._db.execute(
             "SELECT COUNT(*) FROM chain_indexer_alerts"
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("malformation", ["meta", "err"])
+def test_missing_meta_or_err_is_alerted_and_never_credited(
+    recorded, tmp_path, malformation
+):
+    recorded["signatures"] = [
+        item for item in recorded["signatures"] if item["signature"] == "sig-checked"
+    ]
+    if malformation == "meta":
+        recorded["transactions"]["sig-checked"].pop("meta")
+    else:
+        recorded["transactions"]["sig-checked"]["meta"].pop("err")
+    rpc = FakeRPC(recorded, balance=0)
+    with LedgerStore(tmp_path / f"missing-{malformation}.sqlite") as store:
+        _register(store, recorded)
+        assert DepositIndexer(store, rpc, _config(recorded)).poll_once() == 0
+        assert store.balance("alice") == 0
+        assert store._db.execute("SELECT COUNT(*) FROM chain_refs").fetchone()[0] == 0
+        state = store._db.execute(
+            "SELECT cursor, paused FROM chain_indexer_accounts"
+        ).fetchone()
+        assert tuple(state) == ("sig-checked", 0)
+        alert = store._db.execute(
+            "SELECT kind, detail FROM chain_indexer_alerts"
+        ).fetchone()
+        assert alert["kind"] == "malformed_transaction"
+        assert malformation in alert["detail"]
+
+
+def test_confirm_rpc_transaction_disagreement_pauses_without_credit(recorded, tmp_path):
+    recorded["signatures"] = [
+        item for item in recorded["signatures"] if item["signature"] == "sig-checked"
+    ]
+    primary = FakeRPC(recorded, balance=5)
+    confirmation = FakeRPC(recorded, balance=5)
+    confirmation.transactions["sig-checked"]["slot"] = 999
+    config = _config(recorded, confirm_rpc_url="http://127.0.0.1:18900")
+    with LedgerStore(tmp_path / "confirm-transaction.sqlite") as store:
+        _register(store, recorded)
+        indexer = DepositIndexer(store, primary, config, confirmation)
+        assert indexer.poll_once() == 0
+        assert store.balance("alice") == 0
+        assert store._db.execute("SELECT COUNT(*) FROM chain_refs").fetchone()[0] == 0
+        assert store._db.execute(
+            "SELECT paused FROM chain_indexer_accounts"
+        ).fetchone()[0] == 1
+        assert store._db.execute(
+            "SELECT kind FROM chain_indexer_alerts"
+        ).fetchone()[0] == "rpc_disagreement"
+
+
+def test_confirm_rpc_balance_disagreement_pauses_without_credit(recorded, tmp_path):
+    primary = FakeRPC(recorded, balance=15)
+    confirmation = FakeRPC(recorded, balance=14)
+    config = _config(recorded, confirm_rpc_url="http://127.0.0.1:18900")
+    with LedgerStore(tmp_path / "confirm-balance.sqlite") as store:
+        _register(store, recorded)
+        indexer = DepositIndexer(store, primary, config, confirmation)
+        assert indexer.poll_once() == 0
+        assert store.balance("alice") == 0
+        assert store._db.execute(
+            "SELECT kind FROM chain_indexer_alerts"
+        ).fetchone()[0] == "rpc_disagreement"
+
+
+def test_genesis_is_pinned_for_devnet_and_confirm_must_match(recorded, tmp_path):
+    config = IndexerConfig(
+        cluster="devnet",
+        mint=recorded["addresses"]["mint"],
+        rpc_url="https://rpc.example.invalid",
+        confirm_rpc_url="https://confirm.example.invalid",
+    )
+    with LedgerStore(tmp_path / "genesis.sqlite") as store:
+        with pytest.raises(ValueError, match="confirmation RPC client"):
+            DepositIndexer(
+                store,
+                FakeRPC(recorded, genesis=DEVNET_GENESIS_HASH),
+                config,
+            )
+        with pytest.raises(ValueError, match="does not match expected"):
+            DepositIndexer(
+                store,
+                FakeRPC(recorded),
+                config,
+                FakeRPC(recorded, genesis=DEVNET_GENESIS_HASH),
+            )
+        primary = FakeRPC(recorded, genesis=DEVNET_GENESIS_HASH)
+        wrong = FakeRPC(recorded, genesis=recorded["addresses"]["mint"])
+        with pytest.raises(ValueError, match="does not match expected"):
+            DepositIndexer(store, primary, config, wrong)
+        assert ("genesis",) in primary.calls
+        assert ("genesis",) in wrong.calls
+
+
+def test_paginates_more_than_one_thousand_signatures(recorded, tmp_path):
+    records = [
+        {
+            "signature": f"page-{index}",
+            "slot": 10_000 - index,
+            "err": {"InstructionError": [0, "Custom"]},
+            "confirmationStatus": "finalized",
+        }
+        for index in range(1001)
+    ]
+    failed = {
+        "slot": 1,
+        "transaction": {"message": {"instructions": []}},
+        "meta": {"err": {"InstructionError": [0, "Custom"]}},
+    }
+    recorded["signatures"] = records
+    recorded["transactions"] = {
+        item["signature"]: deepcopy(failed) for item in records
+    }
+    rpc = FakeRPC(recorded, balance=0)
+    config = _config(
+        recorded,
+        max_pages_per_account=2,
+        max_rpc_calls_per_poll=1100,
+    )
+    with LedgerStore(tmp_path / "pagination.sqlite") as store:
+        _register(store, recorded)
+        assert DepositIndexer(store, rpc, config).poll_once() == 0
+        assert store._db.execute(
+            "SELECT cursor FROM chain_indexer_accounts"
+        ).fetchone()[0] == "page-0"
+        signature_calls = [call for call in rpc.calls if call[0] == "signatures"]
+        assert len(signature_calls) == 2
+        assert signature_calls[1][2] == "page-999"
+
+
+def test_user_unit_contains_required_supported_hardening():
+    unit = (
+        Path(__file__).parents[1] / "chain" / "systemd" / "nak-indexer.service"
+    ).read_text()
+    for directive in (
+        "UMask=0077",
+        "NoNewPrivileges=yes",
+        "ProtectHome=tmpfs",
+        "BindPaths=%h/.neuron/credits",
+        "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
+        "LockPersonality=yes",
+        "RestrictRealtime=yes",
+        "SystemCallFilter=@system-service",
+        "DevicePolicy=closed",
+        "InaccessiblePaths=/dev",
+    ):
+        assert directive in unit
+    assert "ExecStart=/usr/bin/python3 /home/" not in unit

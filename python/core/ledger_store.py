@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 
 # SQLite's INTEGER storage class is a signed 64-bit value.  Keeping the public
@@ -66,6 +66,17 @@ class ReceiptStateError(LedgerError):
 
 class DepositConflict(LedgerError):
     """A chain reference was replayed with details that do not match its deposit."""
+
+
+class DepositBalanceMismatch(LedgerError):
+    """A candidate deposit batch does not reconcile to its chain balance."""
+
+    def __init__(self, expected: int, actual: int):
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"indexed deposits plus candidates total {actual}, expected {expected}"
+        )
 
 
 class WithdrawalStateError(ReceiptStateError):
@@ -206,6 +217,7 @@ class LedgerStore:
                 ref TEXT PRIMARY KEY,
                 kind TEXT NOT NULL,
                 account TEXT NOT NULL,
+                token_account TEXT,
                 amount INTEGER NOT NULL
                     CHECK(typeof(amount) = 'integer'
                           AND amount BETWEEN 1 AND {max_units}),
@@ -218,6 +230,9 @@ class LedgerStore:
                 token_account TEXT NOT NULL,
                 created_ts INTEGER NOT NULL CHECK(typeof(created_ts) = 'integer')
             );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS deposit_accounts_token_account
+            ON deposit_accounts(token_account);
 
             CREATE TABLE IF NOT EXISTS payout_addresses (
                 operator TEXT PRIMARY KEY,
@@ -254,6 +269,13 @@ class LedgerStore:
             END;
             """
         )
+        # S3 adds the per-chain-account provenance required for account-scoped
+        # reconciliation. Existing S1 databases are upgraded in place.
+        chain_ref_columns = {
+            str(row[1]) for row in self._db.execute("PRAGMA table_info(chain_refs)")
+        }
+        if "token_account" not in chain_ref_columns:
+            self._db.execute("ALTER TABLE chain_refs ADD COLUMN token_account TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -530,6 +552,151 @@ class LedgerStore:
                 (now, operator, TREASURY_ACCOUNT, credits, detail),
             )
             return credits
+
+        return self._tx(operation)
+
+    def deposit_batch(
+        self,
+        operator: str,
+        token_account: str,
+        deposits: Iterable[tuple[str, int, int]],
+        expected_total: int,
+        *,
+        cursor: str | None = None,
+    ) -> int:
+        """Reconcile and atomically credit finalized deposits for one account.
+
+        ``deposits`` contains ``(ref, credits, slot)`` tuples.  The batch is
+        committed only when this token account's already-indexed deposits plus
+        the new, non-replayed candidates equal ``expected_total``.  When a
+        signature ``cursor`` is supplied, its indexer cursor is advanced in the
+        same SQLite transaction as the credits.
+
+        Exact replays are idempotent.  A ref whose stored or repeated details
+        differ still raises :class:`DepositConflict`, and all failure paths
+        roll back the entire batch (including the cursor).
+        """
+        operator = _identifier(operator, "operator")
+        if is_reserved(operator):
+            raise LedgerValueError("operator is reserved")
+        token_account = _identifier(token_account, "token_account")
+        expected_total = _amount(expected_total, "expected_total", allow_zero=True)
+
+        clean: dict[str, tuple[int, int]] = {}
+        try:
+            candidates = list(deposits)
+        except TypeError as exc:
+            raise LedgerValueError("deposits must be an iterable") from exc
+        for index, candidate in enumerate(candidates):
+            if not isinstance(candidate, (tuple, list)) or len(candidate) != 3:
+                raise LedgerValueError(
+                    f"deposit {index} must be a (ref, credits, slot) tuple"
+                )
+            ref = _identifier(candidate[0], f"deposit {index} ref")
+            credits = _amount(candidate[1], f"deposit {index} credits")
+            slot = candidate[2]
+            if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
+                raise LedgerValueError(
+                    f"deposit {index} slot must be a non-negative integer"
+                )
+            if slot > 2 ** 63 - 1:
+                raise LedgerValueError(
+                    f"deposit {index} slot is outside SQLite integer bounds"
+                )
+            previous = clean.get(ref)
+            if previous is not None and previous != (credits, slot):
+                raise DepositConflict(
+                    f"deposit reference {ref!r} appears with different details"
+                )
+            clean[ref] = (credits, slot)
+
+        clean_cursor = (
+            _identifier(cursor, "cursor signature") if cursor is not None else None
+        )
+
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> int:
+            already_indexed = int(
+                db.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM chain_refs "
+                    "WHERE kind='deposit' AND account=? AND token_account=?",
+                    (operator, token_account),
+                ).fetchone()[0]
+            )
+            pending: list[tuple[str, int, int]] = []
+            for ref, (credits, slot) in clean.items():
+                existing = db.execute(
+                    "SELECT kind, account, token_account, amount, slot "
+                    "FROM chain_refs WHERE ref=?",
+                    (ref,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        existing["kind"] != "deposit"
+                        or existing["account"] != operator
+                        or existing["token_account"] != token_account
+                        or int(existing["amount"]) != credits
+                        or int(existing["slot"]) != slot
+                    ):
+                        raise DepositConflict(
+                            f"deposit reference {ref!r} already has different details"
+                        )
+                    continue
+                pending.append((ref, credits, slot))
+
+            reconciled_total = already_indexed + sum(
+                credits for _ref, credits, _slot in pending
+            )
+            if reconciled_total != expected_total:
+                raise DepositBalanceMismatch(expected_total, reconciled_total)
+
+            added = sum(credits for _ref, credits, _slot in pending)
+            if added:
+                treasury_new = self._checked_balance(
+                    self._balance_in(db, TREASURY_ACCOUNT) - added,
+                    TREASURY_ACCOUNT,
+                )
+                operator_new = self._checked_balance(
+                    self._balance_in(db, operator) + added,
+                    operator,
+                )
+                self._ensure_account(db, TREASURY_ACCOUNT, "self")
+                self._ensure_account(db, operator)
+                db.execute(
+                    "UPDATE accounts SET tier='self' WHERE id=?", (TREASURY_ACCOUNT,)
+                )
+                self._set_balance(db, TREASURY_ACCOUNT, treasury_new)
+                self._set_balance(db, operator, operator_new)
+                for ref, credits, slot in pending:
+                    db.execute(
+                        "INSERT INTO chain_refs"
+                        "(ref, kind, account, token_account, amount, slot, ts) "
+                        "VALUES (?, 'deposit', ?, ?, ?, ?, ?)",
+                        (ref, operator, token_account, credits, slot, now),
+                    )
+                    detail = json.dumps(
+                        {"rate": RATE, "ref": ref, "slot": slot},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    db.execute(
+                        "INSERT INTO journal(ts, kind, account, counterparty, amount, detail) "
+                        "VALUES (?, 'deposit', ?, ?, ?, ?)",
+                        (now, operator, TREASURY_ACCOUNT, credits, detail),
+                    )
+
+            if clean_cursor is not None:
+                updated = db.execute(
+                    "UPDATE chain_indexer_accounts SET cursor=?, updated_ts=? "
+                    "WHERE token_account=?",
+                    (clean_cursor, now, token_account),
+                ).rowcount
+                if updated != 1:
+                    raise LedgerValueError(
+                        f"indexer state does not exist for {token_account!r}"
+                    )
+            return added
 
         return self._tx(operation)
 
@@ -963,6 +1130,7 @@ __all__ = [
     "CreditLimitError",
     "ReceiptStateError",
     "DepositConflict",
+    "DepositBalanceMismatch",
     "WithdrawalStateError",
     "LedgerStore",
     "import_legacy_snapshot",

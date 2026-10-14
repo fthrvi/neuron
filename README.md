@@ -36,3 +36,23 @@ When it un-pauses, the work is not "build from scratch" — most of the substrat
 
 - Project architecture: `Sthambha/docs/four-project-architecture.md` (canonical)
 - Mode C / public-network goal: `Sthambha/docs/network-fabric.md` §3 and §11
+
+## Solana deposit indexer trust boundary
+
+`python/chain/indexer.py` indexes finalized SPL-token deposits on devnet or a
+loopback-only local validator. Devnet is pinned by `getGenesisHash` to
+`EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG`; the default may be overridden
+with `NAK_SOLANA_DEVNET_GENESIS` for an intentional future migration. The
+mainnet-beta genesis is always refused. Non-loopback RPC URLs must use HTTPS.
+
+Without `NAK_SOLANA_RPC_CONFIRM`, the primary RPC is a trust root for minting:
+an endpoint that lies consistently about both transactions and account balance
+can create false ledger credit. Set `NAK_SOLANA_RPC_CONFIRM` to a genuinely
+independent second RPC to require exact agreement on every candidate
+transaction and agreement on token-account mint, decimals, and raw balance
+before the ledger commits. The primary and confirmation URLs must differ.
+
+Candidate deposits remain quarantined until the already-indexed total plus the
+entire candidate batch equals the finalized on-chain balance. Credits and the
+account cursor are then written in one SQLite transaction; mismatch commits
+neither, pauses the account, and records an alert.
