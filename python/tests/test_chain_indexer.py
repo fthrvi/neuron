@@ -87,7 +87,7 @@ def test_accepts_transfer_checked_and_inner_but_ignores_noise(recorded, tmp_path
             "sig-transfer:0": 3 * RATE,
         }
         assert store.balance("alice") == 15 * RATE
-        assert store.balance("treasury") == -15 * RATE
+        assert store._balance_in(store._db, "treasury") == -15 * RATE
         assert store._db.execute(
             "SELECT paused FROM chain_indexer_accounts"
         ).fetchone()[0] == 0

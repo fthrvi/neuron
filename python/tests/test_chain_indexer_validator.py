@@ -252,7 +252,7 @@ def test_indexes_real_finalized_spl_transfer(tmp_path):
             indexer = DepositIndexer(store, rpc, config)
             assert indexer.poll_once() == 1
             assert store.balance("validator-user") == 1_000_000 * RATE
-            assert store.balance("treasury") == -(1_000_000 * RATE)
+            assert store._balance_in(store._db, "treasury") == -(1_000_000 * RATE)
             assert store._db.execute("SELECT COUNT(*) FROM chain_refs").fetchone()[0] == 1
             assert indexer.poll_once() == 0
             assert store._db.execute("SELECT COUNT(*) FROM chain_refs").fetchone()[0] == 1
