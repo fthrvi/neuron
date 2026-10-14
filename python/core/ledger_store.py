@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 # SQLite's INTEGER storage class is a signed 64-bit value.  Keeping the public
@@ -243,6 +243,8 @@ class LedgerStore:
         credited: dict[str, int],
         charged: int,
         tier: str,
+        *,
+        account_tiers: Mapping[str, str] | None = None,
     ) -> int:
         """Apply a verified receipt once and return the requester's delta.
 
@@ -260,6 +262,13 @@ class LedgerStore:
         for account, amount in credited.items():
             account = _identifier(account, "credited account")
             clean_credits[account] = _amount(amount, f"credit for {account}")
+        clean_account_tiers = {
+            account: _tier(account_tiers[account])
+            for account in clean_credits
+            if account != requester
+            and account_tiers is not None
+            and account in account_tiers
+        }
         if charged == 0 and clean_credits:
             # A free settle may only cover the requester's OWN work. Crediting anyone while
             # charging nothing would mint units from nothing.
@@ -303,8 +312,14 @@ class LedgerStore:
                 (receipt_id, requester, credited_json, charged, delta, tier, now),
             )
             for account in final:
-                self._ensure_account(db, account, tier if account == requester else "stranger")
+                account_tier = (
+                    tier if account == requester
+                    else clean_account_tiers.get(account, "stranger")
+                )
+                self._ensure_account(db, account, account_tier)
             db.execute("UPDATE accounts SET tier=? WHERE id=?", (tier, requester))
+            for account, account_tier in clean_account_tiers.items():
+                db.execute("UPDATE accounts SET tier=? WHERE id=?", (account_tier, account))
             for account, balance in final.items():
                 self._set_balance(db, account, balance)
             for account, amount in clean_credits.items():

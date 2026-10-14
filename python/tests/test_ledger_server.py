@@ -28,6 +28,7 @@ from ledger_server import (  # noqa: E402
     V2LedgerService,
     _make_handler,
     _make_v2_handler,
+    _operator_tiers,
 )
 from http.server import ThreadingHTTPServer  # noqa: E402
 
@@ -380,6 +381,33 @@ def test_v2_valid_receipt_settles_and_replay_is_idempotent(
     assert service.store.balance("alice") == -40
     assert service.store.balance("bob") == 20
     assert service.store.balance("carol") == 20
+
+
+def test_v2_settle_creates_credited_accounts_with_roster_tiers(
+    v2_server, v2_identities, timestamps
+):
+    base, service = v2_server
+    receipt = _sign_receipt(_v2_receipt(), v2_identities)
+    code, _ = _v2_request(
+        base, "POST", "/settle", v2_identities["alice"], {"receipt": receipt},
+        timestamp=timestamps.next(),
+    )
+    assert code == 200
+    rows = service.store._db.execute(
+        "SELECT id, tier FROM accounts WHERE id IN ('bob', 'carol')"
+    ).fetchall()
+    assert {row["id"]: row["tier"] for row in rows} == {
+        "bob": "known", "carol": "known",
+    }
+
+
+def test_operator_tiers_uses_highest_roster_tier():
+    roster = {
+        "key-1": {"operator": "worker", "tier": "known"},
+        "key-2": {"operator": "worker", "tier": "trusted"},
+        "key-3": {"operator": "other", "tier": "unexpected"},
+    }
+    assert _operator_tiers(roster) == {"worker": "trusted", "other": "stranger"}
 
 
 def test_v2_new_run_id_for_same_work_does_not_double_credit(

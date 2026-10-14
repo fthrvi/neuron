@@ -42,7 +42,13 @@ from core.ledger_store import (  # noqa: E402
     LedgerValueError,
     ReceiptStateError,
 )
-from ledger_auth import ReceiptError, load_roster, verify_envelope, verify_receipt  # noqa: E402
+from ledger_auth import (  # noqa: E402
+    TIER_RANK,
+    ReceiptError,
+    load_roster,
+    verify_envelope,
+    verify_receipt,
+)
 
 DEFAULT_PATH = os.path.expanduser("~/.neuron/credits/ledger.json")
 DEFAULT_ROSTER = os.path.expanduser("~/.nakshatra/admission-peers.tsv")
@@ -212,6 +218,23 @@ def _row_identity(
     return operator, tier if isinstance(tier, str) else "stranger"
 
 
+def _operator_tiers(
+    roster: Mapping[str, Mapping[str, object]],
+) -> dict[str, str]:
+    tiers: dict[str, str] = {}
+    for row in roster.values():
+        if not isinstance(row, Mapping):
+            continue
+        operator = row.get("operator")
+        if not isinstance(operator, str) or not operator:
+            continue
+        tier = row.get("tier")
+        normalized = tier if isinstance(tier, str) and tier in TIER_RANK else "stranger"
+        if TIER_RANK[normalized] > TIER_RANK.get(tiers.get(operator, ""), -1):
+            tiers[operator] = normalized
+    return tiers
+
+
 def _query_integer(value: str, name: str, *, low: int, high: int) -> int:
     if not re.fullmatch(r"0|[1-9][0-9]*", value):
         raise LedgerValueError(f"{name} must be an integer")
@@ -242,7 +265,8 @@ class V2LedgerService:
         requester, tier = _row_identity(keyid, roster)
         receipt_id, credited, charged = verify_receipt(body["receipt"], keyid, roster)
         delta = self.store.settle(
-            receipt_id, requester, credited, charged, tier
+            receipt_id, requester, credited, charged, tier,
+            account_tiers=_operator_tiers(roster),
         )
         return {
             "receipt_id": receipt_id,

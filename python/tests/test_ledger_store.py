@@ -73,6 +73,61 @@ def test_racing_settles_cannot_together_cross_credit_limit(tmp_path):
         assert store.balance("worker") == 60
 
 
+def test_settle_applies_roster_tiers_only_to_named_credited_accounts(tmp_path):
+    path = tmp_path / "ledger.db"
+    with LedgerStore(path) as store:
+        store.settle(
+            "first", "consumer", {"known-worker": 10, "unknown-worker": 10},
+            20, "self", account_tiers={"known-worker": "known"},
+        )
+
+    with sqlite3.connect(path) as db:
+        tiers = dict(db.execute("SELECT id, tier FROM accounts"))
+    assert tiers["known-worker"] == "known"
+    assert tiers["unknown-worker"] == "stranger"
+
+
+def test_settle_updates_existing_credited_account_to_current_roster_tier(tmp_path):
+    path = tmp_path / "ledger.db"
+    with LedgerStore(path) as store:
+        store.settle("first", "consumer", {"worker": 10}, 10, "self")
+        store.settle(
+            "second", "consumer", {"worker": 10}, 10, "self",
+            account_tiers={"worker": "trusted"},
+        )
+        assert store._db.execute(
+            "SELECT tier FROM accounts WHERE id='worker'"
+        ).fetchone()[0] == "trusted"
+        store.settle(
+            "third", "consumer", {"worker": 10}, 10, "self",
+            account_tiers={"worker": "known"},
+        )
+
+    with sqlite3.connect(path) as db:
+        tier = db.execute("SELECT tier FROM accounts WHERE id='worker'").fetchone()[0]
+    assert tier == "known"
+
+
+def test_credited_account_tier_does_not_change_requester_limit(tmp_path):
+    path = tmp_path / "ledger.db"
+    with LedgerStore(path) as store:
+        store.settle(
+            "allowed", "consumer", {"consumer": 1, "worker": 10}, 11, "stranger",
+            account_tiers={"consumer": "self", "worker": "trusted"},
+        )
+        with pytest.raises(CreditLimitError):
+            store.settle(
+                "receipt", "consumer", {"worker": 101}, 101, "stranger",
+                account_tiers={"worker": "trusted"},
+            )
+        assert store.balance("consumer") == -10
+        assert store.balance("worker") == 10
+
+    with sqlite3.connect(path) as db:
+        tier = db.execute("SELECT tier FROM accounts WHERE id='consumer'").fetchone()[0]
+    assert tier == "stranger"
+
+
 def test_dispute_is_permanent_and_resettle_is_refused(tmp_path):
     with LedgerStore(tmp_path / "ledger.db") as store:
         store.settle("receipt", "consumer", {"worker": 25}, 25, "stranger")
