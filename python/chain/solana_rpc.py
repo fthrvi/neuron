@@ -182,11 +182,77 @@ class SolanaRPC:
                 raise KeyError("type")
             info = parsed["info"]
             token_amount = info["tokenAmount"]
-            return {
+            parsed_account = {
                 "mint": info["mint"],
                 "amount": int(token_amount["amount"]),
                 "decimals": int(token_amount["decimals"]),
                 "slot": int(result["context"]["slot"]),
             }
+            if isinstance(info.get("owner"), str):
+                parsed_account["owner"] = info["owner"]
+            return parsed_account
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise RPCError(f"{address} is not a parsed SPL token account") from exc
+
+    def get_latest_blockhash(self) -> dict[str, Any]:
+        result = self.call(
+            "getLatestBlockhash", [{"commitment": "finalized"}]
+        )
+        try:
+            value = result["value"]
+            blockhash = validate_pubkey(value["blockhash"], "blockhash")
+            last_valid = int(value["lastValidBlockHeight"])
+            if last_valid < 0:
+                raise ValueError("negative height")
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise RPCError("getLatestBlockhash returned malformed data") from exc
+        return {"blockhash": blockhash, "last_valid_block_height": last_valid}
+
+    def get_block_height(self) -> int:
+        result = self.call("getBlockHeight", [{"commitment": "finalized"}])
+        if isinstance(result, bool) or not isinstance(result, int) or result < 0:
+            raise RPCError("getBlockHeight result is not a non-negative integer")
+        return result
+
+    def get_signature_status(self, signature: str) -> dict[str, Any] | None:
+        result = self.call(
+            "getSignatureStatuses",
+            [[signature], {"searchTransactionHistory": True}],
+        )
+        try:
+            values = result["value"]
+            status = values[0]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RPCError("getSignatureStatuses returned malformed data") from exc
+        if status is not None and not isinstance(status, dict):
+            raise RPCError("signature status is neither an object nor null")
+        return status
+
+    def send_transaction(self, transaction_b64: str) -> str:
+        result = self.call(
+            "sendTransaction",
+            [
+                transaction_b64,
+                {
+                    "encoding": "base64",
+                    "preflightCommitment": "finalized",
+                    "skipPreflight": False,
+                    "maxRetries": 0,
+                },
+            ],
+        )
+        if not isinstance(result, str) or not result:
+            raise RPCError("sendTransaction result is not a signature")
+        return result
+
+    def account_exists(self, address: str) -> bool:
+        result = self.call(
+            "getAccountInfo", [address, {"commitment": "finalized", "encoding": "base64"}]
+        )
+        try:
+            value = result["value"]
+        except (KeyError, TypeError) as exc:
+            raise RPCError("getAccountInfo returned malformed data") from exc
+        if value is not None and not isinstance(value, dict):
+            raise RPCError("getAccountInfo value is neither an object nor null")
+        return value is not None

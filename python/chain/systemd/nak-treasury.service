@@ -1,0 +1,37 @@
+[Unit]
+Description=Nakshatra devnet treasury keyholder and payout worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+Environment=NAK_FUNDS=off
+Environment=PATH=%h/.local/share/solana/install/active_release/bin:/usr/local/bin:/usr/bin
+EnvironmentFile=%h/.config/nakshatra/payout.env
+ExecStart=/usr/bin/python3 /opt/neuron/python/chain/payout.py --store %h/.neuron/credits/ledger.sqlite
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+# Treasury and generated account key files exist only inside this service's
+# private /tmp namespace and are deleted after each CLI operation.
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.neuron/credits %h/.neuron/vault
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallFilter=@system-service
+
+# Required in payout.env:
+# NAK_SOLANA_CLUSTER=devnet (localnet is accepted only for offline tests)
+# NAK_USDC_MINT=<base58 mint pubkey>
+# NAK_SOLANA_RPC=<explicit HTTPS devnet RPC URL>
+# NAK_TREASURY_USDC_ACCOUNT=<treasury vault token account>
+# NAK_FUNDS=off|on (off is the safe default)
+# Optional: NAK_PAYOUT_AUTO_CAP=5, NAK_PAYOUT_DAY_CAP=50
+
+[Install]
+WantedBy=default.target

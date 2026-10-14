@@ -276,6 +276,31 @@ class LedgerStore:
                 updated_ts INTEGER NOT NULL CHECK(typeof(updated_ts) = 'integer')
             );
 
+            CREATE TABLE IF NOT EXISTS deposit_account_queue (
+                operator TEXT PRIMARY KEY,
+                requested_ts INTEGER NOT NULL CHECK(typeof(requested_ts) = 'integer'),
+                attempts INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(attempts) = 'integer' AND attempts >= 0),
+                last_error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS withdrawal_attempts (
+                withdrawal_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL
+                    CHECK(typeof(attempt) = 'integer' AND attempt > 0),
+                tx_sig TEXT NOT NULL UNIQUE,
+                blockhash TEXT NOT NULL,
+                last_valid_block_height INTEGER NOT NULL
+                    CHECK(typeof(last_valid_block_height) = 'integer'
+                          AND last_valid_block_height >= 0),
+                tx_wire TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('sent','expired','finalized')),
+                created_ts INTEGER NOT NULL CHECK(typeof(created_ts) = 'integer'),
+                updated_ts INTEGER NOT NULL CHECK(typeof(updated_ts) = 'integer'),
+                PRIMARY KEY(withdrawal_id, attempt),
+                FOREIGN KEY(withdrawal_id) REFERENCES withdrawals(id)
+            );
+
             CREATE TRIGGER IF NOT EXISTS journal_no_update
             BEFORE UPDATE ON journal
             BEGIN
@@ -296,6 +321,22 @@ class LedgerStore:
         }
         if "token_account" not in chain_ref_columns:
             self._db.execute("ALTER TABLE chain_refs ADD COLUMN token_account TEXT")
+        # S4 payout state is additive so existing S1 databases open in place.
+        withdrawal_columns = {
+            str(row[1]) for row in self._db.execute("PRAGMA table_info(withdrawals)")
+        }
+        for name, definition in (
+            ("approval_ts", "INTEGER"),
+            ("presence_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("expiry_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("blockhash", "TEXT"),
+            ("last_valid_block_height", "INTEGER"),
+            ("tx_wire", "TEXT"),
+        ):
+            if name not in withdrawal_columns:
+                self._db.execute(
+                    f"ALTER TABLE withdrawals ADD COLUMN {name} {definition}"
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -739,6 +780,96 @@ class LedgerStore:
 
         return self._tx(operation)
 
+    def queue_deposit_account(self, operator: str) -> bool:
+        """Queue creation of a treasury-owned token account for *operator*.
+
+        Returns ``True`` when a new queue row was written and ``False`` when
+        the operator already has an account or an outstanding request.
+        """
+        operator = _identifier(operator, "operator")
+        if is_reserved(operator):
+            raise LedgerValueError("operator is reserved")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> bool:
+            if db.execute(
+                "SELECT 1 FROM deposit_accounts WHERE operator=?", (operator,)
+            ).fetchone():
+                return False
+            result = db.execute(
+                "INSERT OR IGNORE INTO deposit_account_queue(operator, requested_ts) "
+                "VALUES (?, ?)",
+                (operator, now),
+            )
+            return result.rowcount == 1
+
+        return self._tx(operation)
+
+    def pending_deposit_accounts(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return queued account requests in stable FIFO order."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise LedgerValueError("limit must be a positive integer")
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT operator, requested_ts, attempts, last_error "
+                "FROM deposit_account_queue ORDER BY requested_ts, operator LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_deposit_account_error(self, operator: str, error: str) -> None:
+        """Record a failed creation attempt without losing the queued request."""
+        operator = _identifier(operator, "operator")
+        error = _identifier(error, "error")[:500]
+
+        def operation(db: sqlite3.Connection) -> None:
+            updated = db.execute(
+                "UPDATE deposit_account_queue SET attempts=attempts+1, last_error=? "
+                "WHERE operator=?",
+                (error, operator),
+            ).rowcount
+            if updated != 1:
+                raise LedgerValueError(f"no queued deposit account for {operator!r}")
+
+        self._tx(operation)
+
+    def register_deposit_account(self, operator: str, token_account: str) -> str:
+        """Atomically bind a created token account and consume its queue row."""
+        operator = _identifier(operator, "operator")
+        token_account = _identifier(token_account, "token_account")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> str:
+            existing = db.execute(
+                "SELECT token_account FROM deposit_accounts WHERE operator=?",
+                (operator,),
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != token_account:
+                    raise LedgerValueError(
+                        f"operator {operator!r} already has a different deposit account"
+                    )
+                db.execute(
+                    "DELETE FROM deposit_account_queue WHERE operator=?", (operator,)
+                )
+                return token_account
+            if db.execute(
+                "SELECT 1 FROM deposit_account_queue WHERE operator=?", (operator,)
+            ).fetchone() is None:
+                raise LedgerValueError(f"no queued deposit account for {operator!r}")
+            try:
+                db.execute(
+                    "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
+                    "VALUES (?, ?, ?)",
+                    (operator, token_account, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise LedgerValueError("token account is already bound") from exc
+            db.execute("DELETE FROM deposit_account_queue WHERE operator=?", (operator,))
+            return token_account
+
+        return self._tx(operation)
+
     def withdrawable(self, operator: str) -> int:
         """Return cashable credits: net deposits plus funded, matured earnings."""
         operator = _identifier(operator, "operator")
@@ -998,6 +1129,33 @@ class LedgerStore:
                 raise CreditLimitError(
                     f"withdrawal exceeds withdrawable balance {available}: {amount}"
                 )
+            # A stranger may recover only their own net deposits. Cashing
+            # funded/matured earnings requires the decided known+ tier.
+            deposited = int(
+                db.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM chain_refs "
+                    "WHERE kind='deposit' AND account=?",
+                    (operator,),
+                ).fetchone()[0]
+            )
+            committed = int(
+                db.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM withdrawals "
+                    "WHERE operator=? AND state IN "
+                    "('pending','approved','sent','expired','finalized')",
+                    (operator,),
+                ).fetchone()[0]
+            )
+            deposit_cash = max(
+                0,
+                min(self._balance_in(db, operator), deposited - committed),
+            )
+            tier_row = db.execute(
+                "SELECT tier FROM accounts WHERE id=?", (operator,)
+            ).fetchone()
+            tier = _tier(tier_row[0] if tier_row else "stranger")
+            if amount > deposit_cash and tier == "stranger":
+                raise CreditLimitError("cashing earnings requires tier known or higher")
             operator_new = self._checked_balance(
                 self._balance_in(db, operator) - amount, operator
             )
@@ -1027,6 +1185,199 @@ class LedgerStore:
 
         return self._tx(operation)
 
+    def withdrawals(self, *states: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Return payout rows for the requested states, oldest first."""
+        allowed = {"pending", "approved", "sent", "finalized", "released", "expired"}
+        if not states or any(state not in allowed for state in states):
+            raise LedgerValueError("one or more valid withdrawal states are required")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise LedgerValueError("limit must be a positive integer")
+        placeholders = ",".join("?" for _ in states)
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT * FROM withdrawals WHERE state IN ({placeholders}) "
+                "ORDER BY created_ts, id LIMIT ?",
+                (*states, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def approved_withdrawal_total_since(self, timestamp: int) -> int:
+        """Return credits approved at or after *timestamp* (including terminal rows)."""
+        if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+            raise LedgerValueError("timestamp must be a non-negative integer")
+        with self._lock:
+            return int(
+                self._db.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM withdrawals "
+                    "WHERE approval_ts IS NOT NULL AND approval_ts>=?",
+                    (timestamp,),
+                ).fetchone()[0]
+            )
+
+    def withdraw_approve(self, withdrawal_id: str, approval_ref: str) -> int:
+        """Move one pending hold to approved, preserving the approval reference."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        approval_ref = _identifier(approval_ref, "approval_ref")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> int:
+            row = db.execute(
+                "SELECT amount, state, approval_ref FROM withdrawals WHERE id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if row is None:
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} does not exist"
+                )
+            if row["state"] == "approved" and row["approval_ref"] == approval_ref:
+                return int(row["amount"])
+            if row["state"] != "pending":
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} is {row['state']} and cannot approve"
+                )
+            db.execute(
+                "UPDATE withdrawals SET state='approved', approval_ref=?, "
+                "approval_ts=?, updated_ts=? WHERE id=?",
+                (approval_ref, now, now, withdrawal_id),
+            )
+            return int(row["amount"])
+
+        return self._tx(operation)
+
+    def withdraw_presence_attempt(self, withdrawal_id: str) -> int:
+        """Count one unanswered/declined human approval request."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> int:
+            row = db.execute(
+                "SELECT state, presence_attempts FROM withdrawals WHERE id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if row is None or row["state"] != "pending":
+                state = "missing" if row is None else row["state"]
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} is {state} and cannot record presence"
+                )
+            attempts = int(row["presence_attempts"]) + 1
+            db.execute(
+                "UPDATE withdrawals SET presence_attempts=?, updated_ts=? WHERE id=?",
+                (attempts, now, withdrawal_id),
+            )
+            return attempts
+
+        return self._tx(operation)
+
+    def withdraw_mark_sent(
+        self,
+        withdrawal_id: str,
+        tx_sig: str,
+        blockhash: str,
+        last_valid_block_height: int,
+        tx_wire: str,
+    ) -> int:
+        """Durably record a signed transaction before it may be broadcast."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        tx_sig = _identifier(tx_sig, "tx_sig")
+        blockhash = _identifier(blockhash, "blockhash")
+        tx_wire = _identifier(tx_wire, "tx_wire")
+        if (
+            isinstance(last_valid_block_height, bool)
+            or not isinstance(last_valid_block_height, int)
+            or last_valid_block_height < 0
+            or last_valid_block_height > 2 ** 63 - 1
+        ):
+            raise LedgerValueError("last_valid_block_height is invalid")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> int:
+            row = db.execute(
+                "SELECT state, tx_sig, expiry_count FROM withdrawals WHERE id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if row is None:
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} does not exist"
+                )
+            if row["state"] == "sent" and row["tx_sig"] == tx_sig:
+                return int(row["expiry_count"]) + 1
+            if row["state"] not in ("approved", "expired"):
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} is {row['state']} and cannot send"
+                )
+            expiry_count = int(row["expiry_count"])
+            if expiry_count >= 3:
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} exhausted three blockhashes"
+                )
+            attempt = expiry_count + 1
+            try:
+                db.execute(
+                    "INSERT INTO withdrawal_attempts"
+                    "(withdrawal_id, attempt, tx_sig, blockhash, "
+                    "last_valid_block_height, tx_wire, state, created_ts, updated_ts) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'sent', ?, ?)",
+                    (
+                        withdrawal_id,
+                        attempt,
+                        tx_sig,
+                        blockhash,
+                        last_valid_block_height,
+                        tx_wire,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise WithdrawalStateError("transaction signature was already recorded") from exc
+            db.execute(
+                "UPDATE withdrawals SET state='sent', tx_sig=?, blockhash=?, "
+                "last_valid_block_height=?, tx_wire=?, updated_ts=? WHERE id=?",
+                (
+                    tx_sig,
+                    blockhash,
+                    last_valid_block_height,
+                    tx_wire,
+                    now,
+                    withdrawal_id,
+                ),
+            )
+            return attempt
+
+        return self._tx(operation)
+
+    def withdraw_mark_expired(self, withdrawal_id: str) -> int:
+        """Mark the current sent attempt unable to land and return expiry count."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> int:
+            row = db.execute(
+                "SELECT state, tx_sig, expiry_count FROM withdrawals WHERE id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if row is None or row["state"] != "sent":
+                state = "missing" if row is None else row["state"]
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} is {state} and cannot expire"
+                )
+            expiry_count = int(row["expiry_count"]) + 1
+            updated = db.execute(
+                "UPDATE withdrawal_attempts SET state='expired', updated_ts=? "
+                "WHERE withdrawal_id=? AND tx_sig=? AND state='sent'",
+                (now, withdrawal_id, row["tx_sig"]),
+            ).rowcount
+            if updated != 1:
+                raise WithdrawalStateError("current sent attempt is missing")
+            db.execute(
+                "UPDATE withdrawals SET state='expired', expiry_count=?, updated_ts=? "
+                "WHERE id=?",
+                (expiry_count, now, withdrawal_id),
+            )
+            return expiry_count
+
+        return self._tx(operation)
+
     def withdraw_finalize(self, withdrawal_id: str) -> int:
         """Finalize an active hold by moving it to the treasury."""
         withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
@@ -1035,7 +1386,7 @@ class LedgerStore:
 
         def operation(db: sqlite3.Connection) -> int:
             row = db.execute(
-                "SELECT operator, amount, address, state FROM withdrawals WHERE id=?",
+                "SELECT operator, amount, address, state, tx_sig FROM withdrawals WHERE id=?",
                 (withdrawal_id,),
             ).fetchone()
             if row is None:
@@ -1062,6 +1413,11 @@ class LedgerStore:
             db.execute(
                 "UPDATE withdrawals SET state='finalized', updated_ts=? WHERE id=?",
                 (now, withdrawal_id),
+            )
+            db.execute(
+                "UPDATE withdrawal_attempts SET state='finalized', updated_ts=? "
+                "WHERE withdrawal_id=? AND tx_sig=? AND state='sent'",
+                (now, withdrawal_id, row["tx_sig"]),
             )
             detail = json.dumps(
                 {
