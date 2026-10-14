@@ -21,7 +21,9 @@ from typing import Any
 
 # SQLite's INTEGER storage class is a signed 64-bit value.  Keeping the public
 # bound identical prevents a large Python int from silently becoming REAL.
-MAX_UNITS = (1 << 63) - 1
+# Per-operation bound in TEST units: large enough for any real settle, small enough that a
+# malformed or hostile amount can never approach integer overflow in balances.
+MAX_UNITS = 10 ** 12
 
 # These limits mirror nakshatra/scripts/creditlimit.py.  Unknown tiers are
 # intentionally treated as strangers (the tightest policy).
@@ -49,12 +51,13 @@ class ReceiptStateError(LedgerError):
     """A receipt exists but its durable state forbids the requested action."""
 
 
-def _amount(value: Any, name: str = "amount") -> int:
-    """Return a strictly bounded positive integer without coercion."""
+def _amount(value: Any, name: str = "amount", *, allow_zero: bool = False) -> int:
+    """Return a strictly bounded integer without coercion (positive unless ``allow_zero``)."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise LedgerValueError(f"{name} must be an integer")
-    if value <= 0 or value > MAX_UNITS:
-        raise LedgerValueError(f"{name} must be between 1 and {MAX_UNITS}")
+    low = 0 if allow_zero else 1
+    if value < low or value > MAX_UNITS:
+        raise LedgerValueError(f"{name} must be between {low} and {MAX_UNITS}")
     return value
 
 
@@ -149,7 +152,7 @@ class LedgerStore:
                     CHECK(state IN ('settled', 'disputed', 'legacy_unsigned')),
                 created_at INTEGER NOT NULL,
                 disputed_at INTEGER,
-                CHECK(state != 'settled' OR charged > 0)
+                CHECK(state != 'settled' OR charged >= 0)
             );
 
             CREATE TABLE IF NOT EXISTS nonces (
@@ -248,7 +251,8 @@ class LedgerStore:
         """
         receipt_id = _identifier(receipt_id, "receipt_id")
         requester = _identifier(requester, "requester")
-        charged = _amount(charged, "charged")
+        # Work on the requester's OWN nodes is free (local = free) but is still recorded for the audit.
+        charged = _amount(charged, "charged", allow_zero=True)
         tier = _tier(tier)
         if not isinstance(credited, dict):
             raise LedgerValueError("credited must be a dict of account to amount")
@@ -256,6 +260,10 @@ class LedgerStore:
         for account, amount in credited.items():
             account = _identifier(account, "credited account")
             clean_credits[account] = _amount(amount, f"credit for {account}")
+        if charged == 0 and clean_credits:
+            # A free settle may only cover the requester's OWN work. Crediting anyone while
+            # charging nothing would mint units from nothing.
+            raise LedgerValueError("a zero-charge settle cannot credit any account")
         credited_json = json.dumps(clean_credits, sort_keys=True, separators=(",", ":"))
         now = int(time.time())
         delta = -charged
@@ -305,11 +313,12 @@ class LedgerStore:
                     "VALUES (?, 'earn', ?, ?, ?, ?)",
                     (now, receipt_id, account, requester, amount),
                 )
-            db.execute(
-                "INSERT INTO journal(ts, kind, receipt_id, account, amount, detail) "
-                "VALUES (?, 'spend', ?, ?, ?, ?)",
-                (now, receipt_id, requester, -charged, json.dumps({"tier": tier})),
-            )
+            if charged:  # a free own-node settle has no spend row; its receipts row is the record
+                db.execute(
+                    "INSERT INTO journal(ts, kind, receipt_id, account, amount, detail) "
+                    "VALUES (?, 'spend', ?, ?, ?, ?)",
+                    (now, receipt_id, requester, -charged, json.dumps({"tier": tier})),
+                )
             return delta
 
         return self._tx(operation)

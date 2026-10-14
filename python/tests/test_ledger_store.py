@@ -181,3 +181,13 @@ def test_import_legacy_snapshot_preserves_balances_and_marks_receipts(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_free_own_node_settle_is_recorded_once(tmp_path):
+    """Local = free: a settle with charged=0 (the requester's own nodes) is stored for the audit
+    and is idempotent; it must not be rejected (every live settle on 2026-10-13 was charged 0)."""
+    from core.ledger_store import LedgerStore
+    store = LedgerStore(str(tmp_path / "l.sqlite"))
+    assert store.settle("r-free", "prithvi", {}, 0, "self") == 0
+    assert store.settle("r-free", "prithvi", {}, 0, "self") == 0
+    assert store.balance("prithvi") == 0
