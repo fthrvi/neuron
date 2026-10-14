@@ -23,12 +23,15 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 from ledger_auth import canonical_string  # noqa: E402
 from ledger_migrate import migrate  # noqa: E402
 from core.ledger_store import LedgerStore  # noqa: E402
+from core import ledger_store as ledger_store_module  # noqa: E402
+from core.ledger_store import HOLD_S, MIN_WITHDRAW_CREDITS  # noqa: E402
 from ledger_server import (  # noqa: E402
     LedgerService,
     V2LedgerService,
     _make_handler,
     _make_v2_handler,
     _operator_tiers,
+    _row_identity,
 )
 from http.server import ThreadingHTTPServer  # noqa: E402
 
@@ -181,6 +184,7 @@ def v2_identities(tmp_path):
         ("carol", "worker-carol", "carol", "known"),
         ("alice_worker", "worker-alice", "alice", "known"),
         ("mallory", "stranger-node", "mallory", "stranger"),
+        ("stranger_depositor", "deposit-node", "stranger-depositor", "stranger"),
         ("operator", "operator-node", "ledger-operator", "self"),
     ):
         private, public = _v2_keypair()
@@ -540,6 +544,167 @@ def test_v2_signed_gets_are_own_only_and_balances_is_refused(
     assert _v2_request(base, "GET", "/health")[1] == {
         "ok": True, "store": "sqlite", "signed": True
     }
+
+
+def test_funds_routes_are_hidden_when_off_and_require_signatures_when_on(
+    v2_server, v2_identities, timestamps, monkeypatch
+):
+    base, _ = v2_server
+    monkeypatch.delenv("NAK_FUNDS_ROUTES", raising=False)
+    assert _v2_request(base, "GET", "/wallet")[0] == 404
+    assert _v2_request(
+        base, "POST", "/wallet/bind", obj={"address": "1" * 32}
+    )[0] == 404
+
+    monkeypatch.setenv("NAK_FUNDS_ROUTES", "on")
+    assert _v2_request(base, "GET", "/wallet")[0] == 401
+    assert _v2_request(base, "GET", "/wallet/status")[0] == 401
+    assert _v2_request(base, "POST", "/withdraw", obj={"amount": 1})[0] == 401
+
+
+def test_wallet_is_queued_and_all_gets_answer_only_for_signer(
+    v2_server, v2_identities, timestamps, monkeypatch
+):
+    monkeypatch.setenv("NAK_FUNDS_ROUTES", "on")
+    base, service = v2_server
+    code, wallet = _v2_request(
+        base, "GET", "/wallet?account=bob", v2_identities["alice"],
+        timestamp=timestamps.next(),
+    )
+    assert code == 200
+    assert wallet == {
+        "account": "alice",
+        "status": "pending",
+        "deposit_address": None,
+        "requested_ts": wallet["requested_ts"],
+    }
+    queued = service.store._db.execute(
+        "SELECT operator FROM deposit_account_requests"
+    ).fetchall()
+    assert [row["operator"] for row in queued] == ["alice"]
+
+    service.store.deposit("alice:0", "alice", MIN_WITHDRAW_CREDITS * 2, 1)
+    service.store.deposit("bob:0", "bob", MIN_WITHDRAW_CREDITS * 3, 2)
+    code, status = _v2_request(
+        base, "GET", "/wallet/status?account=bob", v2_identities["alice"],
+        timestamp=timestamps.next(),
+    )
+    assert code == 200 and status["account"] == "alice"
+    assert status["balance"] == MIN_WITHDRAW_CREDITS * 2
+    assert status["withdrawable"] == MIN_WITHDRAW_CREDITS * 2
+    assert status["balance_usdc"] == "2.00000000"
+    assert status["pending_withdrawals"] == []
+
+
+
+def test_row_identity_refuses_reserved_operator():
+    with pytest.raises(PermissionError, match="reserved"):
+        _row_identity("key", {"key": {"operator": "treasury", "tier": "self"}})
+
+
+def test_withdraw_requires_bound_cooled_address_minimum_and_one_per_day(
+    v2_server, v2_identities, timestamps, monkeypatch
+):
+    monkeypatch.setenv("NAK_FUNDS_ROUTES", "on")
+    base, service = v2_server
+    service.store.deposit("alice:0", "alice", MIN_WITHDRAW_CREDITS * 3, 1)
+
+    code, _ = _v2_request(
+        base, "POST", "/withdraw", v2_identities["alice"],
+        {"amount": MIN_WITHDRAW_CREDITS}, timestamp=timestamps.next(),
+    )
+    assert code == 403
+
+    first_address = "1" * 32
+    second_address = "So11111111111111111111111111111111111111112"
+    code, bound = _v2_request(
+        base, "POST", "/wallet/bind", v2_identities["alice"],
+        {"address": first_address}, timestamp=timestamps.next(),
+    )
+    assert code == 200 and bound["cooling_until"] is None
+
+    code, _ = _v2_request(
+        base, "POST", "/withdraw", v2_identities["alice"],
+        {"amount": MIN_WITHDRAW_CREDITS - 100}, timestamp=timestamps.next(),
+    )
+    assert code == 422
+    code, withdrawal = _v2_request(
+        base, "POST", "/withdraw", v2_identities["alice"],
+        {"amount": MIN_WITHDRAW_CREDITS}, timestamp=timestamps.next(),
+    )
+    assert code == 200 and withdrawal["state"] == "pending"
+    code, _ = _v2_request(
+        base, "POST", "/withdraw", v2_identities["alice"],
+        {"amount": MIN_WITHDRAW_CREDITS}, timestamp=timestamps.next(),
+    )
+    assert code == 429
+
+    code, changed = _v2_request(
+        base, "POST", "/wallet/bind", v2_identities["alice"],
+        {"address": second_address}, timestamp=timestamps.next(),
+    )
+    assert code == 200 and changed["changed"] is True
+    code, _ = _v2_request(
+        base, "POST", "/withdraw", v2_identities["alice"],
+        {"amount": MIN_WITHDRAW_CREDITS}, timestamp=timestamps.next(),
+    )
+    assert code == 403
+
+
+def test_withdraw_tier_rule_allows_own_deposits_but_not_stranger_earnings(
+    v2_server, v2_identities, timestamps, monkeypatch
+):
+    monkeypatch.setenv("NAK_FUNDS_ROUTES", "on")
+    clock = [1_000_000]
+    monkeypatch.setattr(ledger_store_module.time, "time", lambda: clock[0])
+    signed_at = [clock[0] - 10]
+
+    def next_signed_at():
+        signed_at[0] += 1
+        return signed_at[0]
+
+    base, service = v2_server
+    address = "1" * 32
+
+    service.store.deposit(
+        "own:0", "stranger-depositor", MIN_WITHDRAW_CREDITS, 1
+    )
+    code, _ = _v2_request(
+        base, "POST", "/wallet/bind", v2_identities["stranger_depositor"],
+        {"address": address}, timestamp=next_signed_at(),
+    )
+    assert code == 200
+    code, _ = _v2_request(
+        base, "POST", "/withdraw", v2_identities["stranger_depositor"],
+        {"amount": MIN_WITHDRAW_CREDITS}, timestamp=next_signed_at(),
+    )
+    assert code == 200
+
+    service.store.deposit("funded:0", "alice", MIN_WITHDRAW_CREDITS * 2, 2)
+    service.store.settle(
+        "earnings", "alice",
+        {"mallory": MIN_WITHDRAW_CREDITS, "bob": MIN_WITHDRAW_CREDITS},
+        MIN_WITHDRAW_CREDITS * 2, "self",
+    )
+    for who in ("mallory", "bob"):
+        code, _ = _v2_request(
+            base, "POST", "/wallet/bind", v2_identities[who],
+            {"address": address}, timestamp=next_signed_at(),
+        )
+        assert code == 200
+    clock[0] += HOLD_S + 1
+    signed_at[0] = clock[0] - 10
+
+    code, _ = _v2_request(
+        base, "POST", "/withdraw", v2_identities["mallory"],
+        {"amount": MIN_WITHDRAW_CREDITS}, timestamp=next_signed_at(),
+    )
+    assert code == 403
+    code, _ = _v2_request(
+        base, "POST", "/withdraw", v2_identities["bob"],
+        {"amount": MIN_WITHDRAW_CREDITS}, timestamp=next_signed_at(),
+    )
+    assert code == 200
 
 
 def test_migration_round_trip_preserves_totals_and_is_idempotent(tmp_path, capsys):

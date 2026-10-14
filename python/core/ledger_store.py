@@ -33,6 +33,9 @@ RATE = 100
 
 # Earnings remain reversible for the full receipt dispute window.
 HOLD_S = 7 * 24 * 60 * 60
+PAYOUT_COOLING_S = 48 * 60 * 60
+WITHDRAWAL_DAY_S = 24 * 60 * 60
+MIN_WITHDRAW_CREDITS = RATE * 1_000_000
 
 TREASURY_ACCOUNT = "treasury"
 _WITHDRAWAL_HOLD_STEM = "__withdrawal_hold__"
@@ -81,6 +84,18 @@ class DepositBalanceMismatch(LedgerError):
 
 class WithdrawalStateError(ReceiptStateError):
     """A withdrawal does not exist or cannot make the requested state transition."""
+
+
+class PayoutAddressError(LedgerError):
+    """A withdrawal has no usable bound payout address."""
+
+
+class WithdrawalRateLimitError(LedgerError):
+    """The operator already requested a withdrawal in the current window."""
+
+
+class WithdrawalTierError(LedgerError):
+    """The operator's roster tier cannot cash out earned credits."""
 
 
 def is_reserved(account: object) -> bool:
@@ -234,6 +249,11 @@ class LedgerStore:
             CREATE UNIQUE INDEX IF NOT EXISTS deposit_accounts_token_account
             ON deposit_accounts(token_account);
 
+            CREATE TABLE IF NOT EXISTS deposit_account_requests (
+                operator TEXT PRIMARY KEY,
+                requested_ts INTEGER NOT NULL CHECK(typeof(requested_ts) = 'integer')
+            );
+
             CREATE TABLE IF NOT EXISTS payout_addresses (
                 operator TEXT PRIMARY KEY,
                 address TEXT NOT NULL,
@@ -375,6 +395,25 @@ class LedgerStore:
 
         entitlement = deposited - withdrawn - held + matured_earnings
         return max(0, min(balance, entitlement))
+
+    @staticmethod
+    def _net_deposits_in(db: sqlite3.Connection, operator: str) -> int:
+        deposited = int(
+            db.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM chain_refs "
+                "WHERE kind='deposit' AND account=?",
+                (operator,),
+            ).fetchone()[0]
+        )
+        removed = int(
+            db.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM withdrawals "
+                "WHERE operator=? AND state IN "
+                "('pending','approved','sent','finalized','expired')",
+                (operator,),
+            ).fetchone()[0]
+        )
+        return max(0, deposited - removed)
 
     def settle(
         self,
@@ -707,6 +746,219 @@ class LedgerStore:
             raise LedgerValueError("operator is reserved")
         with self._lock:
             return self._withdrawable_in(self._db, operator, int(time.time()))
+
+    def wallet(self, operator: str) -> dict[str, Any]:
+        """Return the deposit account, durably requesting treasury creation if absent."""
+        operator = _identifier(operator, "operator")
+        if is_reserved(operator):
+            raise LedgerValueError("operator is reserved")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            row = db.execute(
+                "SELECT token_account, created_ts FROM deposit_accounts WHERE operator=?",
+                (operator,),
+            ).fetchone()
+            if row is not None:
+                return {
+                    "status": "ready",
+                    "deposit_address": str(row["token_account"]),
+                    "created_ts": int(row["created_ts"]),
+                }
+            db.execute(
+                "INSERT INTO deposit_account_requests(operator, requested_ts) VALUES (?, ?) "
+                "ON CONFLICT(operator) DO NOTHING",
+                (operator, now),
+            )
+            requested = db.execute(
+                "SELECT requested_ts FROM deposit_account_requests WHERE operator=?",
+                (operator,),
+            ).fetchone()
+            return {
+                "status": "pending",
+                "deposit_address": None,
+                "requested_ts": int(requested["requested_ts"]),
+            }
+
+        return self._tx(operation)
+
+    def bind_payout_address(self, operator: str, address: str) -> dict[str, Any]:
+        """Bind a payout address; changing it starts the 48-hour cooling window."""
+        operator = _identifier(operator, "operator")
+        address = _identifier(address, "address")
+        if is_reserved(operator):
+            raise LedgerValueError("operator is reserved")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            row = db.execute(
+                "SELECT address, bound_ts, previous FROM payout_addresses WHERE operator=?",
+                (operator,),
+            ).fetchone()
+            if row is None:
+                db.execute(
+                    "INSERT INTO payout_addresses(operator, address, bound_ts, previous) "
+                    "VALUES (?, ?, ?, NULL)",
+                    (operator, address, now),
+                )
+                return {
+                    "address": address,
+                    "bound_ts": now,
+                    "previous": None,
+                    "changed": False,
+                    "cooling_until": None,
+                }
+            if row["address"] == address:
+                previous = row["previous"]
+                bound_ts = int(row["bound_ts"])
+                return {
+                    "address": address,
+                    "bound_ts": bound_ts,
+                    "previous": previous,
+                    "changed": False,
+                    "cooling_until": (
+                        bound_ts + PAYOUT_COOLING_S if previous is not None else None
+                    ),
+                }
+            db.execute(
+                "UPDATE payout_addresses SET address=?, bound_ts=?, previous=? "
+                "WHERE operator=?",
+                (address, now, row["address"], operator),
+            )
+            return {
+                "address": address,
+                "bound_ts": now,
+                "previous": row["address"],
+                "changed": True,
+                "cooling_until": now + PAYOUT_COOLING_S,
+            }
+
+        return self._tx(operation)
+
+    def wallet_status(self, operator: str) -> dict[str, Any]:
+        """Return the signer's money-facing status without exposing internal hold accounts."""
+        operator = _identifier(operator, "operator")
+        if is_reserved(operator):
+            raise LedgerValueError("operator is reserved")
+        now = int(time.time())
+        with self._lock:
+            balance = self._balance_in(self._db, operator)
+            withdrawable = self._withdrawable_in(self._db, operator, now)
+            payout = self._db.execute(
+                "SELECT address, bound_ts, previous FROM payout_addresses WHERE operator=?",
+                (operator,),
+            ).fetchone()
+            rows = self._db.execute(
+                "SELECT id, amount, address, state, tx_sig, created_ts, updated_ts "
+                "FROM withdrawals WHERE operator=? AND state NOT IN ('finalized','released') "
+                "ORDER BY created_ts, id",
+                (operator,),
+            ).fetchall()
+            payout_value = None
+            if payout is not None:
+                bound_ts = int(payout["bound_ts"])
+                payout_value = {
+                    "address": str(payout["address"]),
+                    "bound_ts": bound_ts,
+                    "cooling_until": (
+                        bound_ts + PAYOUT_COOLING_S
+                        if payout["previous"] is not None else None
+                    ),
+                }
+            return {
+                "balance": balance,
+                "withdrawable": withdrawable,
+                "payout": payout_value,
+                "pending_withdrawals": [dict(row) for row in rows],
+            }
+
+    def request_withdrawal(
+        self,
+        operator: str,
+        amount: int,
+        tier: str,
+        *,
+        address: str | None = None,
+    ) -> str:
+        """Apply withdrawal policy and create the pending hold in one transaction."""
+        operator = _identifier(operator, "operator")
+        if is_reserved(operator):
+            raise LedgerValueError("operator is reserved")
+        amount = _amount(amount)
+        if amount < MIN_WITHDRAW_CREDITS:
+            raise LedgerValueError(
+                f"amount must be at least {MIN_WITHDRAW_CREDITS} credits (1 USDC)"
+            )
+        if amount % RATE:
+            raise LedgerValueError(f"amount must be a multiple of {RATE} credits")
+        if address is not None:
+            address = _identifier(address, "address")
+        tier = _tier(tier)
+        now = int(time.time())
+        withdrawal_id = uuid.uuid4().hex
+        hold_account = self._withdrawal_hold_account(withdrawal_id)
+
+        def operation(db: sqlite3.Connection) -> str:
+            payout = db.execute(
+                "SELECT address, bound_ts, previous FROM payout_addresses WHERE operator=?",
+                (operator,),
+            ).fetchone()
+            if payout is None:
+                raise PayoutAddressError("bind a payout address before withdrawing")
+            bound_address = str(payout["address"])
+            if address is not None and address != bound_address:
+                raise PayoutAddressError("withdrawal address is not the bound payout address")
+            if (
+                payout["previous"] is not None
+                and now < int(payout["bound_ts"]) + PAYOUT_COOLING_S
+            ):
+                raise PayoutAddressError("the changed payout address is still cooling")
+            recent = db.execute(
+                "SELECT 1 FROM withdrawals WHERE operator=? AND created_ts>? LIMIT 1",
+                (operator, now - WITHDRAWAL_DAY_S),
+            ).fetchone()
+            if recent is not None:
+                raise WithdrawalRateLimitError("only one withdrawal may be requested per day")
+            available = self._withdrawable_in(db, operator, now)
+            if amount > available:
+                raise CreditLimitError(
+                    f"withdrawal exceeds withdrawable balance {available}: {amount}"
+                )
+            balance = self._balance_in(db, operator)
+            own_deposits = min(max(0, balance), self._net_deposits_in(db, operator))
+            if amount > own_deposits and tier == "stranger":
+                raise WithdrawalTierError("known tier or higher is required for earnings")
+
+            operator_new = self._checked_balance(balance - amount, operator)
+            hold_new = self._checked_balance(
+                self._balance_in(db, hold_account) + amount, hold_account
+            )
+            self._ensure_account(db, operator)
+            self._ensure_account(db, hold_account, "self")
+            self._set_balance(db, operator, operator_new)
+            self._set_balance(db, hold_account, hold_new)
+            db.execute(
+                "INSERT INTO withdrawals(id, operator, amount, address, state, "
+                "created_ts, updated_ts) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                (withdrawal_id, operator, amount, bound_address, now, now),
+            )
+            detail = json.dumps(
+                {
+                    "address": bound_address,
+                    "rate": RATE,
+                    "withdrawal_id": withdrawal_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            db.execute(
+                "INSERT INTO journal(ts, kind, account, counterparty, amount, detail) "
+                "VALUES (?, 'withdraw_hold', ?, ?, ?, ?)",
+                (now, operator, hold_account, -amount, detail),
+            )
+            return withdrawal_id
+
+        return self._tx(operation)
 
     def withdraw_hold(
         self,

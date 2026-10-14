@@ -36,11 +36,17 @@ sys.path.insert(0, os.path.dirname(__file__))
 from core.credit_ledger import CreditLedger, CreditError  # noqa: E402
 from core.ledger_store import (  # noqa: E402
     MAX_UNITS,
+    MIN_WITHDRAW_CREDITS,
+    RATE,
     TIER_LIMITS,
     CreditLimitError,
     LedgerStore,
     LedgerValueError,
+    PayoutAddressError,
     ReceiptStateError,
+    WithdrawalRateLimitError,
+    WithdrawalTierError,
+    is_reserved,
 )
 from ledger_auth import (  # noqa: E402
     TIER_RANK,
@@ -53,6 +59,7 @@ from ledger_auth import (  # noqa: E402
 DEFAULT_PATH = os.path.expanduser("~/.neuron/credits/ledger.json")
 DEFAULT_ROSTER = os.path.expanduser("~/.nakshatra/admission-peers.tsv")
 MAX_BODY_BYTES = 64 * 1024
+_BASE58_ALPHABET = frozenset("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 
 class LedgerService:
@@ -215,6 +222,8 @@ def _row_identity(
     tier = row.get("tier")
     if not isinstance(operator, str) or not operator:
         raise PermissionError("signing key has no roster operator")
+    if is_reserved(operator):
+        raise PermissionError("signing key maps to a reserved operator")
     return operator, tier if isinstance(tier, str) else "stranger"
 
 
@@ -242,6 +251,33 @@ def _query_integer(value: str, name: str, *, low: int, high: int) -> int:
     if parsed < low or parsed > high:
         raise LedgerValueError(f"{name} must be between {low} and {high}")
     return parsed
+
+
+def _funds_routes_enabled() -> bool:
+    return os.environ.get("NAK_FUNDS_ROUTES", "").strip().lower() == "on"
+
+
+def _solana_address(value: object) -> str:
+    if not isinstance(value, str) or not 32 <= len(value) <= 44:
+        raise LedgerValueError("address must be a Solana base58 public key")
+    if any(char not in _BASE58_ALPHABET for char in value):
+        raise LedgerValueError("address must be a Solana base58 public key")
+    leading_zeroes = len(value) - len(value.lstrip("1"))
+    number = 0
+    for char in value:
+        number = number * 58 + "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".index(char)
+    decoded = (b"\x00" * leading_zeroes) + (
+        number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
+    )
+    if len(decoded) != 32:
+        raise LedgerValueError("address must decode to a 32-byte Solana public key")
+    return value
+
+
+def _credits_as_usdc(credits: int) -> str:
+    sign = "-" if credits < 0 else ""
+    whole, fraction = divmod(abs(credits), RATE * 1_000_000)
+    return f"{sign}{whole}.{fraction:08d}"
 
 
 class V2LedgerService:
@@ -331,6 +367,71 @@ class V2LedgerService:
         allowed = limit is None or balance - cost >= -limit
         return {"account": operator, "cost": cost, "ok": allowed, "balance": balance}
 
+    def wallet(
+        self,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        operator, _tier = _row_identity(keyid, roster)
+        return {"account": operator, **self.store.wallet(operator)}
+
+    def bind_wallet(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        if not isinstance(body, dict):
+            raise LedgerValueError("request body must be an object")
+        operator, _tier = _row_identity(keyid, roster)
+        address = _solana_address(body.get("address"))
+        return {"account": operator, **self.store.bind_payout_address(operator, address)}
+
+    def withdraw(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        if not isinstance(body, dict):
+            raise LedgerValueError("request body must be an object")
+        operator, tier = _row_identity(keyid, roster)
+        amount = body.get("amount")
+        if isinstance(amount, bool) or not isinstance(amount, int):
+            raise LedgerValueError("amount must be an integer number of credits")
+        requested_address = body.get("address")
+        if requested_address is not None:
+            requested_address = _solana_address(requested_address)
+        withdrawal_id = self.store.request_withdrawal(
+            operator, amount, tier, address=requested_address
+        )
+        return {
+            "id": withdrawal_id,
+            "account": operator,
+            "amount": amount,
+            "amount_usdc": _credits_as_usdc(amount),
+            "state": "pending",
+        }
+
+    def wallet_status(
+        self,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        operator, tier = _row_identity(keyid, roster)
+        status = self.store.wallet_status(operator)
+        return {
+            "account": operator,
+            "tier": tier,
+            **status,
+            "balance_usdc": _credits_as_usdc(int(status["balance"])),
+            "withdrawable_usdc": _credits_as_usdc(int(status["withdrawable"])),
+            "rate": {
+                "credits_per_micro_usdc": RATE,
+                "minimum_withdrawal_credits": MIN_WITHDRAW_CREDITS,
+            },
+        }
+
 
 def _make_v2_handler(svc: V2LedgerService):
     class H(BaseHTTPRequestHandler):
@@ -384,7 +485,13 @@ def _make_v2_handler(svc: V2LedgerService):
             if target.path == "/balances":
                 self._send(403, {"error": "all-account balances are disabled"})
                 return
-            if target.path not in ("/balance", "/history", "/can_consume"):
+            funds_path = target.path in ("/wallet", "/wallet/status")
+            if funds_path and not _funds_routes_enabled():
+                self._send(404, {"error": "not found"})
+                return
+            if target.path not in (
+                "/balance", "/history", "/can_consume", "/wallet", "/wallet/status"
+            ):
                 self._send(404, {"error": "not found"})
                 return
             authenticated = self._authenticate("GET", b"")
@@ -403,12 +510,16 @@ def _make_v2_handler(svc: V2LedgerService):
                     limit_text = query.get("limit", ["50"])[0]
                     limit = _query_integer(limit_text, "limit", low=1, high=1000)
                     result = svc.history(operator, limit)
-                else:
+                elif target.path == "/can_consume":
                     cost_text = query.get("cost", [None])[0]
                     if cost_text is None:
                         raise LedgerValueError("cost is required")
                     cost = _query_integer(cost_text, "cost", low=0, high=MAX_UNITS)
                     result = svc.can_consume(operator, tier, cost)
+                elif target.path == "/wallet":
+                    result = svc.wallet(keyid, roster)
+                else:
+                    result = svc.wallet_status(keyid, roster)
                 self._send(200, result)
             except PermissionError as exc:
                 self._send(403, {"error": str(exc)})
@@ -416,6 +527,11 @@ def _make_v2_handler(svc: V2LedgerService):
                 self._send(422, {"error": str(exc)})
 
         def do_POST(self) -> None:
+            target = urlparse(self.path)
+            funds_path = target.path in ("/wallet/bind", "/withdraw")
+            if funds_path and not _funds_routes_enabled():
+                self._send(404, {"error": "not found"})
+                return
             body_bytes = self._raw_body()
             if body_bytes is None:
                 return
@@ -423,8 +539,9 @@ def _make_v2_handler(svc: V2LedgerService):
             if authenticated is None:
                 return
             keyid, roster = authenticated
-            target = urlparse(self.path)
-            if target.path not in ("/settle", "/transfer", "/dispute"):
+            if target.path not in (
+                "/settle", "/transfer", "/dispute", "/wallet/bind", "/withdraw"
+            ):
                 self._send(404, {"error": "not found"})
                 return
             try:
@@ -437,11 +554,20 @@ def _make_v2_handler(svc: V2LedgerService):
                     result = svc.settle(body, keyid, roster)
                 elif target.path == "/transfer":
                     result = svc.transfer(body, keyid, roster)
-                else:
+                elif target.path == "/dispute":
                     result = svc.dispute(body, keyid, roster)
+                elif target.path == "/wallet/bind":
+                    result = svc.bind_wallet(body, keyid, roster)
+                else:
+                    result = svc.withdraw(body, keyid, roster)
                 self._send(200, result)
             except CreditLimitError as exc:
-                self._send(402, {"error": str(exc)})
+                self._send(422 if target.path == "/withdraw" else 402,
+                           {"error": str(exc)})
+            except (PayoutAddressError, WithdrawalTierError) as exc:
+                self._send(403, {"error": str(exc)})
+            except WithdrawalRateLimitError as exc:
+                self._send(429, {"error": str(exc)})
             except ReceiptStateError as exc:
                 self._send(409, {"error": str(exc)})
             except PermissionError as exc:
