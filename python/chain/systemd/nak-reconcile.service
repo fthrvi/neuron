@@ -1,0 +1,31 @@
+# Example user unit. Copying this file does not install or enable it.
+[Unit]
+Description=Nakshatra daily signed Solana credit reconciliation
+After=network-online.target nak-indexer.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=%h/.config/nakshatra/reconcile.env
+ExecStart=/usr/bin/python3 /opt/neuron/python/chain/reconcile.py --store %h/.neuron/credits/ledger.sqlite
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.neuron/credits
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallFilter=@system-service
+
+# Required in reconcile.env:
+# NAK_SOLANA_CLUSTER=devnet (localnet is accepted only for offline tests)
+# NAK_USDC_MINT=<base58 mint pubkey>
+# NAK_SOLANA_RPC=<explicit HTTPS devnet RPC URL>
+# NAK_TREASURY_USDC_ACCOUNT=<treasury vault token account>
+# Optional: NAK_SOLANA_RPC_CONFIRM=<independent HTTPS RPC URL>
+# Optional: NAK_PAYOUT_KILL_FILE=%h/.neuron/credits/payout.off
+# Optional: NAK_RECONCILE_SIGNING_KEY=%h/.nakshatra/keys/worker.ed25519
+# Optional: NAK_RECONCILE_REPORT_DIR=%h/.neuron/credits/reconcile

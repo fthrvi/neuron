@@ -1,0 +1,12 @@
+# Example user timer. It is intentionally not installed or enabled by this repo.
+[Unit]
+Description=Run Nakshatra credit reconciliation daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+Unit=nak-reconcile.service
+
+[Install]
+WantedBy=timers.target
