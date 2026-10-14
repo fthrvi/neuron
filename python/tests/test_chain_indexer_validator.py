@@ -41,8 +41,8 @@ def _run(command, env, *, timeout=30, skip_missing_token_program=False):
             or "Unsupported program id" in exc.stderr
         ):
             pytest.skip(
-                "local validator has no bundled SPL Token program; loading one would "
-                "require a network clone or an unavailable local .so"
+                "local validator has no SPL Token program (set NAK_SPL_PROGRAM_DIR to a dir "
+                f"holding spl_token.so/spl_ata.so): {exc.stderr.strip()[:600]}"
             )
         pytest.fail(
             f"command failed ({exc.returncode}): {' '.join(command)}\n"
@@ -95,7 +95,9 @@ def _wait_for_validator(rpc, process, timeout=20):
             _, stderr = process.communicate(timeout=1)
             pytest.skip(f"local validator could not start: {stderr[-1000:]}")
         try:
-            if rpc.call("getHealth", []) == "ok":
+            # Healthy is not enough: programs preloaded with --bpf-program only become
+            # invocable after the first slots ("Program is not deployed" at slot 0).
+            if rpc.call("getHealth", []) == "ok" and rpc.call("getSlot", []) >= 2:
                 return
         except RPCError:
             pass
@@ -128,9 +130,22 @@ def test_indexes_real_finalized_spl_transfer(tmp_path):
 
     port = _port_block()
     rpc_url = f"http://127.0.0.1:{port}"
+    # Solana 4.x's local validator ships without the SPL programs. NAK_SPL_PROGRAM_DIR points at
+    # spl_token.so / spl_ata.so dumped once from devnet (`solana program dump -u devnet <id> <file>`),
+    # loaded at their real program ids so spl-token works offline.
+    preload = []
+    program_dir = os.environ.get("NAK_SPL_PROGRAM_DIR", "")
+    for program_id, filename in (
+        ("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "spl_token.so"),
+        ("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", "spl_ata.so"),
+    ):
+        path = os.path.join(program_dir, filename) if program_dir else ""
+        if path and os.path.isfile(path):
+            preload += ["--bpf-program", program_id, path]
     process = subprocess.Popen(
         [
             validator,
+            *preload,
             "--ledger",
             str(tmp_path / "validator-ledger"),
             "--reset",
@@ -164,10 +179,17 @@ def test_indexes_real_finalized_spl_transfer(tmp_path):
         )
         mint = _json_value(mint_result.stdout, {"address", "mint"})
 
-        source_result = _run(
-            common + ["create-account", mint, "--owner", payer_address], env
+        # spl-token's JSON for create-account carries only the signature, so both token
+        # accounts are made from explicit keypairs whose addresses we already know.
+        source_keypair = tmp_path / "source-token.json"
+        _run(
+            [keygen, "new", "--no-bip39-passphrase", "--silent", "--force", "-o", str(source_keypair)],
+            env,
         )
-        source = _json_value(source_result.stdout, {"address", "account"})
+        _run(
+            common + ["create-account", mint, str(source_keypair), "--owner", payer_address], env
+        )
+        source = _run([solana, "address", "-k", str(source_keypair)], env).stdout.strip()
 
         deposit_keypair = tmp_path / "deposit-token.json"
         _run(
@@ -182,12 +204,12 @@ def test_indexes_real_finalized_spl_transfer(tmp_path):
             ],
             env,
         )
-        deposit_result = _run(
+        _run(
             common
             + ["create-account", mint, str(deposit_keypair), "--owner", payer_address],
             env,
         )
-        deposit = _json_value(deposit_result.stdout, {"address", "account"})
+        deposit = _run([solana, "address", "-k", str(deposit_keypair)], env).stdout.strip()
 
         _run(
             common
