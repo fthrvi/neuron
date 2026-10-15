@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +19,7 @@ from core.ledger_store import (  # noqa: E402
     CreditLimitError,
     DepositBalanceMismatch,
     DepositConflict,
+    LedgerInvariantError,
     LedgerStore,
     LedgerValueError,
     ReceiptStateError,
@@ -304,13 +306,45 @@ def test_dispute_rolls_back_if_legacy_reversal_would_break_zero_sum(tmp_path):
             ),
         )
 
-        with pytest.raises(AssertionError, match="balance invariant"):
+        with pytest.raises(LedgerInvariantError, match="balance invariant"):
             store.dispute("bad-legacy")
 
         assert store.balance("consumer") == -10
         assert store.balance("worker") == 10
         assert store.receipt_state("bad-legacy") == "legacy_unsigned"
         assert store._db.execute("SELECT COUNT(*) FROM journal").fetchone()[0] == 0
+
+
+def test_zero_sum_invariant_survives_python_optimized(tmp_path):
+    path = tmp_path / "optimized.db"
+    python_root = os.path.dirname(os.path.dirname(__file__))
+    code = f"""
+from core.ledger_store import LedgerInvariantError, LedgerStore
+store = LedgerStore({str(path)!r})
+try:
+    store._tx(lambda db: db.execute(
+        "INSERT INTO accounts(id, balance) VALUES ('imbalance', 1)"
+    ))
+except LedgerInvariantError:
+    pass
+else:
+    raise SystemExit("optimized mode skipped the zero-sum invariant")
+if store._db.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] != 0:
+    raise SystemExit("invariant failure did not roll back")
+store.close()
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        item for item in (python_root, env.get("PYTHONPATH")) if item
+    )
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 if __name__ == "__main__":

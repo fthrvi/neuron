@@ -14,6 +14,7 @@ from core.ledger_store import (  # noqa: E402
     SPEND_EXECUTION_S,
     SPEND_SETTLEMENT_GRACE_S,
     CreditLimitError,
+    LedgerError,
     LedgerStore,
     LedgerValueError,
     SpendConflict,
@@ -161,8 +162,23 @@ def test_payer_owned_entry_is_snapshotted_free_and_stays_zero(tmp_path):
 def test_authorize_is_idempotent_and_conflicting_nonce_or_session_fails(tmp_path):
     with LedgerStore(tmp_path / "ledger.db") as store:
         first = _authorize(store)
-        replay = _authorize(store)
+        replay = _authorize(
+            store,
+            payer_account="renamed-payer-account",
+            tier="trusted",
+            workers=[_worker(account="renamed-worker-account", price=99)],
+        )
         assert replay["hold_id"] == first["hold_id"]
+        assert replay["payer_account_at_authorize"] == "payer"
+        assert replay["payer_tier_at_authorize"] == "stranger"
+        assert replay["workers"][0]["worker_account_at_authorize"] == "worker"
+        assert replay["workers"][0]["price_multiplier"] == 2
+        digests = store._db.execute(
+            "SELECT request_digest, authorization_digest FROM spend_holds "
+            "WHERE hold_id=?",
+            (first["hold_id"],),
+        ).fetchone()
+        assert digests["request_digest"] != digests["authorization_digest"]
         assert store._db.execute("SELECT COUNT(*) FROM spend_holds").fetchone()[0] == 1
         with pytest.raises(SpendConflict, match="client_nonce"):
             _authorize(store, max_output_tokens=6)
@@ -264,6 +280,39 @@ def test_immature_and_unfunded_earnings_are_excluded_from_capacity(
         clock[0] += HOLD_S + 1
         assert store.eligible_spend_capacity("payer", "stranger") == 1_000_100
         assert store.eligible_spend_capacity("unfunded-payer", "stranger") == 1_000_000
+
+
+def test_legacy_imported_positive_balance_is_not_paid_hold_collateral(tmp_path):
+    snapshot = {
+        "balances": {"payer": 100, "legacy-consumer": -100},
+        "settled": {
+            "legacy-earning": {
+                "credited": {"payer": 100},
+                "requester": "legacy-consumer",
+                "debited": 100,
+            }
+        },
+    }
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        ledger_store_module.import_legacy_snapshot(snapshot, store)
+        assert store.eligible_spend_capacity("payer", "stranger") == 1_000_000
+        with pytest.raises(CreditLimitError):
+            _authorize(
+                store,
+                max_prompt_tokens=1_000_050,
+                max_output_tokens=0,
+                workers=[_worker(end=1, price=1)],
+            )
+
+        hold = _authorize(
+            store,
+            max_prompt_tokens=1_000_000,
+            max_output_tokens=0,
+            workers=[_worker(end=1, price=1)],
+        )
+        assert store.dispute("legacy-earning") is True
+        assert store.balance("payer") == -1_000_000
+        assert hold["escrow_balance"] == 1_000_000
 
 
 def test_dispute_after_authorization_cannot_touch_escrow(tmp_path, monkeypatch):
@@ -389,6 +438,193 @@ def test_release_and_two_deadline_expiry_leave_closed_accounts_empty(
         assert closed and all(int(row["balance"]) == 0 for row in closed)
         _assert_zero_sum(store)
         _assert_spend_journals_zero_sum(store)
+
+
+def test_overdue_partial_run_expires_before_late_abandon(tmp_path):
+    clock = [4_000_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        hold = _authorize(
+            store,
+            workers=[
+                _worker(key="finished", account="worker-a", end=2, price=1),
+                _worker(key="unused", account="worker-b", start=2, end=4, price=1),
+            ],
+        )
+        store.claim_spend_worker(hold["hold_id"], "finished", "instance")
+        store.settle_spend_usage(
+            hold["hold_id"], "finished", 1, 0, final=True
+        )
+        clock[0] = hold["settlement_deadline"] + 1
+
+        result = store.abandon_spend_worker(
+            hold["hold_id"], "unused", "payer-key"
+        )
+
+        assert result["state"] == "expired"
+        assert result["escrow_balance"] == 0
+        assert [entry["state"] for entry in result["workers"]] == [
+            "final",
+            "expired",
+        ]
+
+
+class _TransactionSignallingStore(LedgerStore):
+    def __init__(self, *args, **kwargs):
+        self.tx_entered = threading.Event()
+        super().__init__(*args, **kwargs)
+
+    def _tx(self, operation):
+        self.tx_entered.set()
+        return super()._tx(operation)
+
+
+def _run_after_blocked_begin(store, path, clock, advanced_now, operation):
+    blocker = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+    blocker.execute("PRAGMA busy_timeout=5000")
+    blocker.execute("BEGIN IMMEDIATE")
+    store.tx_entered.clear()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(operation)
+            assert store.tx_entered.wait(timeout=5)
+            clock[0] = advanced_now
+            blocker.execute("COMMIT")
+            return future.result(timeout=5)
+    finally:
+        if blocker.in_transaction:
+            blocker.execute("ROLLBACK")
+        blocker.close()
+
+
+def test_authorize_samples_time_after_begin_immediate(tmp_path):
+    path = tmp_path / "ledger.db"
+    clock = [5_000_000]
+    with _TransactionSignallingStore(path, clock=lambda: clock[0]) as store:
+        result = _run_after_blocked_begin(
+            store,
+            path,
+            clock,
+            5_000_123,
+            lambda: _authorize(store),
+        )
+        assert result["authorized_at"] == 5_000_123
+
+
+def test_claim_samples_time_after_begin_immediate(tmp_path):
+    path = tmp_path / "ledger.db"
+    clock = [6_000_000]
+    with _TransactionSignallingStore(path, clock=lambda: clock[0]) as store:
+        hold = _authorize(store)
+        clock[0] = hold["execution_deadline"] - 1
+        result = _run_after_blocked_begin(
+            store,
+            path,
+            clock,
+            hold["execution_deadline"] + 1,
+            lambda: store.claim_spend_worker(
+                hold["hold_id"], "worker-key", "late-instance"
+            ),
+        )
+        assert result["state"] == "cancelled"
+        assert result["workers"][0]["claim_instance"] is None
+
+
+def test_settle_samples_time_after_begin_immediate(tmp_path):
+    path = tmp_path / "ledger.db"
+    clock = [7_000_000]
+    with _TransactionSignallingStore(path, clock=lambda: clock[0]) as store:
+        hold = _authorize(store)
+        store.claim_spend_worker(hold["hold_id"], "worker-key", "instance")
+        clock[0] = hold["settlement_deadline"] - 1
+        result = _run_after_blocked_begin(
+            store,
+            path,
+            clock,
+            hold["settlement_deadline"] + 1,
+            lambda: store.settle_spend_usage(
+                hold["hold_id"], "worker-key", 1, 0, final=True
+            ),
+        )
+        assert result["state"] == "expired"
+        assert result["accepted_delta"] == 0
+        assert store.balance("worker") == 0
+
+
+def test_release_advances_overdue_hold_before_cancelling(tmp_path):
+    clock = [8_000_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        hold = _authorize(store)
+        clock[0] = hold["settlement_deadline"]
+        result = store.request_spend_release(hold["hold_id"], "payer-key")
+        assert result["state"] == "expired"
+        assert result["workers"][0]["state"] == "expired"
+
+
+@pytest.mark.parametrize("action", ("abandon", "release"))
+def test_abandon_and_release_sample_time_after_begin_immediate(tmp_path, action):
+    path = tmp_path / f"{action}.db"
+    clock = [8_500_000]
+    with _TransactionSignallingStore(path, clock=lambda: clock[0]) as store:
+        hold = _authorize(store)
+        clock[0] = hold["settlement_deadline"] - 1
+        def operation():
+            if action == "abandon":
+                return store.abandon_spend_worker(
+                    hold["hold_id"], "worker-key", "payer-key"
+                )
+            return store.request_spend_release(hold["hold_id"], "payer-key")
+
+        result = _run_after_blocked_begin(
+            store,
+            path,
+            clock,
+            hold["settlement_deadline"],
+            operation,
+        )
+        assert result["state"] == "expired"
+        assert result["workers"][0]["state"] == "expired"
+
+
+def test_expiry_samples_time_after_begin_immediate(tmp_path):
+    path = tmp_path / "ledger.db"
+    clock = [9_000_000]
+    with _TransactionSignallingStore(path, clock=lambda: clock[0]) as store:
+        hold = _authorize(store)
+        store.claim_spend_worker(hold["hold_id"], "worker-key", "instance")
+        clock[0] = hold["execution_deadline"] - 1
+        result = _run_after_blocked_begin(
+            store,
+            path,
+            clock,
+            hold["execution_deadline"],
+            store.expire_spend_holds,
+        )
+        assert result == [hold["hold_id"]]
+        assert store.spend_status(hold["hold_id"])["state"] == "closing"
+
+
+def test_migration_refuses_unbacked_reserved_spend_account(tmp_path):
+    path = tmp_path / "legacy.db"
+    db = sqlite3.connect(path)
+    db.execute(
+        "CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INTEGER NOT NULL, "
+        "tier TEXT NOT NULL DEFAULT 'stranger')"
+    )
+    db.executemany(
+        "INSERT INTO accounts(id, balance) VALUES (?, ?)",
+        (("__spend_hold__:legacy-user", 100), ("legacy-source", -100)),
+    )
+    db.commit()
+    db.close()
+
+    with pytest.raises(LedgerError, match="rename or remap this legacy account"):
+        LedgerStore(path)
+
+    with sqlite3.connect(path) as check:
+        assert dict(check.execute("SELECT id, balance FROM accounts")) == {
+            "__spend_hold__:legacy-user": 100,
+            "legacy-source": -100,
+        }
 
 
 @pytest.mark.parametrize(

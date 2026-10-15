@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
 # SQLite's INTEGER storage class is a signed 64-bit value.  Keeping the public
@@ -59,6 +59,10 @@ TIER_LIMITS: dict[str, int | None] = {
 
 class LedgerError(Exception):
     """Base class for an accounting operation that was refused."""
+
+
+class LedgerInvariantError(LedgerError):
+    """Durable ledger state violated a money-conservation invariant."""
 
 
 class LedgerValueError(LedgerError, ValueError):
@@ -182,8 +186,11 @@ class LedgerStore:
     races.  ``BEGIN IMMEDIATE`` also serializes writers using other connections.
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(
+        self, path: str | Path, *, clock: Callable[[], float] | None = None
+    ):
         self.path = Path(path)
+        self._clock = clock
         self._lock = threading.RLock()
         self._closed = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -356,6 +363,7 @@ class LedgerStore:
                     CHECK(typeof(max_cost) = 'integer'
                           AND max_cost BETWEEN 0 AND {max_units}),
                 authorization_digest TEXT NOT NULL,
+                request_digest TEXT NOT NULL,
                 token_digest TEXT UNIQUE,
                 escrow_account TEXT NOT NULL UNIQUE,
                 state TEXT NOT NULL CHECK(state IN
@@ -490,6 +498,67 @@ class LedgerStore:
             END;
             """
         )
+        collision = self._db.execute(
+            "SELECT a.id, a.balance FROM accounts AS a "
+            "LEFT JOIN spend_holds AS h ON h.escrow_account=a.id "
+            "WHERE substr(a.id, 1, ?)=? AND h.hold_id IS NULL "
+            "ORDER BY a.id LIMIT 1",
+            (len(_SPEND_HOLD_STEM), _SPEND_HOLD_STEM),
+        ).fetchone()
+        if collision is not None:
+            raise LedgerError(
+                f"reserved spend account {collision['id']!r} (balance "
+                f"{int(collision['balance'])}) is not backed by "
+                "spend_holds.escrow_account; rename or remap this legacy "
+                "account before reopening the ledger"
+            )
+
+        spend_hold_columns = {
+            str(row[1]) for row in self._db.execute("PRAGMA table_info(spend_holds)")
+        }
+        if "request_digest" not in spend_hold_columns:
+            self._db.execute("ALTER TABLE spend_holds ADD COLUMN request_digest TEXT")
+        missing_request_digests = self._db.execute(
+            "SELECT payer_keyid, client_nonce, session_id, model_id, billing_mode, "
+            "max_prompt_tokens, max_output_tokens, hold_id FROM spend_holds "
+            "WHERE request_digest IS NULL"
+        ).fetchall()
+        for hold in missing_request_digests:
+            workers = self._db.execute(
+                "SELECT worker_keyid, layer_start, layer_end "
+                "FROM spend_hold_workers WHERE hold_id=? ORDER BY entry_index",
+                (hold["hold_id"],),
+            ).fetchall()
+            request_digest = self._spend_request_digest(
+                payer_keyid=str(hold["payer_keyid"]),
+                client_nonce=str(hold["client_nonce"]),
+                session_id=str(hold["session_id"]),
+                model_id=str(hold["model_id"]),
+                billing_mode=str(hold["billing_mode"]),
+                max_prompt_tokens=int(hold["max_prompt_tokens"]),
+                max_output_tokens=int(hold["max_output_tokens"]),
+                workers=workers,
+            )
+            self._db.execute(
+                "UPDATE spend_holds SET request_digest=? WHERE hold_id=?",
+                (request_digest, hold["hold_id"]),
+            )
+        self._db.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS spend_holds_request_digest_immutable
+            BEFORE UPDATE OF request_digest ON spend_holds
+            BEGIN
+                SELECT RAISE(ABORT, 'spend hold request digest is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS spend_holds_request_digest_required
+            BEFORE INSERT ON spend_holds
+            WHEN NEW.request_digest IS NULL
+            BEGIN
+                SELECT RAISE(ABORT, 'spend hold request digest is required');
+            END;
+            """
+        )
         # S3 adds the per-chain-account provenance required for account-scoped
         # reconciliation. Existing S1 databases are upgraded in place.
         chain_ref_columns = {
@@ -536,12 +605,53 @@ class LedgerStore:
                 total = self._db.execute(
                     "SELECT COALESCE(SUM(balance), 0) FROM accounts"
                 ).fetchone()[0]
-                assert total == 0, f"ledger balance invariant violated: sum={total}"
+                if total != 0:
+                    raise LedgerInvariantError(
+                        f"ledger balance invariant violated: sum={total}"
+                    )
                 self._db.execute("COMMIT")
                 return result
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
+
+    def _now(self) -> int:
+        return int(self._clock() if self._clock is not None else time.time())
+
+    @staticmethod
+    def _spend_request_digest(
+        *,
+        payer_keyid: str,
+        client_nonce: str,
+        session_id: str,
+        model_id: str,
+        billing_mode: str,
+        max_prompt_tokens: int,
+        max_output_tokens: int,
+        workers: Iterable[Mapping[str, Any]],
+    ) -> str:
+        request = {
+            "v": 1,
+            "payer_keyid": payer_keyid,
+            "client_nonce": client_nonce,
+            "session_id": session_id,
+            "model_id": model_id,
+            "billing_mode": billing_mode,
+            "max_prompt_tokens": max_prompt_tokens,
+            "max_output_tokens": max_output_tokens,
+            "workers": [
+                {
+                    "worker_keyid": str(worker["worker_keyid"]),
+                    "layer_start": int(worker["layer_start"]),
+                    "layer_end": int(worker["layer_end"]),
+                }
+                for worker in workers
+            ],
+        }
+        canonical = json.dumps(request, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
     @staticmethod
     def _balance_in(db: sqlite3.Connection, account: str) -> int:
@@ -580,13 +690,22 @@ class LedgerStore:
     ) -> int:
         """Return earnings N1 must not treat as paid-hold collateral.
 
-        N2 replaces this deliberately narrow compatibility query with the one
-        shared economic-receipt view.  Until then, legacy funded earnings use
-        their existing journal timestamp maturity, and spend earnings use the
-        hold's terminal timestamp.  Unfunded, nonterminal, and disputed
-        earnings remain restricted.
+        N2 replaces this deliberately narrow compatibility query with the
+        shared economic-receipt view.  Its additional per-spend-earn row query
+        is provisional and must not remain once ledger history makes it
+        authorization-lock-heavy.  Until then, legacy funded earnings use
+        their existing journal timestamp maturity, spend earnings use the
+        hold's terminal timestamp, and imported positive balances remain
+        restricted until an explicit reconciliation proves their provenance.
+        Unfunded, nonterminal, and disputed earnings remain restricted.
         """
-        restricted = 0
+        restricted = int(
+            db.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM journal "
+                "WHERE account=? AND kind='legacy_import' AND amount>0",
+                (account,),
+            ).fetchone()[0]
+        )
         legacy_rows = db.execute(
             "SELECT j.ts, j.amount, j.detail, r.state FROM journal AS j "
             "JOIN receipts AS r ON r.receipt_id=j.receipt_id "
@@ -1869,6 +1988,109 @@ class LedgerStore:
         cls._assert_spend_hold_in(db, hold_id)
         return True
 
+    @classmethod
+    def _advance_spend_hold_in(
+        cls, db: sqlite3.Connection, hold_id: str, now: int
+    ) -> bool:
+        """Apply every deadline transition due at authoritative transaction time."""
+        hold = db.execute(
+            "SELECT payer_account_at_authorize, escrow_account, state, "
+            "execution_deadline, settlement_deadline FROM spend_holds "
+            "WHERE hold_id=?",
+            (hold_id,),
+        ).fetchone()
+        if hold is None:
+            raise SpendStateError(f"spend hold {hold_id!r} does not exist")
+        if hold["state"] in {"settled", "expired", "cancelled", "disputed"}:
+            return False
+
+        if now >= int(hold["settlement_deadline"]):
+            remainder = cls._balance_in(db, str(hold["escrow_account"]))
+            cls._move_spend_value(
+                db,
+                source=str(hold["escrow_account"]),
+                destination=str(hold["payer_account_at_authorize"]),
+                amount=remainder,
+                timestamp=now,
+                debit_kind="spend_release_debit",
+                credit_kind="spend_release_credit",
+                event_id=f"spend-release:{hold_id}:expired",
+                detail={"hold_id": hold_id, "reason": "settlement_deadline"},
+            )
+            db.execute(
+                "UPDATE spend_hold_workers SET state='expired', finalized_at=?, "
+                "updated_at=? WHERE hold_id=? AND state IN ('planned','claimed')",
+                (now, now, hold_id),
+            )
+            db.execute(
+                "UPDATE spend_holds SET state='expired', terminal_at=?, updated_at=? "
+                "WHERE hold_id=?",
+                (now, now, hold_id),
+            )
+            cls._assert_spend_hold_in(db, hold_id)
+            return True
+
+        if now < int(hold["execution_deadline"]):
+            return False
+
+        planned = int(
+            db.execute(
+                "SELECT COALESCE(SUM(max_cost - cumulative_cost), 0) "
+                "FROM spend_hold_workers WHERE hold_id=? AND state='planned'",
+                (hold_id,),
+            ).fetchone()[0]
+        )
+        planned_entry = db.execute(
+            "SELECT 1 FROM spend_hold_workers WHERE hold_id=? "
+            "AND state='planned' LIMIT 1",
+            (hold_id,),
+        ).fetchone()
+        if planned_entry is None and hold["state"] == "closing":
+            return False
+
+        cls._move_spend_value(
+            db,
+            source=str(hold["escrow_account"]),
+            destination=str(hold["payer_account_at_authorize"]),
+            amount=planned,
+            timestamp=now,
+            debit_kind="spend_release_debit",
+            credit_kind="spend_release_credit",
+            event_id=f"spend-release:{hold_id}:execution-expiry",
+            detail={"hold_id": hold_id, "reason": "execution_deadline"},
+        )
+        db.execute(
+            "UPDATE spend_hold_workers SET state='abandoned', finalized_at=?, "
+            "updated_at=? WHERE hold_id=? AND state='planned'",
+            (now, now, hold_id),
+        )
+        claimed = db.execute(
+            "SELECT 1 FROM spend_hold_workers WHERE hold_id=? "
+            "AND state='claimed' LIMIT 1",
+            (hold_id,),
+        ).fetchone()
+        if claimed is not None:
+            db.execute(
+                "UPDATE spend_holds SET state='closing', updated_at=? WHERE hold_id=?",
+                (now, hold_id),
+            )
+        else:
+            any_claim = db.execute(
+                "SELECT 1 FROM spend_hold_workers WHERE hold_id=? "
+                "AND claimed_at IS NOT NULL LIMIT 1",
+                (hold_id,),
+            ).fetchone()
+            if any_claim is None:
+                db.execute(
+                    "UPDATE spend_holds SET state='cancelled', terminal_at=?, "
+                    "updated_at=? WHERE hold_id=?",
+                    (now, now, hold_id),
+                )
+            else:
+                cls._finish_spend_hold_if_ready(db, hold_id, now)
+        cls._assert_spend_hold_in(db, hold_id)
+        return True
+
     def eligible_spend_capacity(self, account: str, tier: str) -> int | None:
         """Return N1 paid-hold capacity, or ``None`` for an unlimited tier.
 
@@ -1879,7 +2101,7 @@ class LedgerStore:
         if is_reserved(account):
             raise LedgerValueError("account is reserved")
         tier = _tier(tier)
-        now = int(time.time())
+        now = self._now()
         with self._lock:
             balance = self._balance_in(self._db, account)
             restricted = self._restricted_paid_earnings_in(self._db, account, now)
@@ -2018,28 +2240,39 @@ class LedgerStore:
             authorization, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         authorization_digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
-        now = int(time.time())
+        request_digest = self._spend_request_digest(
+            payer_keyid=payer_keyid,
+            client_nonce=client_nonce,
+            session_id=session_id,
+            model_id=model_id,
+            billing_mode=billing_mode,
+            max_prompt_tokens=max_prompt_tokens,
+            max_output_tokens=max_output_tokens,
+            workers=clean_workers,
+        )
         escrow_account = self._spend_hold_account(proposed_hold_id)
 
         def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            now = self._now()
             existing = db.execute(
-                "SELECT hold_id, authorization_digest FROM spend_holds "
+                "SELECT hold_id, request_digest FROM spend_holds "
                 "WHERE payer_keyid=? AND client_nonce=?",
                 (payer_keyid, client_nonce),
             ).fetchone()
             if existing is not None:
                 if (
-                    existing["authorization_digest"] != authorization_digest
+                    existing["request_digest"] != request_digest
                     or (hold_id is not None and existing["hold_id"] != hold_id)
                 ):
                     raise SpendConflict(
                         "client_nonce already authorizes a different spend plan"
                     )
+                self._advance_spend_hold_in(db, str(existing["hold_id"]), now)
                 self._assert_spend_hold_in(db, str(existing["hold_id"]))
                 return self._spend_status_in(db, str(existing["hold_id"]))
 
             session = db.execute(
-                "SELECT hold_id, authorization_digest FROM spend_holds "
+                "SELECT hold_id FROM spend_holds "
                 "WHERE payer_keyid=? AND session_id=?",
                 (payer_keyid, session_id),
             ).fetchone()
@@ -2069,9 +2302,9 @@ class LedgerStore:
                 "payer_account_at_authorize, payer_tier_at_authorize, client_nonce, "
                 "session_id, model_id, billing_mode, max_prompt_tokens, "
                 "max_output_tokens, max_token_layers, max_cost, "
-                "authorization_digest, escrow_account, state, authorized_at, "
+                "authorization_digest, request_digest, escrow_account, state, authorized_at, "
                 "execution_deadline, settlement_deadline, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
                 (
                     proposed_hold_id,
                     payer_keyid,
@@ -2086,6 +2319,7 @@ class LedgerStore:
                     total_token_layers,
                     total_cost,
                     authorization_digest,
+                    request_digest,
                     escrow_account,
                     now,
                     execution_deadline,
@@ -2147,9 +2381,10 @@ class LedgerStore:
         hold_id = _identifier(hold_id, "hold_id")
         worker_keyid = _identifier(worker_keyid, "worker_keyid")
         claim_instance = _identifier(claim_instance, "claim_instance")
-        now = int(time.time())
 
         def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            now = self._now()
+            advanced = self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
                 "SELECT state, execution_deadline FROM spend_holds WHERE hold_id=?",
                 (hold_id,),
@@ -2163,6 +2398,8 @@ class LedgerStore:
             ).fetchone()
             if entry is None:
                 raise SpendStateError("worker is not part of the spend hold")
+            if advanced and hold["state"] != "open":
+                return self._spend_status_in(db, hold_id)
             if entry["claim_instance"] is not None:
                 if entry["claim_instance"] != claim_instance:
                     raise SpendConflict("worker entry was claimed by another instance")
@@ -2213,9 +2450,10 @@ class LedgerStore:
             final_receipt_id = _identifier(final_receipt_id, "final_receipt_id")
         if not final and final_receipt_id is not None:
             raise LedgerValueError("final_receipt_id requires final=true")
-        now = int(time.time())
 
         def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            now = self._now()
+            advanced = self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
                 "SELECT payer_account_at_authorize, escrow_account, state, "
                 "settlement_deadline FROM spend_holds WHERE hold_id=?",
@@ -2229,6 +2467,10 @@ class LedgerStore:
             ).fetchone()
             if entry is None:
                 raise SpendStateError("worker is not part of the spend hold")
+            if advanced and hold["state"] == "expired":
+                result = self._spend_status_in(db, hold_id)
+                result["accepted_delta"] = 0
+                return result
             if entry["state"] == "final":
                 same = (
                     int(entry["cumulative_prompt_tokens"])
@@ -2344,9 +2586,10 @@ class LedgerStore:
         hold_id = _identifier(hold_id, "hold_id")
         worker_keyid = _identifier(worker_keyid, "worker_keyid")
         payer_keyid = _identifier(payer_keyid, "payer_keyid")
-        now = int(time.time())
 
         def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            now = self._now()
+            advanced = self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
                 "SELECT payer_keyid, payer_account_at_authorize, escrow_account, state "
                 "FROM spend_holds WHERE hold_id=?",
@@ -2363,6 +2606,13 @@ class LedgerStore:
             ).fetchone()
             if entry is None:
                 raise SpendStateError("worker is not part of the spend hold")
+            if advanced and hold["state"] in {
+                "settled",
+                "expired",
+                "cancelled",
+                "disputed",
+            }:
+                return self._spend_status_in(db, hold_id)
             if entry["state"] == "abandoned":
                 return self._spend_status_in(db, hold_id)
             if hold["state"] not in {"open", "closing"}:
@@ -2402,9 +2652,10 @@ class LedgerStore:
         """Cancel a wholly unclaimed hold, otherwise record a release request."""
         hold_id = _identifier(hold_id, "hold_id")
         payer_keyid = _identifier(payer_keyid, "payer_keyid")
-        now = int(time.time())
 
         def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            now = self._now()
+            self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
                 "SELECT payer_keyid, payer_account_at_authorize, escrow_account, state, "
                 "release_requested FROM spend_holds WHERE hold_id=?",
@@ -2464,12 +2715,10 @@ class LedgerStore:
 
     def expire_spend_holds(self) -> list[str]:
         """Advance every due hold and return the affected hold ids."""
-        now = int(time.time())
-
         def operation(db: sqlite3.Connection) -> list[str]:
+            now = self._now()
             rows = db.execute(
-                "SELECT hold_id, payer_account_at_authorize, escrow_account, state, "
-                "execution_deadline, settlement_deadline FROM spend_holds "
+                "SELECT hold_id FROM spend_holds "
                 "WHERE state IN ('open','closing') "
                 "AND execution_deadline<=? ORDER BY authorized_at, hold_id",
                 (now,),
@@ -2477,84 +2726,8 @@ class LedgerStore:
             affected: list[str] = []
             for hold in rows:
                 hold_id = str(hold["hold_id"])
-                if now >= int(hold["settlement_deadline"]):
-                    remainder = self._balance_in(db, str(hold["escrow_account"]))
-                    self._move_spend_value(
-                        db,
-                        source=str(hold["escrow_account"]),
-                        destination=str(hold["payer_account_at_authorize"]),
-                        amount=remainder,
-                        timestamp=now,
-                        debit_kind="spend_release_debit",
-                        credit_kind="spend_release_credit",
-                        event_id=f"spend-release:{hold_id}:expired",
-                        detail={"hold_id": hold_id, "reason": "settlement_deadline"},
-                    )
-                    db.execute(
-                        "UPDATE spend_hold_workers SET state='expired', finalized_at=?, "
-                        "updated_at=? WHERE hold_id=? AND state IN ('planned','claimed')",
-                        (now, now, hold_id),
-                    )
-                    db.execute(
-                        "UPDATE spend_holds SET state='expired', terminal_at=?, "
-                        "updated_at=? WHERE hold_id=?",
-                        (now, now, hold_id),
-                    )
-                    self._assert_spend_hold_in(db, hold_id)
+                if self._advance_spend_hold_in(db, hold_id, now):
                     affected.append(hold_id)
-                    continue
-
-                planned = db.execute(
-                    "SELECT COALESCE(SUM(max_cost - cumulative_cost), 0) "
-                    "FROM spend_hold_workers WHERE hold_id=? AND state='planned'",
-                    (hold_id,),
-                ).fetchone()[0]
-                release = int(planned)
-                self._move_spend_value(
-                    db,
-                    source=str(hold["escrow_account"]),
-                    destination=str(hold["payer_account_at_authorize"]),
-                    amount=release,
-                    timestamp=now,
-                    debit_kind="spend_release_debit",
-                    credit_kind="spend_release_credit",
-                    event_id=f"spend-release:{hold_id}:execution-expiry",
-                    detail={"hold_id": hold_id, "reason": "execution_deadline"},
-                )
-                db.execute(
-                    "UPDATE spend_hold_workers SET state='abandoned', finalized_at=?, "
-                    "updated_at=? WHERE hold_id=? AND state='planned'",
-                    (now, now, hold_id),
-                )
-                claimed = db.execute(
-                    "SELECT 1 FROM spend_hold_workers WHERE hold_id=? "
-                    "AND state='claimed' LIMIT 1",
-                    (hold_id,),
-                ).fetchone()
-                if claimed is None:
-                    # All entries were unused or already final. A wholly unused
-                    # hold is a cancellation, while completed work settles.
-                    any_claim = db.execute(
-                        "SELECT 1 FROM spend_hold_workers WHERE hold_id=? "
-                        "AND claimed_at IS NOT NULL LIMIT 1",
-                        (hold_id,),
-                    ).fetchone()
-                    if any_claim is None:
-                        db.execute(
-                            "UPDATE spend_holds SET state='cancelled', terminal_at=?, "
-                            "updated_at=? WHERE hold_id=?",
-                            (now, now, hold_id),
-                        )
-                    else:
-                        self._finish_spend_hold_if_ready(db, hold_id, now)
-                else:
-                    db.execute(
-                        "UPDATE spend_holds SET state='closing', updated_at=? "
-                        "WHERE hold_id=?",
-                        (now, hold_id),
-                    )
-                self._assert_spend_hold_in(db, hold_id)
-                affected.append(hold_id)
             return affected
 
         return self._tx(operation)
@@ -2808,6 +2981,7 @@ __all__ = [
     "TIER_LIMITS",
     "is_reserved",
     "LedgerError",
+    "LedgerInvariantError",
     "LedgerValueError",
     "CreditLimitError",
     "ReceiptStateError",
