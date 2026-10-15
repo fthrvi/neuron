@@ -9,6 +9,10 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import core.ledger_store as ledger_store_module  # noqa: E402
+from chain.spend_preflight import (  # noqa: E402
+    find_spend_namespace_collisions,
+    main as spend_preflight_main,
+)
 from core.ledger_store import (  # noqa: E402
     HOLD_S,
     SPEND_EXECUTION_S,
@@ -18,6 +22,7 @@ from core.ledger_store import (  # noqa: E402
     LedgerStore,
     LedgerValueError,
     SpendConflict,
+    SpendExpired,
     is_reserved,
 )
 
@@ -173,6 +178,19 @@ def test_authorize_is_idempotent_and_conflicting_nonce_or_session_fails(tmp_path
         assert replay["payer_tier_at_authorize"] == "stranger"
         assert replay["workers"][0]["worker_account_at_authorize"] == "worker"
         assert replay["workers"][0]["price_multiplier"] == 2
+        replay_after_unusable_price = _authorize(
+            store,
+            payer_account="__spend_hold__:invalid-derived-payer",
+            tier=object(),
+            workers=[
+                _worker(
+                    account="__spend_hold__:invalid-derived-worker",
+                    price=ledger_store_module.MAX_UNITS,
+                )
+            ],
+        )
+        assert replay_after_unusable_price["hold_id"] == first["hold_id"]
+        assert replay_after_unusable_price["workers"][0]["price_multiplier"] == 2
         digests = store._db.execute(
             "SELECT request_digest, authorization_digest FROM spend_holds "
             "WHERE hold_id=?",
@@ -456,16 +474,50 @@ def test_overdue_partial_run_expires_before_late_abandon(tmp_path):
         )
         clock[0] = hold["settlement_deadline"] + 1
 
-        result = store.abandon_spend_worker(
-            hold["hold_id"], "unused", "payer-key"
-        )
+        with pytest.raises(SpendExpired, match="deadline has expired"):
+            store.abandon_spend_worker(hold["hold_id"], "unused", "payer-key")
 
+        result = store.spend_status(hold["hold_id"])
         assert result["state"] == "expired"
         assert result["escrow_balance"] == 0
         assert [entry["state"] for entry in result["workers"]] == [
             "final",
             "expired",
         ]
+
+
+@pytest.mark.parametrize("action", ("claim", "settle", "abandon"))
+def test_late_lifecycle_request_and_retry_raise_same_expiry_error(tmp_path, action):
+    clock = [4_500_000]
+    with LedgerStore(tmp_path / f"{action}.db", clock=lambda: clock[0]) as store:
+        hold = _authorize(store)
+        if action == "settle":
+            store.claim_spend_worker(hold["hold_id"], "worker-key", "instance")
+        clock[0] = hold["settlement_deadline"]
+
+        if action == "claim":
+            operation = lambda: store.claim_spend_worker(
+                hold["hold_id"], "worker-key", "late-instance"
+            )
+        elif action == "settle":
+            operation = lambda: store.settle_spend_usage(
+                hold["hold_id"], "worker-key", 1, 0, final=True
+            )
+        else:
+            operation = lambda: store.abandon_spend_worker(
+                hold["hold_id"], "worker-key", "payer-key"
+            )
+
+        errors = []
+        for _ in range(2):
+            with pytest.raises(SpendExpired) as raised:
+                operation()
+            errors.append((type(raised.value), raised.value.args))
+        assert errors[0] == errors[1] == (
+            SpendExpired,
+            ("spend hold deadline has expired",),
+        )
+        assert store.spend_status(hold["hold_id"])["state"] == "expired"
 
 
 class _TransactionSignallingStore(LedgerStore):
@@ -516,15 +568,17 @@ def test_claim_samples_time_after_begin_immediate(tmp_path):
     with _TransactionSignallingStore(path, clock=lambda: clock[0]) as store:
         hold = _authorize(store)
         clock[0] = hold["execution_deadline"] - 1
-        result = _run_after_blocked_begin(
-            store,
-            path,
-            clock,
-            hold["execution_deadline"] + 1,
-            lambda: store.claim_spend_worker(
-                hold["hold_id"], "worker-key", "late-instance"
-            ),
-        )
+        with pytest.raises(SpendExpired, match="deadline has expired"):
+            _run_after_blocked_begin(
+                store,
+                path,
+                clock,
+                hold["execution_deadline"] + 1,
+                lambda: store.claim_spend_worker(
+                    hold["hold_id"], "worker-key", "late-instance"
+                ),
+            )
+        result = store.spend_status(hold["hold_id"])
         assert result["state"] == "cancelled"
         assert result["workers"][0]["claim_instance"] is None
 
@@ -536,17 +590,17 @@ def test_settle_samples_time_after_begin_immediate(tmp_path):
         hold = _authorize(store)
         store.claim_spend_worker(hold["hold_id"], "worker-key", "instance")
         clock[0] = hold["settlement_deadline"] - 1
-        result = _run_after_blocked_begin(
-            store,
-            path,
-            clock,
-            hold["settlement_deadline"] + 1,
-            lambda: store.settle_spend_usage(
-                hold["hold_id"], "worker-key", 1, 0, final=True
-            ),
-        )
-        assert result["state"] == "expired"
-        assert result["accepted_delta"] == 0
+        with pytest.raises(SpendExpired, match="deadline has expired"):
+            _run_after_blocked_begin(
+                store,
+                path,
+                clock,
+                hold["settlement_deadline"] + 1,
+                lambda: store.settle_spend_usage(
+                    hold["hold_id"], "worker-key", 1, 0, final=True
+                ),
+            )
+        assert store.spend_status(hold["hold_id"])["state"] == "expired"
         assert store.balance("worker") == 0
 
 
@@ -574,13 +628,24 @@ def test_abandon_and_release_sample_time_after_begin_immediate(tmp_path, action)
                 )
             return store.request_spend_release(hold["hold_id"], "payer-key")
 
-        result = _run_after_blocked_begin(
-            store,
-            path,
-            clock,
-            hold["settlement_deadline"],
-            operation,
-        )
+        if action == "abandon":
+            with pytest.raises(SpendExpired, match="deadline has expired"):
+                _run_after_blocked_begin(
+                    store,
+                    path,
+                    clock,
+                    hold["settlement_deadline"],
+                    operation,
+                )
+            result = store.spend_status(hold["hold_id"])
+        else:
+            result = _run_after_blocked_begin(
+                store,
+                path,
+                clock,
+                hold["settlement_deadline"],
+                operation,
+            )
         assert result["state"] == "expired"
         assert result["workers"][0]["state"] == "expired"
 
@@ -601,6 +666,165 @@ def test_expiry_samples_time_after_begin_immediate(tmp_path):
         )
         assert result == [hold["hold_id"]]
         assert store.spend_status(hold["hold_id"])["state"] == "closing"
+
+
+def _seed_due_zero_cost_holds(store, count, now):
+    def seed(db):
+        hold_rows = []
+        worker_rows = []
+        for index in range(count):
+            hold_id = f"backlog-{index:05d}"
+            hold_rows.append(
+                (
+                    hold_id,
+                    "payer-key",
+                    "payer",
+                    "self",
+                    f"nonce-{index}",
+                    f"session-{index}",
+                    "model",
+                    "greedy-direct-v1",
+                    1,
+                    0,
+                    1,
+                    0,
+                    f"authorization-{index}",
+                    f"request-{index}",
+                    f"__spend_hold__:{hold_id}",
+                    now - 2,
+                    now - 1,
+                    now + 100,
+                    now - 2,
+                )
+            )
+            worker_rows.append(
+                (hold_id, "worker-key", "payer", now - 2)
+            )
+        db.executemany(
+            "INSERT INTO spend_holds(hold_id, payer_keyid, "
+            "payer_account_at_authorize, payer_tier_at_authorize, client_nonce, "
+            "session_id, model_id, billing_mode, max_prompt_tokens, "
+            "max_output_tokens, max_token_layers, max_cost, "
+            "authorization_digest, request_digest, escrow_account, state, "
+            "authorized_at, execution_deadline, settlement_deadline, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', "
+            "?, ?, ?, ?)",
+            hold_rows,
+        )
+        db.executemany(
+            "INSERT INTO spend_hold_workers(hold_id, entry_index, worker_keyid, "
+            "worker_account_at_authorize, billable, layer_start, layer_end, "
+            "layers, price_multiplier, max_prompt_tokens, max_output_tokens, "
+            "max_token_layers, max_cost, state, updated_at) "
+            "VALUES (?, 0, ?, ?, 0, 0, 1, 1, 1, 1, 0, 1, 0, 'planned', ?)",
+            worker_rows,
+        )
+
+    store._tx(seed)
+
+
+def test_expiry_batch_is_bounded_ordered_and_exposes_remaining_work(tmp_path):
+    clock = [10_000_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        _seed_due_zero_cost_holds(store, 5, clock[0])
+        first = store.expire_spend_holds_batch(batch_size=2)
+        second = store.expire_spend_holds_batch(batch_size=2)
+        third = store.expire_spend_holds_batch(batch_size=2)
+
+        assert first.affected == ("backlog-00000", "backlog-00001")
+        assert first.remaining is True
+        assert second.affected == ("backlog-00002", "backlog-00003")
+        assert second.remaining is True
+        assert third.affected == ("backlog-00004",)
+        assert third.remaining is False
+
+
+class _SweepSignallingStore(LedgerStore):
+    def __init__(self, *args, **kwargs):
+        self.first_batch_committed = threading.Event()
+        self.concurrent_writer_done = threading.Event()
+        self.batch_lengths = []
+        super().__init__(*args, **kwargs)
+
+    def expire_spend_holds_batch(self, batch_size=200):
+        batch = super().expire_spend_holds_batch(batch_size)
+        self.batch_lengths.append(len(batch.affected))
+        if not self.first_batch_committed.is_set():
+            self.first_batch_committed.set()
+            assert self.concurrent_writer_done.wait(timeout=5)
+        return batch
+
+
+def test_backlog_sweep_allows_short_timeout_concurrent_writer(tmp_path):
+    path = tmp_path / "ledger.db"
+    clock = [11_000_000]
+    with _SweepSignallingStore(path, clock=lambda: clock[0]) as store:
+        _seed_due_zero_cost_holds(store, 5_000, clock[0])
+        store._tx(
+            lambda db: db.executemany(
+                "INSERT INTO accounts(id, balance) VALUES (?, ?)",
+                (("writer-credit", 1), ("writer-debit", -1)),
+            )
+        )
+
+        def write_during_sweep():
+            assert store.first_batch_committed.wait(timeout=5)
+            writer = sqlite3.connect(path, timeout=0.05, isolation_level=None)
+            writer.execute("PRAGMA busy_timeout=50")
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute(
+                    "UPDATE accounts SET balance=0 "
+                    "WHERE id IN ('writer-credit','writer-debit')"
+                )
+                writer.execute("COMMIT")
+                return "committed"
+            finally:
+                if writer.in_transaction:
+                    writer.execute("ROLLBACK")
+                writer.close()
+                store.concurrent_writer_done.set()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            sweep = pool.submit(store.expire_spend_holds)
+            writer = pool.submit(write_during_sweep)
+            assert writer.result(timeout=10) == "committed"
+            affected = sweep.result(timeout=20)
+
+        assert len(affected) == 5_000
+        assert len(store.batch_lengths) == 25
+        assert max(store.batch_lengths) <= 200
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM spend_holds WHERE state='cancelled'"
+        ).fetchone()[0] == 5_000
+
+
+def test_reserved_namespace_preflight_is_read_only_and_reports_collisions(
+    tmp_path, capsys
+):
+    path = tmp_path / "legacy.db"
+    db = sqlite3.connect(path)
+    db.execute(
+        "CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INTEGER NOT NULL)"
+    )
+    db.executemany(
+        "INSERT INTO accounts(id, balance) VALUES (?, ?)",
+        (("__spend_hold__:legacy", 0), ("ordinary", 0)),
+    )
+    db.commit()
+    db.close()
+    before = (path.read_bytes(), path.stat().st_mtime_ns, tuple(tmp_path.iterdir()))
+
+    collisions = find_spend_namespace_collisions(path)
+    assert [(row.account, row.balance) for row in collisions] == [
+        ("__spend_hold__:legacy", 0)
+    ]
+    assert spend_preflight_main([str(path), "--json"]) == 1
+    output = capsys.readouterr().out
+    assert '"collision_count": 1' in output
+    assert '"account": "__spend_hold__:legacy"' in output
+    after = (path.read_bytes(), path.stat().st_mtime_ns, tuple(tmp_path.iterdir()))
+    assert after == before
 
 
 def test_migration_refuses_unbacked_reserved_spend_account(tmp_path):

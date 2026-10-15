@@ -37,6 +37,25 @@ budgets with `NAK_RECONCILE_SNAPSHOT_ATTEMPTS`, `NAK_RECONCILE_RETRY_DELAY_S`, a
 `NAK_RECONCILE_INCONCLUSIVE_KILL_RUNS`. `NAK_SOLANA_RPC_CONFIRM` enables an independent
 second read for account, status, and transaction agreement.
 
+## Spend-ledger namespace preflight
+
+Before deploying the spend escrow schema against an existing ledger, run the read-only
+namespace check. It opens the supplied database with SQLite `mode=ro` and does not run
+ledger initialization or migrations:
+
+```bash
+python3 python/chain/spend_preflight.py /path/to/ledger.sqlite
+```
+
+Exit status `0` means clear, `1` means one or more collisions were found, and `2` means
+the database could not be checked. Add `--json` for automation. A collision is an account
+whose name begins with the reserved `__spend_hold__` stem but is not backed by a spend
+hold escrow row. Do not deploy until every collision is remediated. The colliding account
+must first have a zero balance; then rename it outside the reserved namespace or remove
+the zero-balance account row through the normal audited ledger-maintenance procedure.
+Merely transferring its balance to zero is insufficient because the account row itself
+still blocks schema startup.
+
 Verification must use a hub public key pinned independently of the report. The report's
 embedded `keyid` is informational and is never a trust root. Store the expected raw
 32-byte Ed25519 public key as 64 lowercase hex characters in a root/operator-managed

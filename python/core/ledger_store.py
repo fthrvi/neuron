@@ -17,6 +17,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -46,6 +47,7 @@ _SPEND_HOLD_PREFIX = f"{_SPEND_HOLD_STEM}:"
 
 SPEND_EXECUTION_S = 15 * 60
 SPEND_SETTLEMENT_GRACE_S = 24 * 60 * 60
+SPEND_EXPIRY_BATCH_SIZE = 200
 
 # These limits mirror nakshatra/scripts/creditlimit.py.  Unknown tiers are
 # intentionally treated as strangers (the tightest policy).
@@ -114,6 +116,18 @@ class SpendConflict(LedgerError):
 
 class SpendStateError(ReceiptStateError):
     """A spend hold or worker entry cannot make the requested transition."""
+
+
+class SpendExpired(SpendStateError):
+    """A spend lifecycle request arrived after its applicable deadline."""
+
+
+@dataclass(frozen=True)
+class SpendExpiryBatch:
+    """One committed expiry batch and whether another batch was due."""
+
+    affected: tuple[str, ...]
+    remaining: bool
 
 
 def is_reserved(account: object) -> bool:
@@ -2091,6 +2105,43 @@ class LedgerStore:
         cls._assert_spend_hold_in(db, hold_id)
         return True
 
+    @staticmethod
+    def _spend_lifecycle_expired_in(
+        db: sqlite3.Connection, hold_id: str, worker_keyid: str
+    ) -> bool:
+        """Return whether a worker operation was rejected by a hold deadline."""
+        hold = db.execute(
+            "SELECT state, execution_deadline, terminal_at, release_requested "
+            "FROM spend_holds WHERE hold_id=?",
+            (hold_id,),
+        ).fetchone()
+        if hold is None:
+            raise SpendStateError(f"spend hold {hold_id!r} does not exist")
+        if hold["state"] == "expired":
+            return True
+        worker = db.execute(
+            "SELECT state, finalized_at FROM spend_hold_workers "
+            "WHERE hold_id=? AND worker_keyid=?",
+            (hold_id, worker_keyid),
+        ).fetchone()
+        if worker is None:
+            raise SpendStateError("worker is not part of the spend hold")
+        if worker["state"] == "expired":
+            return True
+        finalized_at = worker["finalized_at"]
+        if (
+            worker["state"] == "abandoned"
+            and finalized_at is not None
+            and int(finalized_at) >= int(hold["execution_deadline"])
+        ):
+            return True
+        return (
+            hold["state"] == "cancelled"
+            and not bool(hold["release_requested"])
+            and hold["terminal_at"] is not None
+            and int(hold["terminal_at"]) >= int(hold["execution_deadline"])
+        )
+
     def eligible_spend_capacity(self, account: str, tier: str) -> int | None:
         """Return N1 paid-hold capacity, or ``None`` for an unlimited tier.
 
@@ -2101,8 +2152,8 @@ class LedgerStore:
         if is_reserved(account):
             raise LedgerValueError("account is reserved")
         tier = _tier(tier)
-        now = self._now()
         with self._lock:
+            now = self._now()
             balance = self._balance_in(self._db, account)
             restricted = self._restricted_paid_earnings_in(self._db, account, now)
         limit = TIER_LIMITS[tier]
@@ -2131,11 +2182,10 @@ class LedgerStore:
         no HTTP route and no token claim surface; N3 will bind this primitive
         to its opaque authorization token.
         """
+        # Parse only fields covered by the authenticated wire request before
+        # looking up its idempotency key.  Roster accounts, tiers, billability,
+        # and prices are derived snapshots and must not invalidate a replay.
         payer_keyid = _identifier(payer_keyid, "payer_keyid")
-        payer_account = _identifier(payer_account, "payer_account")
-        if is_reserved(payer_account):
-            raise LedgerValueError("payer_account is reserved")
-        tier = _tier(tier)
         client_nonce = _identifier(client_nonce, "client_nonce")
         session_id = _identifier(session_id, "session_id")
         model_id = _identifier(model_id, "model_id")
@@ -2161,11 +2211,8 @@ class LedgerStore:
         if not raw_workers:
             raise LedgerValueError("workers must not be empty")
 
-        clean_workers: list[dict[str, Any]] = []
+        wire_workers: list[dict[str, Any]] = []
         seen_workers: set[str] = set()
-        total_token_layers = 0
-        total_cost = 0
-        token_cap = max_prompt_tokens + max_output_tokens
         for index, raw in enumerate(raw_workers):
             if not isinstance(raw, Mapping):
                 raise LedgerValueError(f"worker {index} must be a mapping")
@@ -2173,73 +2220,18 @@ class LedgerStore:
             if worker_keyid in seen_workers:
                 raise LedgerValueError(f"duplicate worker_keyid {worker_keyid!r}")
             seen_workers.add(worker_keyid)
-            worker_account = raw.get(
-                "worker_account_at_authorize", raw.get("worker_account")
-            )
-            worker_account = _identifier(worker_account, "worker_account")
-            if is_reserved(worker_account):
-                raise LedgerValueError("worker_account is reserved")
             layer_start = _nonnegative_integer(raw.get("layer_start"), "layer_start")
             layer_end = _nonnegative_integer(raw.get("layer_end"), "layer_end")
             if layer_end <= layer_start:
                 raise LedgerValueError("layer_end must be greater than layer_start")
-            layers = layer_end - layer_start
-            price_multiplier = _amount(
-                raw.get("price_multiplier"), "price_multiplier"
-            )
-            max_token_layers = _bounded_product(
-                token_cap, layers, name="worker max_token_layers"
-            )
-            billable = worker_account != payer_account
-            if "billable" in raw and raw["billable"] is not billable:
-                raise LedgerValueError(
-                    "billable must match the payer/worker account snapshot policy"
-                )
-            max_cost = (
-                _bounded_product(
-                    max_token_layers,
-                    price_multiplier,
-                    name="worker max_cost",
-                )
-                if billable
-                else 0
-            )
-            total_token_layers += max_token_layers
-            total_cost += max_cost
-            if total_token_layers > MAX_UNITS or total_cost > MAX_UNITS:
-                raise LedgerValueError("aggregate spend cap exceeds ledger bounds")
-            clean_workers.append(
+            wire_workers.append(
                 {
                     "entry_index": index,
                     "worker_keyid": worker_keyid,
-                    "worker_account_at_authorize": worker_account,
-                    "billable": billable,
                     "layer_start": layer_start,
                     "layer_end": layer_end,
-                    "layers": layers,
-                    "price_multiplier": price_multiplier,
-                    "max_token_layers": max_token_layers,
-                    "max_cost": max_cost,
                 }
             )
-
-        authorization = {
-            "v": 1,
-            "payer_keyid": payer_keyid,
-            "payer_account_at_authorize": payer_account,
-            "payer_tier_at_authorize": tier,
-            "client_nonce": client_nonce,
-            "session_id": session_id,
-            "model_id": model_id,
-            "billing_mode": billing_mode,
-            "max_prompt_tokens": max_prompt_tokens,
-            "max_output_tokens": max_output_tokens,
-            "workers": clean_workers,
-        }
-        canonical = json.dumps(
-            authorization, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        authorization_digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
         request_digest = self._spend_request_digest(
             payer_keyid=payer_keyid,
             client_nonce=client_nonce,
@@ -2248,12 +2240,11 @@ class LedgerStore:
             billing_mode=billing_mode,
             max_prompt_tokens=max_prompt_tokens,
             max_output_tokens=max_output_tokens,
-            workers=clean_workers,
+            workers=wire_workers,
         )
         escrow_account = self._spend_hold_account(proposed_hold_id)
 
         def operation(db: sqlite3.Connection) -> dict[str, Any]:
-            now = self._now()
             existing = db.execute(
                 "SELECT hold_id, request_digest FROM spend_holds "
                 "WHERE payer_keyid=? AND client_nonce=?",
@@ -2267,6 +2258,7 @@ class LedgerStore:
                     raise SpendConflict(
                         "client_nonce already authorizes a different spend plan"
                     )
+                now = self._now()
                 self._advance_spend_hold_in(db, str(existing["hold_id"]), now)
                 self._assert_spend_hold_in(db, str(existing["hold_id"]))
                 return self._spend_status_in(db, str(existing["hold_id"]))
@@ -2283,15 +2275,90 @@ class LedgerStore:
             ).fetchone():
                 raise SpendConflict("hold_id already exists")
 
-            balance = self._balance_in(db, payer_account)
-            restricted = self._restricted_paid_earnings_in(db, payer_account, now)
-            limit = TIER_LIMITS[tier]
+            resolved_payer_account = _identifier(payer_account, "payer_account")
+            if is_reserved(resolved_payer_account):
+                raise LedgerValueError("payer_account is reserved")
+            resolved_tier = _tier(tier)
+            clean_workers: list[dict[str, Any]] = []
+            total_token_layers = 0
+            total_cost = 0
+            token_cap = max_prompt_tokens + max_output_tokens
+            for raw, wire in zip(raw_workers, wire_workers):
+                worker_account = raw.get(
+                    "worker_account_at_authorize", raw.get("worker_account")
+                )
+                worker_account = _identifier(worker_account, "worker_account")
+                if is_reserved(worker_account):
+                    raise LedgerValueError("worker_account is reserved")
+                layers = wire["layer_end"] - wire["layer_start"]
+                price_multiplier = _amount(
+                    raw.get("price_multiplier"), "price_multiplier"
+                )
+                max_token_layers = _bounded_product(
+                    token_cap, layers, name="worker max_token_layers"
+                )
+                billable = worker_account != resolved_payer_account
+                if "billable" in raw and raw["billable"] is not billable:
+                    raise LedgerValueError(
+                        "billable must match the payer/worker account snapshot policy"
+                    )
+                max_cost = (
+                    _bounded_product(
+                        max_token_layers,
+                        price_multiplier,
+                        name="worker max_cost",
+                    )
+                    if billable
+                    else 0
+                )
+                total_token_layers += max_token_layers
+                total_cost += max_cost
+                if total_token_layers > MAX_UNITS or total_cost > MAX_UNITS:
+                    raise LedgerValueError("aggregate spend cap exceeds ledger bounds")
+                clean_workers.append(
+                    {
+                        **wire,
+                        "worker_account_at_authorize": worker_account,
+                        "billable": billable,
+                        "layers": layers,
+                        "price_multiplier": price_multiplier,
+                        "max_token_layers": max_token_layers,
+                        "max_cost": max_cost,
+                    }
+                )
+
+            authorization = {
+                "v": 1,
+                "payer_keyid": payer_keyid,
+                "payer_account_at_authorize": resolved_payer_account,
+                "payer_tier_at_authorize": resolved_tier,
+                "client_nonce": client_nonce,
+                "session_id": session_id,
+                "model_id": model_id,
+                "billing_mode": billing_mode,
+                "max_prompt_tokens": max_prompt_tokens,
+                "max_output_tokens": max_output_tokens,
+                "workers": clean_workers,
+            }
+            canonical = json.dumps(
+                authorization, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            authorization_digest = (
+                "sha256:" + hashlib.sha256(canonical).hexdigest()
+            )
+            now = self._now()
+
+            balance = self._balance_in(db, resolved_payer_account)
+            restricted = self._restricted_paid_earnings_in(
+                db, resolved_payer_account, now
+            )
+            limit = TIER_LIMITS[resolved_tier]
             if limit is not None and total_cost > balance - restricted + limit:
                 raise CreditLimitError(
                     f"authorization exceeds eligible capacity "
                     f"{max(0, balance - restricted + limit)}: {total_cost}"
                 )
-            self._checked_balance(balance - total_cost, payer_account)
+            self._checked_balance(balance - total_cost, resolved_payer_account)
             self._checked_balance(
                 self._balance_in(db, escrow_account) + total_cost, escrow_account
             )
@@ -2308,8 +2375,8 @@ class LedgerStore:
                 (
                     proposed_hold_id,
                     payer_keyid,
-                    payer_account,
-                    tier,
+                    resolved_payer_account,
+                    resolved_tier,
                     client_nonce,
                     session_id,
                     model_id,
@@ -2352,11 +2419,11 @@ class LedgerStore:
                         now,
                     ),
                 )
-            self._ensure_account(db, payer_account, tier)
+            self._ensure_account(db, resolved_payer_account, resolved_tier)
             self._ensure_account(db, escrow_account, "self")
             self._move_spend_value(
                 db,
-                source=payer_account,
+                source=resolved_payer_account,
                 destination=escrow_account,
                 amount=total_cost,
                 timestamp=now,
@@ -2365,7 +2432,10 @@ class LedgerStore:
                 event_id=f"spend-authorize:{proposed_hold_id}",
                 detail={"hold_id": proposed_hold_id},
             )
-            db.execute("UPDATE accounts SET tier=? WHERE id=?", (tier, payer_account))
+            db.execute(
+                "UPDATE accounts SET tier=? WHERE id=?",
+                (resolved_tier, resolved_payer_account),
+            )
             db.execute(
                 "UPDATE accounts SET tier='self' WHERE id=?", (escrow_account,)
             )
@@ -2382,9 +2452,9 @@ class LedgerStore:
         worker_keyid = _identifier(worker_keyid, "worker_keyid")
         claim_instance = _identifier(claim_instance, "claim_instance")
 
-        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+        def operation(db: sqlite3.Connection) -> dict[str, Any] | SpendExpired:
             now = self._now()
-            advanced = self._advance_spend_hold_in(db, hold_id, now)
+            self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
                 "SELECT state, execution_deadline FROM spend_holds WHERE hold_id=?",
                 (hold_id,),
@@ -2398,8 +2468,8 @@ class LedgerStore:
             ).fetchone()
             if entry is None:
                 raise SpendStateError("worker is not part of the spend hold")
-            if advanced and hold["state"] != "open":
-                return self._spend_status_in(db, hold_id)
+            if self._spend_lifecycle_expired_in(db, hold_id, worker_keyid):
+                return SpendExpired("spend hold deadline has expired")
             if entry["claim_instance"] is not None:
                 if entry["claim_instance"] != claim_instance:
                     raise SpendConflict("worker entry was claimed by another instance")
@@ -2418,7 +2488,10 @@ class LedgerStore:
             self._assert_spend_hold_in(db, hold_id)
             return self._spend_status_in(db, hold_id)
 
-        return self._tx(operation)
+        result = self._tx(operation)
+        if isinstance(result, SpendExpired):
+            raise result
+        return result
 
     def settle_spend_usage(
         self,
@@ -2451,9 +2524,9 @@ class LedgerStore:
         if not final and final_receipt_id is not None:
             raise LedgerValueError("final_receipt_id requires final=true")
 
-        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+        def operation(db: sqlite3.Connection) -> dict[str, Any] | SpendExpired:
             now = self._now()
-            advanced = self._advance_spend_hold_in(db, hold_id, now)
+            self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
                 "SELECT payer_account_at_authorize, escrow_account, state, "
                 "settlement_deadline FROM spend_holds WHERE hold_id=?",
@@ -2467,10 +2540,8 @@ class LedgerStore:
             ).fetchone()
             if entry is None:
                 raise SpendStateError("worker is not part of the spend hold")
-            if advanced and hold["state"] == "expired":
-                result = self._spend_status_in(db, hold_id)
-                result["accepted_delta"] = 0
-                return result
+            if self._spend_lifecycle_expired_in(db, hold_id, worker_keyid):
+                return SpendExpired("spend hold deadline has expired")
             if entry["state"] == "final":
                 same = (
                     int(entry["cumulative_prompt_tokens"])
@@ -2577,7 +2648,10 @@ class LedgerStore:
             result["accepted_delta"] = delta
             return result
 
-        return self._tx(operation)
+        result = self._tx(operation)
+        if isinstance(result, SpendExpired):
+            raise result
+        return result
 
     def abandon_spend_worker(
         self, hold_id: str, worker_keyid: str, payer_keyid: str
@@ -2587,9 +2661,9 @@ class LedgerStore:
         worker_keyid = _identifier(worker_keyid, "worker_keyid")
         payer_keyid = _identifier(payer_keyid, "payer_keyid")
 
-        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+        def operation(db: sqlite3.Connection) -> dict[str, Any] | SpendExpired:
             now = self._now()
-            advanced = self._advance_spend_hold_in(db, hold_id, now)
+            self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
                 "SELECT payer_keyid, payer_account_at_authorize, escrow_account, state "
                 "FROM spend_holds WHERE hold_id=?",
@@ -2606,13 +2680,8 @@ class LedgerStore:
             ).fetchone()
             if entry is None:
                 raise SpendStateError("worker is not part of the spend hold")
-            if advanced and hold["state"] in {
-                "settled",
-                "expired",
-                "cancelled",
-                "disputed",
-            }:
-                return self._spend_status_in(db, hold_id)
+            if self._spend_lifecycle_expired_in(db, hold_id, worker_keyid):
+                return SpendExpired("spend hold deadline has expired")
             if entry["state"] == "abandoned":
                 return self._spend_status_in(db, hold_id)
             if hold["state"] not in {"open", "closing"}:
@@ -2644,7 +2713,10 @@ class LedgerStore:
             self._assert_spend_hold_in(db, hold_id)
             return self._spend_status_in(db, hold_id)
 
-        return self._tx(operation)
+        result = self._tx(operation)
+        if isinstance(result, SpendExpired):
+            raise result
+        return result
 
     def request_spend_release(
         self, hold_id: str, payer_keyid: str
@@ -2713,24 +2785,52 @@ class LedgerStore:
         with self._lock:
             return self._spend_status_in(self._db, hold_id)
 
-    def expire_spend_holds(self) -> list[str]:
-        """Advance every due hold and return the affected hold ids."""
-        def operation(db: sqlite3.Connection) -> list[str]:
+    def expire_spend_holds_batch(
+        self, batch_size: int = SPEND_EXPIRY_BATCH_SIZE
+    ) -> SpendExpiryBatch:
+        """Advance one bounded, ordered batch in a single transaction."""
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size < 1
+        ):
+            raise LedgerValueError("batch_size must be a positive integer")
+
+        def operation(db: sqlite3.Connection) -> SpendExpiryBatch:
             now = self._now()
             rows = db.execute(
                 "SELECT hold_id FROM spend_holds "
-                "WHERE state IN ('open','closing') "
-                "AND execution_deadline<=? ORDER BY authorized_at, hold_id",
-                (now,),
+                "WHERE (state='open' AND execution_deadline<=?) "
+                "OR (state='closing' AND settlement_deadline<=?) "
+                "ORDER BY CASE state WHEN 'open' THEN execution_deadline "
+                "ELSE settlement_deadline END, authorized_at, hold_id LIMIT ?",
+                (now, now, batch_size + 1),
             ).fetchall()
             affected: list[str] = []
-            for hold in rows:
+            for hold in rows[:batch_size]:
                 hold_id = str(hold["hold_id"])
                 if self._advance_spend_hold_in(db, hold_id, now):
                     affected.append(hold_id)
-            return affected
+            return SpendExpiryBatch(
+                affected=tuple(affected),
+                remaining=len(rows) > batch_size,
+            )
 
         return self._tx(operation)
+
+    def expire_spend_holds(
+        self, batch_size: int = SPEND_EXPIRY_BATCH_SIZE
+    ) -> list[str]:
+        """Sweep every due hold, committing and yielding between batches."""
+        affected: list[str] = []
+        while True:
+            batch = self.expire_spend_holds_batch(batch_size)
+            affected.extend(batch.affected)
+            if not batch.remaining:
+                return affected
+            # Give a writer already waiting on SQLite's lock a scheduling
+            # point before the next bounded BEGIN IMMEDIATE.
+            time.sleep(0)
 
     def transfer(self, src: str, dst: str, amount: int, tier: str) -> int:
         """Move units atomically, allowing debt only within ``src``'s tier."""
@@ -2977,6 +3077,7 @@ __all__ = [
     "HOLD_S",
     "SPEND_EXECUTION_S",
     "SPEND_SETTLEMENT_GRACE_S",
+    "SPEND_EXPIRY_BATCH_SIZE",
     "TREASURY_ACCOUNT",
     "TIER_LIMITS",
     "is_reserved",
@@ -2990,6 +3091,8 @@ __all__ = [
     "WithdrawalStateError",
     "SpendConflict",
     "SpendStateError",
+    "SpendExpired",
+    "SpendExpiryBatch",
     "LedgerStore",
     "import_legacy_snapshot",
 ]
