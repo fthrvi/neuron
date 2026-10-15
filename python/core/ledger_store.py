@@ -124,10 +124,11 @@ class SpendExpired(SpendStateError):
 
 @dataclass(frozen=True)
 class SpendExpiryBatch:
-    """One committed expiry batch and whether another batch was due."""
+    """One committed expiry batch at a fixed sweep cutoff."""
 
     affected: tuple[str, ...]
     remaining: bool
+    cutoff: int
 
 
 def is_reserved(account: object) -> bool:
@@ -2786,34 +2787,44 @@ class LedgerStore:
             return self._spend_status_in(self._db, hold_id)
 
     def expire_spend_holds_batch(
-        self, batch_size: int = SPEND_EXPIRY_BATCH_SIZE
+        self,
+        batch_size: int = SPEND_EXPIRY_BATCH_SIZE,
+        *,
+        cutoff: int | None = None,
     ) -> SpendExpiryBatch:
-        """Advance one bounded, ordered batch in a single transaction."""
+        """Advance one bounded, ordered batch at a fixed cutoff."""
         if (
             isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
             or batch_size < 1
         ):
             raise LedgerValueError("batch_size must be a positive integer")
+        if batch_size > SPEND_EXPIRY_BATCH_SIZE:
+            raise LedgerValueError(
+                f"batch_size must not exceed {SPEND_EXPIRY_BATCH_SIZE}"
+            )
+        if cutoff is not None:
+            cutoff = _nonnegative_integer(cutoff, "cutoff")
 
         def operation(db: sqlite3.Connection) -> SpendExpiryBatch:
-            now = self._now()
+            sweep_cutoff = self._now() if cutoff is None else cutoff
             rows = db.execute(
                 "SELECT hold_id FROM spend_holds "
                 "WHERE (state='open' AND execution_deadline<=?) "
                 "OR (state='closing' AND settlement_deadline<=?) "
                 "ORDER BY CASE state WHEN 'open' THEN execution_deadline "
                 "ELSE settlement_deadline END, authorized_at, hold_id LIMIT ?",
-                (now, now, batch_size + 1),
+                (sweep_cutoff, sweep_cutoff, batch_size + 1),
             ).fetchall()
             affected: list[str] = []
             for hold in rows[:batch_size]:
                 hold_id = str(hold["hold_id"])
-                if self._advance_spend_hold_in(db, hold_id, now):
+                if self._advance_spend_hold_in(db, hold_id, sweep_cutoff):
                     affected.append(hold_id)
             return SpendExpiryBatch(
                 affected=tuple(affected),
                 remaining=len(rows) > batch_size,
+                cutoff=sweep_cutoff,
             )
 
         return self._tx(operation)
@@ -2823,8 +2834,10 @@ class LedgerStore:
     ) -> list[str]:
         """Sweep every due hold, committing and yielding between batches."""
         affected: list[str] = []
+        cutoff: int | None = None
         while True:
-            batch = self.expire_spend_holds_batch(batch_size)
+            batch = self.expire_spend_holds_batch(batch_size, cutoff=cutoff)
+            cutoff = batch.cutoff
             affected.extend(batch.affected)
             if not batch.remaining:
                 return affected

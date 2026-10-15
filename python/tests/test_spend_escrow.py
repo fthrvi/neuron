@@ -1,4 +1,5 @@
 """N1 spend escrow pricing, lifecycle, concurrency, and accounting tests."""
+import hashlib
 import os
 import sqlite3
 import sys
@@ -10,12 +11,14 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import core.ledger_store as ledger_store_module  # noqa: E402
 from chain.spend_preflight import (  # noqa: E402
+    SpendNamespaceCollision,
     find_spend_namespace_collisions,
     main as spend_preflight_main,
 )
 from core.ledger_store import (  # noqa: E402
     HOLD_S,
     SPEND_EXECUTION_S,
+    SPEND_EXPIRY_BATCH_SIZE,
     SPEND_SETTLEMENT_GRACE_S,
     CreditLimitError,
     LedgerError,
@@ -728,15 +731,119 @@ def test_expiry_batch_is_bounded_ordered_and_exposes_remaining_work(tmp_path):
     with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
         _seed_due_zero_cost_holds(store, 5, clock[0])
         first = store.expire_spend_holds_batch(batch_size=2)
-        second = store.expire_spend_holds_batch(batch_size=2)
-        third = store.expire_spend_holds_batch(batch_size=2)
+        second = store.expire_spend_holds_batch(
+            batch_size=2, cutoff=first.cutoff
+        )
+        third = store.expire_spend_holds_batch(
+            batch_size=2, cutoff=first.cutoff
+        )
 
         assert first.affected == ("backlog-00000", "backlog-00001")
         assert first.remaining is True
+        assert first.cutoff == clock[0]
         assert second.affected == ("backlog-00002", "backlog-00003")
         assert second.remaining is True
         assert third.affected == ("backlog-00004",)
         assert third.remaining is False
+        assert second.cutoff == third.cutoff == first.cutoff
+
+
+class _ClockAdvancingSweepStore(LedgerStore):
+    def __init__(self, *args, sweep_clock, advance_s, **kwargs):
+        self.sweep_clock = sweep_clock
+        self.advance_s = advance_s
+        self.expiry_batches = []
+        super().__init__(*args, clock=lambda: self.sweep_clock[0], **kwargs)
+
+    def expire_spend_holds_batch(
+        self,
+        batch_size=SPEND_EXPIRY_BATCH_SIZE,
+        *,
+        cutoff=None,
+    ):
+        batch = super().expire_spend_holds_batch(
+            batch_size, cutoff=cutoff
+        )
+        self.expiry_batches.append(batch)
+        self.sweep_clock[0] += self.advance_s
+        return batch
+
+
+def test_expiry_sweep_does_not_process_one_hold_at_both_deadlines(tmp_path):
+    clock = [10_500_000]
+    with _ClockAdvancingSweepStore(
+        tmp_path / "ledger.db",
+        sweep_clock=clock,
+        advance_s=SPEND_SETTLEMENT_GRACE_S,
+    ) as store:
+        first = _authorize(
+            store, nonce="a", session="a", hold_id="a"
+        )
+        _authorize(store, nonce="b", session="b", hold_id="b")
+        store.claim_spend_worker(first["hold_id"], "worker-key", "instance")
+        clock[0] = first["execution_deadline"]
+
+        affected = store.expire_spend_holds(batch_size=1)
+
+        assert affected == ["a", "b"]
+        assert [batch.affected for batch in store.expiry_batches] == [
+            ("a",),
+            ("b",),
+        ]
+        assert {batch.cutoff for batch in store.expiry_batches} == {
+            first["execution_deadline"]
+        }
+        assert store.spend_status("a")["state"] == "closing"
+
+        store.expiry_batches.clear()
+        assert store.expire_spend_holds(batch_size=1) == ["a"]
+        assert store.spend_status("a")["state"] == "expired"
+
+
+def test_expiry_sweep_defers_newly_due_work_regardless_of_backlog(tmp_path):
+    def run_case(name, with_backlog):
+        clock = [10_750_000]
+        with _ClockAdvancingSweepStore(
+            tmp_path / name,
+            sweep_clock=clock,
+            advance_s=1,
+        ) as store:
+            first = _authorize(
+                store, nonce="a", session="a", hold_id="a"
+            )
+            if with_backlog:
+                _authorize(store, nonce="c", session="c", hold_id="c")
+            clock[0] += 1
+            _authorize(store, nonce="b", session="b", hold_id="b")
+            clock[0] = first["execution_deadline"]
+
+            affected = store.expire_spend_holds(batch_size=1)
+            state_after_first_sweep = store.spend_status("b")["state"]
+            store.expiry_batches.clear()
+            next_affected = store.expire_spend_holds(batch_size=1)
+            return affected, state_after_first_sweep, next_affected
+
+    assert run_case("no-backlog.db", False) == (["a"], "open", ["b"])
+    assert run_case("with-backlog.db", True) == (
+        ["a", "c"],
+        "open",
+        ["b"],
+    )
+
+
+@pytest.mark.parametrize("method", ("batch", "sweep"))
+def test_expiry_batch_size_cannot_exceed_transaction_bound(tmp_path, method):
+    with LedgerStore(tmp_path / f"{method}.db") as store:
+        operation = (
+            store.expire_spend_holds_batch
+            if method == "batch"
+            else store.expire_spend_holds
+        )
+        with pytest.raises(
+            LedgerValueError,
+            match=rf"must not exceed {SPEND_EXPIRY_BATCH_SIZE}",
+        ):
+            operation(SPEND_EXPIRY_BATCH_SIZE + 1)
 
 
 class _SweepSignallingStore(LedgerStore):
@@ -746,8 +853,15 @@ class _SweepSignallingStore(LedgerStore):
         self.batch_lengths = []
         super().__init__(*args, **kwargs)
 
-    def expire_spend_holds_batch(self, batch_size=200):
-        batch = super().expire_spend_holds_batch(batch_size)
+    def expire_spend_holds_batch(
+        self,
+        batch_size=SPEND_EXPIRY_BATCH_SIZE,
+        *,
+        cutoff=None,
+    ):
+        batch = super().expire_spend_holds_batch(
+            batch_size, cutoff=cutoff
+        )
         self.batch_lengths.append(len(batch.affected))
         if not self.first_batch_committed.is_set():
             self.first_batch_committed.set()
@@ -825,6 +939,47 @@ def test_reserved_namespace_preflight_is_read_only_and_reports_collisions(
     assert '"account": "__spend_hold__:legacy"' in output
     after = (path.read_bytes(), path.stat().st_mtime_ns, tuple(tmp_path.iterdir()))
     assert after == before
+
+
+def test_reserved_namespace_preflight_preserves_active_wal_hashes(
+    tmp_path, capsys
+):
+    path = tmp_path / "active.db"
+    writer = sqlite3.connect(path)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(
+            "CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INTEGER NOT NULL)"
+        )
+        writer.executemany(
+            "INSERT INTO accounts(id, balance) VALUES (?, ?)",
+            (("__spend_hold__:active", 0), ("ordinary", 0)),
+        )
+        writer.commit()
+        wal_path = path.with_name(f"{path.name}-wal")
+        assert wal_path.exists() and wal_path.stat().st_size > 0
+
+        def hashes():
+            return {
+                candidate.name: (
+                    candidate.stat().st_size,
+                    hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                )
+                for candidate in (path, wal_path)
+            }
+
+        before = hashes()
+        assert find_spend_namespace_collisions(path) == (
+            SpendNamespaceCollision(
+                account="__spend_hold__:active", balance=0
+            ),
+        )
+        assert spend_preflight_main([str(path), "--json"]) == 1
+        assert '"collision_count": 1' in capsys.readouterr().out
+        assert hashes() == before
+    finally:
+        writer.close()
 
 
 def test_migration_refuses_unbacked_reserved_spend_account(tmp_path):
