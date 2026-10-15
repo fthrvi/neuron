@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -20,6 +21,9 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 
 # SQLite's INTEGER storage class is a signed 64-bit value.  Keeping the public
@@ -48,6 +52,19 @@ _SPEND_HOLD_PREFIX = f"{_SPEND_HOLD_STEM}:"
 SPEND_EXECUTION_S = 15 * 60
 SPEND_SETTLEMENT_GRACE_S = 24 * 60 * 60
 SPEND_EXPIRY_BATCH_SIZE = 200
+SPEND_RECEIPT_DOMAIN = b"nakshatra-spend-usage-receipt-v2\0"
+
+SPEND_USAGE_FIELDS = frozenset(
+    {
+        "v", "kind", "receipt_id", "hold_id", "claim_response_sha256",
+        "payer_keyid", "payer_account_at_authorize", "worker_keyid",
+        "worker_account_at_authorize", "billable", "session_id", "model_id",
+        "billing_mode", "layer_start", "layer_end", "sequence",
+        "cumulative_prompt_tokens", "cumulative_generated_tokens",
+        "cumulative_token_layers", "cumulative_cost", "work_completed_at",
+        "final", "termination", "output_sha256",
+    }
+)
 
 # These limits mirror nakshatra/scripts/creditlimit.py.  Unknown tiers are
 # intentionally treated as strangers (the tightest policy).
@@ -446,6 +463,11 @@ class LedgerStore:
                           AND cumulative_cost BETWEEN 0 AND {max_units}),
                 final INTEGER NOT NULL DEFAULT 0 CHECK(final IN (0, 1)),
                 final_receipt_id TEXT,
+                receipt_sequence INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(receipt_sequence) = 'integer'
+                          AND receipt_sequence >= 0),
+                last_receipt_id TEXT,
+                claim_response_sha256 TEXT,
                 finalized_at INTEGER,
                 updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer'),
                 PRIMARY KEY(hold_id, worker_keyid),
@@ -458,6 +480,68 @@ class LedgerStore:
                 CHECK(cumulative_token_layers <= max_token_layers),
                 CHECK(cumulative_cost <= max_cost),
                 CHECK(final = 0 OR state = 'final')
+            );
+
+            CREATE TABLE IF NOT EXISTS spend_usage_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                hold_id TEXT NOT NULL,
+                worker_keyid TEXT NOT NULL,
+                sequence INTEGER NOT NULL
+                    CHECK(typeof(sequence) = 'integer' AND sequence > 0),
+                receipt_json TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                cumulative_prompt_tokens INTEGER NOT NULL
+                    CHECK(typeof(cumulative_prompt_tokens) = 'integer'
+                          AND cumulative_prompt_tokens BETWEEN 0 AND {max_units}),
+                cumulative_generated_tokens INTEGER NOT NULL
+                    CHECK(typeof(cumulative_generated_tokens) = 'integer'
+                          AND cumulative_generated_tokens BETWEEN 0 AND {max_units}),
+                cumulative_token_layers INTEGER NOT NULL
+                    CHECK(typeof(cumulative_token_layers) = 'integer'
+                          AND cumulative_token_layers BETWEEN 0 AND {max_units}),
+                cumulative_cost INTEGER NOT NULL
+                    CHECK(typeof(cumulative_cost) = 'integer'
+                          AND cumulative_cost BETWEEN 0 AND {max_units}),
+                accepted_delta INTEGER NOT NULL
+                    CHECK(typeof(accepted_delta) = 'integer'
+                          AND accepted_delta BETWEEN 0 AND {max_units}),
+                final INTEGER NOT NULL CHECK(final IN (0, 1)),
+                debit_journal_seq INTEGER,
+                credit_journal_seq INTEGER,
+                accepted_at INTEGER NOT NULL CHECK(typeof(accepted_at) = 'integer'),
+                UNIQUE(hold_id, worker_keyid, sequence),
+                FOREIGN KEY(hold_id, worker_keyid)
+                    REFERENCES spend_hold_workers(hold_id, worker_keyid),
+                FOREIGN KEY(debit_journal_seq) REFERENCES journal(seq),
+                FOREIGN KEY(credit_journal_seq) REFERENCES journal(seq),
+                CHECK((accepted_delta = 0 AND debit_journal_seq IS NULL
+                        AND credit_journal_seq IS NULL)
+                      OR (accepted_delta > 0 AND debit_journal_seq IS NOT NULL
+                          AND credit_journal_seq IS NOT NULL))
+            );
+
+            CREATE TABLE IF NOT EXISTS spend_economic_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                hold_id TEXT NOT NULL,
+                payer_account TEXT NOT NULL,
+                worker_account TEXT NOT NULL,
+                amount INTEGER NOT NULL
+                    CHECK(typeof(amount) = 'integer'
+                          AND amount BETWEEN 0 AND {max_units}),
+                funded INTEGER NOT NULL CHECK(funded IN (0, 1)),
+                earned_at INTEGER NOT NULL CHECK(typeof(earned_at) = 'integer'),
+                hold_terminal_at INTEGER,
+                matures_at INTEGER,
+                dispute_state TEXT NOT NULL DEFAULT 'none'
+                    CHECK(dispute_state IN ('none','clawed_back')),
+                debit_journal_seq INTEGER,
+                credit_journal_seq INTEGER,
+                FOREIGN KEY(receipt_id) REFERENCES spend_usage_receipts(receipt_id),
+                FOREIGN KEY(hold_id) REFERENCES spend_holds(hold_id),
+                FOREIGN KEY(debit_journal_seq) REFERENCES journal(seq),
+                FOREIGN KEY(credit_journal_seq) REFERENCES journal(seq),
+                CHECK((hold_terminal_at IS NULL AND matures_at IS NULL)
+                      OR matures_at = hold_terminal_at + {HOLD_S})
             );
 
             CREATE INDEX IF NOT EXISTS spend_holds_due
@@ -511,6 +595,32 @@ class LedgerStore:
             BEGIN
                 SELECT RAISE(ABORT, 'spend worker entries are permanent');
             END;
+
+            CREATE TRIGGER IF NOT EXISTS spend_usage_receipts_no_update
+            BEFORE UPDATE ON spend_usage_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'spend usage receipts are immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS spend_usage_receipts_no_delete
+            BEFORE DELETE ON spend_usage_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'spend usage receipts are permanent');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS spend_economic_receipts_no_delete
+            BEFORE DELETE ON spend_economic_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'spend economic receipts are permanent');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS spend_economic_core_immutable
+            BEFORE UPDATE OF receipt_id, hold_id, payer_account, worker_account,
+                amount, funded, earned_at, debit_journal_seq, credit_journal_seq
+            ON spend_economic_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'spend economic receipt core is immutable');
+            END;
             """
         )
         collision = self._db.execute(
@@ -533,6 +643,19 @@ class LedgerStore:
         }
         if "request_digest" not in spend_hold_columns:
             self._db.execute("ALTER TABLE spend_holds ADD COLUMN request_digest TEXT")
+        spend_worker_columns = {
+            str(row[1])
+            for row in self._db.execute("PRAGMA table_info(spend_hold_workers)")
+        }
+        for name, definition in (
+            ("receipt_sequence", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_receipt_id", "TEXT"),
+            ("claim_response_sha256", "TEXT"),
+        ):
+            if name not in spend_worker_columns:
+                self._db.execute(
+                    f"ALTER TABLE spend_hold_workers ADD COLUMN {name} {definition}"
+                )
         missing_request_digests = self._db.execute(
             "SELECT payer_keyid, client_nonce, session_id, model_id, billing_mode, "
             "max_prompt_tokens, max_output_tokens, hold_id FROM spend_holds "
@@ -571,6 +694,57 @@ class LedgerStore:
             WHEN NEW.request_digest IS NULL
             BEGIN
                 SELECT RAISE(ABORT, 'spend hold request digest is required');
+            END;
+            """
+        )
+        self._db.executescript(
+            f"""
+            DROP VIEW IF EXISTS economic_receipts;
+            CREATE VIEW economic_receipts AS
+            SELECT 'v1:' || j.seq AS economic_id, 'v1' AS namespace,
+                j.receipt_id AS receipt_id, NULL AS hold_id,
+                j.counterparty AS payer_account, j.account AS worker_account,
+                j.amount AS amount,
+                CASE WHEN json_valid(j.detail)
+                          AND json_extract(j.detail, '$.funded') = 1
+                     THEN 1 ELSE 0 END AS funded,
+                j.ts AS earned_at, j.ts AS hold_terminal_at,
+                j.ts + {HOLD_S} AS matures_at,
+                CASE WHEN r.state = 'disputed' THEN 'clawed_back' ELSE 'none' END
+                    AS dispute_state,
+                (SELECT d.seq FROM journal AS d
+                 WHERE d.receipt_id=j.receipt_id AND d.kind='spend'
+                 ORDER BY d.seq LIMIT 1) AS debit_journal_seq,
+                j.seq AS credit_journal_seq
+            FROM journal AS j JOIN receipts AS r ON r.receipt_id=j.receipt_id
+            WHERE j.kind='earn' AND j.amount > 0
+            UNION ALL
+            SELECT 'legacy_import:' || j.seq, 'legacy_import', j.receipt_id,
+                NULL, j.counterparty, j.account, j.amount, 0, j.ts, NULL, NULL,
+                'none', NULL, j.seq
+            FROM journal AS j
+            WHERE j.kind='legacy_import' AND j.amount > 0
+            UNION ALL
+            SELECT 'v2:' || e.receipt_id, 'v2', e.receipt_id, e.hold_id,
+                e.payer_account, e.worker_account, e.amount, e.funded,
+                e.earned_at, e.hold_terminal_at, e.matures_at, e.dispute_state,
+                e.debit_journal_seq, e.credit_journal_seq
+            FROM spend_economic_receipts AS e;
+
+            CREATE TRIGGER IF NOT EXISTS spend_terminal_at_immutable
+            BEFORE UPDATE OF terminal_at ON spend_holds
+            WHEN OLD.terminal_at IS NOT NULL AND NEW.terminal_at IS NOT OLD.terminal_at
+            BEGIN
+                SELECT RAISE(ABORT, 'spend hold terminal time is immutable');
+            END;
+
+
+            CREATE TRIGGER IF NOT EXISTS spend_claim_digest_immutable
+            BEFORE UPDATE OF claim_response_sha256 ON spend_hold_workers
+            WHEN OLD.claim_response_sha256 IS NOT NULL
+                 AND NEW.claim_response_sha256 IS NOT OLD.claim_response_sha256
+            BEGIN
+                SELECT RAISE(ABORT, 'spend claim response digest is immutable');
             END;
             """
         )
@@ -669,6 +843,63 @@ class LedgerStore:
         return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
     @staticmethod
+    def spend_receipt_id(receipt: Mapping[str, Any]) -> str:
+        """Compute the v2 domain-separated identifier from receipt fields."""
+        if not isinstance(receipt, Mapping):
+            raise LedgerValueError("usage receipt must be an object")
+        fields = {key: value for key, value in receipt.items() if key != "receipt_id"}
+        canonical = json.dumps(
+            fields, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(SPEND_RECEIPT_DOMAIN + canonical).hexdigest()
+
+    @staticmethod
+    def _claim_response_digest(
+        hold: Mapping[str, Any], entry: Mapping[str, Any], claim_instance: str, now: int
+    ) -> str:
+        response = {
+            "v": 1,
+            "hold_id": str(hold["hold_id"]),
+            "claim_instance": claim_instance,
+            "payer_keyid": str(hold["payer_keyid"]),
+            "payer_account_at_authorize": str(hold["payer_account_at_authorize"]),
+            "worker_keyid": str(entry["worker_keyid"]),
+            "worker_account_at_authorize": str(entry["worker_account_at_authorize"]),
+            "billable": bool(entry["billable"]),
+            "session_id": str(hold["session_id"]),
+            "model_id": str(hold["model_id"]),
+            "billing_mode": str(hold["billing_mode"]),
+            "layer_start": int(entry["layer_start"]),
+            "layer_end": int(entry["layer_end"]),
+            "price_multiplier": int(entry["price_multiplier"]),
+            "max_prompt_tokens": int(entry["max_prompt_tokens"]),
+            "max_output_tokens": int(entry["max_output_tokens"]),
+            "max_token_layers": int(entry["max_token_layers"]),
+            "max_cost": int(entry["max_cost"]),
+            "execution_deadline": int(hold["execution_deadline"]),
+            "settlement_deadline": int(hold["settlement_deadline"]),
+            "server_time": now,
+        }
+        canonical = json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(canonical).hexdigest()
+
+    @staticmethod
+    def _strict_sha256(
+        value: Any,
+        name: str,
+        *,
+        empty_ok: bool = False,
+        prefixed: bool = False,
+    ) -> str:
+        if empty_ok and value == "":
+            return ""
+        pattern = r"sha256:[0-9a-f]{64}" if prefixed else r"[0-9a-f]{64}"
+        if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+            shape = "sha256:<64 lowercase hex>" if prefixed else "64 lowercase hex"
+            raise LedgerValueError(f"{name} must be {shape}")
+        return value
+
+    @staticmethod
     def _balance_in(db: sqlite3.Connection, account: str) -> int:
         row = db.execute("SELECT balance FROM accounts WHERE id=?", (account,)).fetchone()
         return int(row[0]) if row else 0
@@ -703,64 +934,21 @@ class LedgerStore:
     def _restricted_paid_earnings_in(
         db: sqlite3.Connection, account: str, now: int
     ) -> int:
-        """Return earnings N1 must not treat as paid-hold collateral.
+        """Return paid earnings excluded from new-hold collateral.
 
-        N2 replaces this deliberately narrow compatibility query with the
-        shared economic-receipt view.  Its additional per-spend-earn row query
-        is provisional and must not remain once ledger history makes it
-        authorization-lock-heavy.  Until then, legacy funded earnings use
-        their existing journal timestamp maturity, spend earnings use the
-        hold's terminal timestamp, and imported positive balances remain
-        restricted until an explicit reconciliation proves their provenance.
-        Unfunded, nonterminal, and disputed earnings remain restricted.
+        This is deliberately the same normalized economic view consumed by
+        withdrawal eligibility and S6.  An earning becomes usable only after
+        its terminal-anchored maturity and only while funded and undisputed.
         """
-        restricted = int(
+        return int(
             db.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM journal "
-                "WHERE account=? AND kind='legacy_import' AND amount>0",
-                (account,),
+                "SELECT COALESCE(SUM(amount), 0) FROM economic_receipts "
+                "WHERE worker_account=? AND amount>0 AND NOT "
+                "(funded=1 AND dispute_state='none' "
+                "AND matures_at IS NOT NULL AND ?>matures_at)",
+                (account, now),
             ).fetchone()[0]
         )
-        legacy_rows = db.execute(
-            "SELECT j.ts, j.amount, j.detail, r.state FROM journal AS j "
-            "JOIN receipts AS r ON r.receipt_id=j.receipt_id "
-            "WHERE j.account=? AND j.kind='earn'",
-            (account,),
-        ).fetchall()
-        for row in legacy_rows:
-            if row["state"] != "settled":
-                continue
-            try:
-                funded = json.loads(row["detail"]).get("funded") is True
-            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-                funded = False
-            if not funded or now <= int(row["ts"]) + HOLD_S:
-                restricted += int(row["amount"])
-
-        spend_rows = db.execute(
-            "SELECT amount, detail FROM journal "
-            "WHERE account=? AND kind='spend_earn' AND amount>0",
-            (account,),
-        ).fetchall()
-        for row in spend_rows:
-            try:
-                hold_id = json.loads(row["detail"])["hold_id"]
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                # Malformed economic provenance is never eligible collateral.
-                restricted += int(row["amount"])
-                continue
-            hold = db.execute(
-                "SELECT state, terminal_at FROM spend_holds WHERE hold_id=?",
-                (hold_id,),
-            ).fetchone()
-            if (
-                hold is None
-                or hold["state"] == "disputed"
-                or hold["terminal_at"] is None
-                or now <= int(hold["terminal_at"]) + HOLD_S
-            ):
-                restricted += int(row["amount"])
-        return restricted
 
     @staticmethod
     def _spend_liability_in(db: sqlite3.Connection, hold_id: str) -> int:
@@ -805,9 +993,9 @@ class LedgerStore:
         credit_kind: str,
         event_id: str,
         detail: Mapping[str, Any],
-    ) -> None:
+    ) -> tuple[int, int] | tuple[None, None]:
         if amount == 0:
-            return
+            return None, None
         source_new = cls._checked_balance(
             cls._balance_in(db, source) - amount, source
         )
@@ -819,12 +1007,12 @@ class LedgerStore:
         cls._set_balance(db, source, source_new)
         cls._set_balance(db, destination, destination_new)
         encoded = json.dumps(detail, sort_keys=True, separators=(",", ":"))
-        db.execute(
+        debit = db.execute(
             "INSERT INTO journal(ts, kind, receipt_id, account, counterparty, "
             "amount, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (timestamp, debit_kind, event_id, source, destination, -amount, encoded),
         )
-        db.execute(
+        credit = db.execute(
             "INSERT INTO journal(ts, kind, receipt_id, account, counterparty, "
             "amount, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
@@ -836,6 +1024,17 @@ class LedgerStore:
                 amount,
                 encoded,
             ),
+        )
+        return int(debit.lastrowid), int(credit.lastrowid)
+
+    @staticmethod
+    def _anchor_spend_economics_in(
+        db: sqlite3.Connection, hold_id: str, terminal_at: int
+    ) -> None:
+        db.execute(
+            "UPDATE spend_economic_receipts SET hold_terminal_at=?, matures_at=? "
+            "WHERE hold_id=? AND hold_terminal_at IS NULL",
+            (terminal_at, terminal_at + HOLD_S, hold_id),
         )
 
     @staticmethod
@@ -863,20 +1062,15 @@ class LedgerStore:
             ).fetchone()[0]
         )
 
-        matured_earnings = 0
-        rows = db.execute(
-            "SELECT j.amount, j.detail FROM journal AS j "
-            "JOIN receipts AS r ON r.receipt_id=j.receipt_id "
-            "WHERE j.account=? AND j.kind='earn' AND j.ts<=? AND r.state='settled'",
-            (operator, now - HOLD_S),
-        ).fetchall()
-        for row in rows:
-            try:
-                funded = json.loads(row["detail"]).get("funded") is True
-            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-                funded = False
-            if funded:
-                matured_earnings += int(row["amount"])
+        matured_earnings = int(
+            db.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM economic_receipts "
+                "WHERE worker_account=? AND amount>0 AND funded=1 "
+                "AND dispute_state='none' AND matures_at IS NOT NULL "
+                "AND ?>matures_at",
+                (operator, now),
+            ).fetchone()[0]
+        )
 
         entitlement = deposited - withdrawn - held + matured_earnings
         return max(0, min(balance, entitlement))
@@ -944,7 +1138,7 @@ class LedgerStore:
             # charging nothing would mint units from nothing.
             raise LedgerValueError("a zero-charge settle cannot credit any account")
         credited_json = json.dumps(clean_credits, sort_keys=True, separators=(",", ":"))
-        now = int(time.time())
+        now = self._now()
         delta = -charged
 
         def operation(db: sqlite3.Connection) -> int:
@@ -1320,14 +1514,14 @@ class LedgerStore:
         if is_reserved(operator):
             raise LedgerValueError("operator is reserved")
         with self._lock:
-            return self._withdrawable_in(self._db, operator, int(time.time()))
+            return self._withdrawable_in(self._db, operator, self._now())
 
     def wallet(self, operator: str) -> dict[str, Any]:
         """Return the deposit account, durably requesting treasury creation if absent."""
         operator = _identifier(operator, "operator")
         if is_reserved(operator):
             raise LedgerValueError("operator is reserved")
-        now = int(time.time())
+        now = self._now()
 
         def operation(db: sqlite3.Connection) -> dict[str, Any]:
             row = db.execute(
@@ -1363,7 +1557,7 @@ class LedgerStore:
         address = _identifier(address, "address")
         if is_reserved(operator):
             raise LedgerValueError("operator is reserved")
-        now = int(time.time())
+        now = self._now()
 
         def operation(db: sqlite3.Connection) -> dict[str, Any]:
             row = db.execute(
@@ -1415,7 +1609,7 @@ class LedgerStore:
         operator = _identifier(operator, "operator")
         if is_reserved(operator):
             raise LedgerValueError("operator is reserved")
-        now = int(time.time())
+        now = self._now()
         with self._lock:
             balance = self._balance_in(self._db, operator)
             withdrawable = self._withdrawable_in(self._db, operator, now)
@@ -1469,7 +1663,7 @@ class LedgerStore:
         if address is not None:
             address = _identifier(address, "address")
         tier = _tier(tier)
-        now = int(time.time())
+        now = self._now()
         withdrawal_id = uuid.uuid4().hex
         hold_account = self._withdrawal_hold_account(withdrawal_id)
 
@@ -1551,7 +1745,7 @@ class LedgerStore:
         if withdrawal_id is None:
             withdrawal_id = uuid.uuid4().hex
         withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
-        now = int(time.time())
+        now = self._now()
         hold_account = self._withdrawal_hold_account(withdrawal_id)
 
         def operation(db: sqlite3.Connection) -> str:
@@ -1946,7 +2140,8 @@ class LedgerStore:
             "max_prompt_tokens, max_output_tokens, max_token_layers, max_cost, "
             "state, claim_instance, claimed_at, cumulative_prompt_tokens, "
             "cumulative_generated_tokens, cumulative_token_layers, "
-            "cumulative_cost, final, final_receipt_id, finalized_at, updated_at "
+            "cumulative_cost, final, final_receipt_id, receipt_sequence, "
+            "last_receipt_id, claim_response_sha256, finalized_at, updated_at "
             "FROM spend_hold_workers WHERE hold_id=? ORDER BY entry_index",
             (hold_id,),
         ).fetchall()
@@ -2000,6 +2195,7 @@ class LedgerStore:
             "WHERE hold_id=?",
             (now, now, hold_id),
         )
+        cls._anchor_spend_economics_in(db, hold_id, now)
         cls._assert_spend_hold_in(db, hold_id)
         return True
 
@@ -2042,6 +2238,7 @@ class LedgerStore:
                 "WHERE hold_id=?",
                 (now, now, hold_id),
             )
+            cls._anchor_spend_economics_in(db, hold_id, now)
             cls._assert_spend_hold_in(db, hold_id)
             return True
 
@@ -2101,6 +2298,7 @@ class LedgerStore:
                     "updated_at=? WHERE hold_id=?",
                     (now, now, hold_id),
                 )
+                cls._anchor_spend_economics_in(db, hold_id, now)
             else:
                 cls._finish_spend_hold_if_ready(db, hold_id, now)
         cls._assert_spend_hold_in(db, hold_id)
@@ -2144,7 +2342,7 @@ class LedgerStore:
         )
 
     def eligible_spend_capacity(self, account: str, tier: str) -> int | None:
-        """Return N1 paid-hold capacity, or ``None`` for an unlimited tier.
+        """Return paid-hold capacity from the shared economic view.
 
         This is advisory. ``authorize_spend`` recomputes it while holding a
         ``BEGIN IMMEDIATE`` write transaction.
@@ -2179,8 +2377,8 @@ class LedgerStore:
     ) -> dict[str, Any]:
         """Reserve one immutable, worst-case-priced paid execution plan.
 
-        The caller supplies an already authenticated roster snapshot.  N1 has
-        no HTTP route and no token claim surface; N3 will bind this primitive
+        The caller supplies an already authenticated roster snapshot.  N2 has
+        no HTTP route or opaque-token claim surface; N3 will bind this primitive
         to its opaque authorization token.
         """
         # Parse only fields covered by the authenticated wire request before
@@ -2448,7 +2646,7 @@ class LedgerStore:
     def claim_spend_worker(
         self, hold_id: str, worker_keyid: str, claim_instance: str
     ) -> dict[str, Any]:
-        """Claim one planned entry by stable instance (internal N1 primitive)."""
+        """Claim one planned entry by stable instance (internal pre-N3 primitive)."""
         hold_id = _identifier(hold_id, "hold_id")
         worker_keyid = _identifier(worker_keyid, "worker_keyid")
         claim_instance = _identifier(claim_instance, "claim_instance")
@@ -2457,13 +2655,13 @@ class LedgerStore:
             now = self._now()
             self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
-                "SELECT state, execution_deadline FROM spend_holds WHERE hold_id=?",
+                "SELECT * FROM spend_holds WHERE hold_id=?",
                 (hold_id,),
             ).fetchone()
             if hold is None:
                 raise SpendStateError(f"spend hold {hold_id!r} does not exist")
             entry = db.execute(
-                "SELECT state, claim_instance FROM spend_hold_workers "
+                "SELECT * FROM spend_hold_workers "
                 "WHERE hold_id=? AND worker_keyid=?",
                 (hold_id, worker_keyid),
             ).fetchone()
@@ -2474,6 +2672,16 @@ class LedgerStore:
             if entry["claim_instance"] is not None:
                 if entry["claim_instance"] != claim_instance:
                     raise SpendConflict("worker entry was claimed by another instance")
+                if entry["claim_response_sha256"] is None:
+                    claimed_at = int(entry["claimed_at"])
+                    claim_digest = self._claim_response_digest(
+                        hold, entry, claim_instance, claimed_at
+                    )
+                    db.execute(
+                        "UPDATE spend_hold_workers SET claim_response_sha256=? "
+                        "WHERE hold_id=? AND worker_keyid=?",
+                        (claim_digest, hold_id, worker_keyid),
+                    )
                 return self._spend_status_in(db, hold_id)
             if hold["state"] != "open":
                 raise SpendStateError(f"spend hold is {hold['state']}")
@@ -2481,10 +2689,14 @@ class LedgerStore:
                 raise SpendStateError("spend execution deadline has passed")
             if entry["state"] != "planned":
                 raise SpendStateError(f"worker entry is {entry['state']}")
+            claim_digest = self._claim_response_digest(
+                hold, entry, claim_instance, now
+            )
             db.execute(
                 "UPDATE spend_hold_workers SET state='claimed', claim_instance=?, "
-                "claimed_at=?, updated_at=? WHERE hold_id=? AND worker_keyid=?",
-                (claim_instance, now, now, hold_id, worker_keyid),
+                "claim_response_sha256=?, claimed_at=?, updated_at=? "
+                "WHERE hold_id=? AND worker_keyid=?",
+                (claim_instance, claim_digest, now, now, hold_id, worker_keyid),
             )
             self._assert_spend_hold_in(db, hold_id)
             return self._spend_status_in(db, hold_id)
@@ -2496,42 +2708,97 @@ class LedgerStore:
 
     def settle_spend_usage(
         self,
-        hold_id: str,
-        worker_keyid: str,
-        cumulative_prompt_tokens: int,
-        cumulative_generated_tokens: int,
+        receipt: Mapping[str, Any],
+        signature: str,
         *,
-        final: bool = False,
-        final_receipt_id: str | None = None,
+        relayer_keyid: str,
     ) -> dict[str, Any]:
-        """Price cumulative usage and atomically move only its new delta.
+        """Verify and settle exactly one signed, cumulative v2 worker receipt."""
+        if not isinstance(receipt, Mapping):
+            raise LedgerValueError("usage receipt must be an object")
+        if set(receipt) != SPEND_USAGE_FIELDS:
+            missing = sorted(SPEND_USAGE_FIELDS - set(receipt))
+            unknown = sorted(set(receipt) - SPEND_USAGE_FIELDS)
+            detail = f"missing {missing[0]!r}" if missing else f"unknown {unknown[0]!r}"
+            raise LedgerValueError(f"strict v2 usage receipt schema: {detail}")
+        if (
+            isinstance(receipt["v"], bool)
+            or not isinstance(receipt["v"], int)
+            or receipt["v"] != 2
+            or receipt["kind"] != "nakshatra-worker-usage"
+        ):
+            raise LedgerValueError("spend settlement accepts only v2 worker usage receipts")
 
-        N2 will put strict signed receipt validation and sequence handling in
-        front of this accounting transition.  N1 intentionally accepts only
-        already-resolved hold and worker identities.
-        """
-        hold_id = _identifier(hold_id, "hold_id")
-        worker_keyid = _identifier(worker_keyid, "worker_keyid")
-        cumulative_prompt_tokens = _nonnegative_integer(
-            cumulative_prompt_tokens, "cumulative_prompt_tokens"
-        )
-        cumulative_generated_tokens = _nonnegative_integer(
-            cumulative_generated_tokens, "cumulative_generated_tokens"
-        )
-        if not isinstance(final, bool):
+        hold_id = _identifier(receipt["hold_id"], "hold_id")
+        worker_keyid = _identifier(receipt["worker_keyid"], "worker_keyid")
+        if re.fullmatch(r"[0-9a-f]{64}", worker_keyid) is None:
+            raise LedgerValueError("worker_keyid must be a lowercase Ed25519 public key")
+        payer_keyid = _identifier(receipt["payer_keyid"], "payer_keyid")
+        for field in (
+            "payer_account_at_authorize", "worker_account_at_authorize",
+            "session_id", "model_id", "billing_mode", "termination",
+        ):
+            _identifier(receipt[field], field)
+        if not isinstance(receipt["billable"], bool):
+            raise LedgerValueError("billable must be a boolean")
+        if not isinstance(receipt["final"], bool):
             raise LedgerValueError("final must be a boolean")
-        if final_receipt_id is not None:
-            final_receipt_id = _identifier(final_receipt_id, "final_receipt_id")
-        if not final and final_receipt_id is not None:
-            raise LedgerValueError("final_receipt_id requires final=true")
+        integers = {}
+        for field in (
+            "layer_start", "layer_end", "sequence", "cumulative_prompt_tokens",
+            "cumulative_generated_tokens", "cumulative_token_layers",
+            "cumulative_cost", "work_completed_at",
+        ):
+            integers[field] = _nonnegative_integer(receipt[field], field)
+        if integers["layer_end"] <= integers["layer_start"]:
+            raise LedgerValueError("layer_end must be greater than layer_start")
+        if integers["sequence"] == 0:
+            raise LedgerValueError("sequence must be positive")
+        self._strict_sha256(receipt["claim_response_sha256"], "claim_response_sha256")
+        self._strict_sha256(receipt["output_sha256"], "output_sha256", empty_ok=True)
+        receipt_id = self._strict_sha256(
+            receipt["receipt_id"], "receipt_id", prefixed=True
+        )
+        expected_id = self.spend_receipt_id(receipt)
+        if receipt_id != expected_id:
+            raise LedgerValueError("receipt_id does not match the v2 domain hash")
+        if not isinstance(signature, str) or re.fullmatch(r"[0-9a-f]{128}", signature) is None:
+            raise LedgerValueError("signature must be 64-byte lowercase hex")
+        canonical = json.dumps(
+            dict(receipt), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        try:
+            ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(worker_keyid)).verify(
+                bytes.fromhex(signature), canonical.encode("utf-8")
+            )
+        except (InvalidSignature, ValueError) as exc:
+            raise LedgerValueError("worker usage receipt signature is invalid") from exc
+        relayer_keyid = _identifier(relayer_keyid, "relayer_keyid")
+        if relayer_keyid not in {worker_keyid, payer_keyid}:
+            raise SpendStateError("relayer is neither the worker nor payer")
+        receipt_json = canonical
 
         def operation(db: sqlite3.Connection) -> dict[str, Any] | SpendExpired:
             now = self._now()
+            existing = db.execute(
+                "SELECT receipt_json, signature, accepted_delta, hold_id "
+                "FROM spend_usage_receipts WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["receipt_json"] != receipt_json or existing["signature"] != signature:
+                    raise SpendConflict("receipt_id already has different receipt bytes")
+                result = self._spend_status_in(db, str(existing["hold_id"]))
+                result.update(
+                    receipt_id=receipt_id,
+                    accepted_delta=int(existing["accepted_delta"]),
+                    replayed=True,
+                )
+                return result
+
             self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
-                "SELECT payer_account_at_authorize, escrow_account, state, "
-                "settlement_deadline FROM spend_holds WHERE hold_id=?",
-                (hold_id,),
+                "SELECT * FROM spend_holds WHERE hold_id=?", (hold_id,)
             ).fetchone()
             if hold is None:
                 raise SpendStateError(f"spend hold {hold_id!r} does not exist")
@@ -2541,112 +2808,145 @@ class LedgerStore:
             ).fetchone()
             if entry is None:
                 raise SpendStateError("worker is not part of the spend hold")
+            same_sequence = db.execute(
+                "SELECT receipt_id FROM spend_usage_receipts "
+                "WHERE hold_id=? AND worker_keyid=? AND sequence=?",
+                (hold_id, worker_keyid, integers["sequence"]),
+            ).fetchone()
+            if same_sequence is not None:
+                raise SpendConflict("receipt sequence already has a different receipt")
             if self._spend_lifecycle_expired_in(db, hold_id, worker_keyid):
                 return SpendExpired("spend hold deadline has expired")
-            if entry["state"] == "final":
-                same = (
-                    int(entry["cumulative_prompt_tokens"])
-                    == cumulative_prompt_tokens
-                    and int(entry["cumulative_generated_tokens"])
-                    == cumulative_generated_tokens
-                    and final
-                    and entry["final_receipt_id"] == final_receipt_id
-                )
-                if same:
-                    result = self._spend_status_in(db, hold_id)
-                    result["accepted_delta"] = 0
-                    return result
-                raise SpendStateError("worker entry is already final")
             if hold["state"] not in {"open", "closing"}:
                 raise SpendStateError(f"spend hold is {hold['state']}")
             if now >= int(hold["settlement_deadline"]):
                 raise SpendStateError("spend settlement deadline has passed")
-            if entry["state"] != "claimed":
+            if entry["state"] != "claimed" or bool(entry["final"]):
                 raise SpendStateError(f"worker entry is {entry['state']}")
+
+            immutable = {
+                "claim_response_sha256": entry["claim_response_sha256"],
+                "payer_keyid": hold["payer_keyid"],
+                "payer_account_at_authorize": hold["payer_account_at_authorize"],
+                "worker_keyid": entry["worker_keyid"],
+                "worker_account_at_authorize": entry["worker_account_at_authorize"],
+                "billable": bool(entry["billable"]),
+                "session_id": hold["session_id"],
+                "model_id": hold["model_id"],
+                "billing_mode": hold["billing_mode"],
+                "layer_start": int(entry["layer_start"]),
+                "layer_end": int(entry["layer_end"]),
+            }
+            for field, expected in immutable.items():
+                if receipt[field] != expected:
+                    raise SpendConflict(f"receipt {field} differs from the hold snapshot")
+            if entry["claim_response_sha256"] is None:
+                raise SpendStateError("worker entry has no durable claim response")
+            if integers["work_completed_at"] > int(hold["execution_deadline"]):
+                raise SpendExpired("receipt work completed after the execution deadline")
+            if integers["work_completed_at"] < int(entry["claimed_at"]):
+                raise SpendConflict("receipt predates the worker claim")
+
+            old_sequence = int(entry["receipt_sequence"])
+            if integers["sequence"] != old_sequence + 1:
+                raise SpendConflict("receipt sequence is not strictly increasing")
             old_prompt = int(entry["cumulative_prompt_tokens"])
             old_generated = int(entry["cumulative_generated_tokens"])
-            if old_prompt and cumulative_prompt_tokens != old_prompt:
+            prompt = integers["cumulative_prompt_tokens"]
+            generated = integers["cumulative_generated_tokens"]
+            if old_sequence and prompt != old_prompt:
                 raise SpendConflict("prompt token count is immutable after first usage")
-            if cumulative_prompt_tokens < old_prompt:
-                raise SpendConflict("prompt token count regressed")
-            if cumulative_generated_tokens < old_generated:
-                raise SpendConflict("generated token count regressed")
-            if cumulative_prompt_tokens > int(entry["max_prompt_tokens"]):
+            if prompt < old_prompt or generated < old_generated:
+                raise SpendConflict("cumulative usage regressed")
+            if prompt > int(entry["max_prompt_tokens"]):
                 raise CreditLimitError("prompt token cap exceeded")
-            if cumulative_generated_tokens > int(entry["max_output_tokens"]):
+            if generated > int(entry["max_output_tokens"]):
                 raise CreditLimitError("output token cap exceeded")
-            cumulative_token_layers = _bounded_product(
-                cumulative_prompt_tokens + cumulative_generated_tokens,
-                int(entry["layers"]),
+            token_layers = _bounded_product(
+                prompt + generated, int(entry["layers"]),
                 name="cumulative_token_layers",
             )
-            cumulative_cost = (
-                _bounded_product(
-                    cumulative_token_layers,
-                    int(entry["price_multiplier"]),
-                    name="cumulative_cost",
-                )
-                if bool(entry["billable"])
-                else 0
+            cost = (
+                _bounded_product(token_layers, int(entry["price_multiplier"]),
+                                 name="cumulative_cost")
+                if bool(entry["billable"]) else 0
             )
-            if cumulative_token_layers > int(entry["max_token_layers"]):
-                raise CreditLimitError("token-layer cap exceeded")
-            if cumulative_cost > int(entry["max_cost"]):
-                raise CreditLimitError("entry cost cap exceeded")
+            if integers["cumulative_token_layers"] != token_layers:
+                raise SpendConflict("cumulative_token_layers does not match hold pricing")
+            if integers["cumulative_cost"] != cost:
+                raise SpendConflict("cumulative_cost does not match hold pricing")
+            if token_layers > int(entry["max_token_layers"]) or cost > int(entry["max_cost"]):
+                raise CreditLimitError("entry cumulative charge exceeds its cap")
             old_cost = int(entry["cumulative_cost"])
-            if cumulative_cost < old_cost:
+            unchanged = (
+                prompt == old_prompt and generated == old_generated
+                and token_layers == int(entry["cumulative_token_layers"])
+                and cost == old_cost
+            )
+            if unchanged:
+                if old_sequence == 0 or not receipt["final"]:
+                    raise SpendConflict(
+                        "only a nonfinal-to-final receipt may leave meters unchanged"
+                    )
+            elif prompt + generated <= old_prompt + old_generated:
+                raise SpendConflict("cumulative meter did not strictly increase")
+            delta = cost - old_cost
+            if delta < 0:
                 raise SpendConflict("cumulative cost regressed")
-            delta = cumulative_cost - old_cost
             worker_account = str(entry["worker_account_at_authorize"])
-            if delta:
-                if self._balance_in(db, str(hold["escrow_account"])) < delta:
-                    raise LedgerError("spend hold is undercollateralized")
-                self._move_spend_value(
-                    db,
-                    source=str(hold["escrow_account"]),
-                    destination=worker_account,
-                    amount=delta,
-                    timestamp=now,
-                    debit_kind="spend_settle_debit",
-                    credit_kind="spend_earn",
-                    event_id=(
-                        f"spend-settle:{hold_id}:{worker_keyid}:"
-                        f"{cumulative_prompt_tokens}:{cumulative_generated_tokens}"
-                    ),
-                    detail={
-                        "hold_id": hold_id,
-                        "worker_keyid": worker_keyid,
-                        "prompt_tokens": cumulative_prompt_tokens,
-                        "generated_tokens": cumulative_generated_tokens,
-                        "token_layers": cumulative_token_layers,
-                        "cumulative_cost": cumulative_cost,
-                    },
-                )
-            state = "final" if final else "claimed"
+            if delta and self._balance_in(db, str(hold["escrow_account"])) < delta:
+                raise LedgerError("spend hold is undercollateralized")
+            debit_seq, credit_seq = self._move_spend_value(
+                db,
+                source=str(hold["escrow_account"]),
+                destination=worker_account,
+                amount=delta,
+                timestamp=now,
+                debit_kind="spend_settle_debit",
+                credit_kind="spend_earn",
+                event_id=receipt_id,
+                detail={
+                    "hold_id": hold_id,
+                    "worker_keyid": worker_keyid,
+                    "sequence": integers["sequence"],
+                    "cumulative_cost": cost,
+                },
+            )
             db.execute(
-                "UPDATE spend_hold_workers SET state=?, "
-                "cumulative_prompt_tokens=?, cumulative_generated_tokens=?, "
-                "cumulative_token_layers=?, cumulative_cost=?, final=?, "
-                "final_receipt_id=?, finalized_at=?, updated_at=? "
-                "WHERE hold_id=? AND worker_keyid=?",
-                (
-                    state,
-                    cumulative_prompt_tokens,
-                    cumulative_generated_tokens,
-                    cumulative_token_layers,
-                    cumulative_cost,
-                    int(final),
-                    final_receipt_id,
-                    now if final else None,
-                    now,
-                    hold_id,
-                    worker_keyid,
-                ),
+                "INSERT INTO spend_usage_receipts(receipt_id, hold_id, worker_keyid, "
+                "sequence, receipt_json, signature, cumulative_prompt_tokens, "
+                "cumulative_generated_tokens, cumulative_token_layers, cumulative_cost, "
+                "accepted_delta, final, debit_journal_seq, credit_journal_seq, accepted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (receipt_id, hold_id, worker_keyid, integers["sequence"], receipt_json,
+                 signature, prompt, generated, token_layers, cost, delta,
+                 int(receipt["final"]), debit_seq, credit_seq, now),
+            )
+            db.execute(
+                "INSERT INTO spend_economic_receipts(receipt_id, hold_id, payer_account, "
+                "worker_account, amount, funded, earned_at, debit_journal_seq, "
+                "credit_journal_seq) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                (receipt_id, hold_id, hold["payer_account_at_authorize"], worker_account,
+                 delta, now, debit_seq, credit_seq),
+            )
+            state = "final" if receipt["final"] else "claimed"
+            db.execute(
+                "UPDATE spend_hold_workers SET state=?, receipt_sequence=?, "
+                "last_receipt_id=?, cumulative_prompt_tokens=?, "
+                "cumulative_generated_tokens=?, cumulative_token_layers=?, "
+                "cumulative_cost=?, final=?, final_receipt_id=?, finalized_at=?, "
+                "updated_at=? WHERE hold_id=? AND worker_keyid=?",
+                (state, integers["sequence"], receipt_id, prompt, generated,
+                 token_layers, cost, int(receipt["final"]),
+                 receipt_id if receipt["final"] else None,
+                 now if receipt["final"] else None, now, hold_id, worker_keyid),
             )
             self._finish_spend_hold_if_ready(db, hold_id, now)
             self._assert_spend_hold_in(db, hold_id)
             result = self._spend_status_in(db, hold_id)
-            result["accepted_delta"] = delta
+            result.update(
+                receipt_id=receipt_id, accepted_delta=delta, replayed=False
+            )
             return result
 
         result = self._tx(operation)
@@ -2776,6 +3076,7 @@ class LedgerStore:
                 "terminal_at=?, updated_at=? WHERE hold_id=?",
                 (now, now, hold_id),
             )
+            self._anchor_spend_economics_in(db, hold_id, now)
             self._assert_spend_hold_in(db, hold_id)
             return self._spend_status_in(db, hold_id)
 
@@ -2890,7 +3191,7 @@ class LedgerStore:
     def dispute(self, receipt_id: str) -> bool:
         """Reverse a receipt once while retaining its permanent receipt row."""
         receipt_id = _identifier(receipt_id, "receipt_id")
-        now = int(time.time())
+        now = self._now()
 
         def operation(db: sqlite3.Connection) -> bool:
             row = db.execute(
@@ -2899,6 +3200,13 @@ class LedgerStore:
             ).fetchone()
             if row is None or row["state"] == "disputed":
                 return False
+            maturity = db.execute(
+                "SELECT MIN(matures_at) FROM economic_receipts "
+                "WHERE namespace='v1' AND receipt_id=?",
+                (receipt_id,),
+            ).fetchone()[0]
+            if maturity is not None and now > int(maturity):
+                raise ReceiptStateError("receipt dispute window has matured")
             requester = row["requester"]
             credited = json.loads(row["credited"])
             charged = int(row["charged"])
@@ -2933,6 +3241,74 @@ class LedgerStore:
             return True
 
         return self._tx(operation)
+
+    def dispute_spend_hold(self, hold_id: str) -> bool:
+        """Claw back a terminal spend hold through its inclusive maturity boundary."""
+        hold_id = _identifier(hold_id, "hold_id")
+
+        def operation(db: sqlite3.Connection) -> bool:
+            now = self._now()
+            hold = db.execute(
+                "SELECT payer_account_at_authorize, state, terminal_at "
+                "FROM spend_holds WHERE hold_id=?",
+                (hold_id,),
+            ).fetchone()
+            if hold is None:
+                raise SpendStateError(f"spend hold {hold_id!r} does not exist")
+            if hold["state"] == "disputed":
+                return False
+            if hold["state"] not in {"settled", "expired", "cancelled"}:
+                raise SpendStateError("spend hold is not terminal")
+            terminal_at = int(hold["terminal_at"])
+            if now > terminal_at + HOLD_S:
+                raise SpendStateError("spend dispute window has matured")
+            rows = db.execute(
+                "SELECT receipt_id, worker_account, amount FROM spend_economic_receipts "
+                "WHERE hold_id=? AND dispute_state='none' ORDER BY receipt_id",
+                (hold_id,),
+            ).fetchall()
+            for row in rows:
+                amount = int(row["amount"])
+                self._move_spend_value(
+                    db,
+                    source=str(row["worker_account"]),
+                    destination=str(hold["payer_account_at_authorize"]),
+                    amount=amount,
+                    timestamp=now,
+                    debit_kind="spend_dispute_clawback",
+                    credit_kind="spend_dispute_refund",
+                    event_id=f"spend-dispute:{row['receipt_id']}",
+                    detail={"hold_id": hold_id, "receipt_id": row["receipt_id"]},
+                )
+            db.execute(
+                "UPDATE spend_economic_receipts SET dispute_state='clawed_back' "
+                "WHERE hold_id=? AND dispute_state='none'",
+                (hold_id,),
+            )
+            db.execute(
+                "UPDATE spend_holds SET state='disputed', updated_at=? WHERE hold_id=?",
+                (now, hold_id),
+            )
+            self._assert_spend_hold_in(db, hold_id)
+            return True
+
+        return self._tx(operation)
+
+    def economic_receipts(self, account: str | None = None) -> list[dict[str, Any]]:
+        """Return the normalized read model shared by maturity consumers and S6."""
+        with self._lock:
+            if account is None:
+                rows = self._db.execute(
+                    "SELECT * FROM economic_receipts ORDER BY economic_id"
+                ).fetchall()
+            else:
+                account = _identifier(account, "account")
+                rows = self._db.execute(
+                    "SELECT * FROM economic_receipts WHERE worker_account=? "
+                    "ORDER BY economic_id",
+                    (account,),
+                ).fetchall()
+        return [dict(row) for row in rows]
 
     def balance(self, account: str) -> int:
         account = _identifier(account, "account")

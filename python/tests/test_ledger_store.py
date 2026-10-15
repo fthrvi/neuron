@@ -580,7 +580,7 @@ def test_unfunded_earnings_are_never_withdrawable(tmp_path, monkeypatch):
         _assert_zero_sum(store)
 
 
-def test_funded_earnings_mature_after_hold_and_dispute_removes_them(
+def test_funded_earnings_use_strict_maturity_and_inclusive_dispute_boundary(
     tmp_path, monkeypatch
 ):
     clock = [2_000_000]
@@ -595,10 +595,16 @@ def test_funded_earnings_mature_after_hold_and_dispute_removes_them(
         assert store.withdrawable("worker") == 0
 
         clock[0] += HOLD_S
-        assert store.withdrawable("worker") == 40
+        assert store.withdrawable("worker") == 0
         assert store.dispute("funded") is True
         _assert_zero_sum(store)
         assert store.withdrawable("worker") == 0
+
+        store.settle("funded-after", "consumer", {"worker": 40}, 40, "self")
+        clock[0] += HOLD_S + 1
+        assert store.withdrawable("worker") == 40
+        with pytest.raises(ReceiptStateError, match="matured"):
+            store.dispute("funded-after")
 
 
 def test_withdraw_hold_release_and_finalize_preserve_zero_sum(tmp_path):

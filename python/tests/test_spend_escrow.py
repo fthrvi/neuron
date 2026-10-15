@@ -1,5 +1,6 @@
 """N1 spend escrow pricing, lifecycle, concurrency, and accounting tests."""
 import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -7,6 +8,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import core.ledger_store as ledger_store_module  # noqa: E402
@@ -30,14 +33,74 @@ from core.ledger_store import (  # noqa: E402
 )
 
 
+def _private(label):
+    return ed25519.Ed25519PrivateKey.from_private_bytes(
+        hashlib.sha256(label.encode()).digest()
+    )
+
+
+def _key(label):
+    return _private(label).public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+
+
 def _worker(key="worker-key", account="worker", start=0, end=4, price=2):
     return {
-        "worker_keyid": key,
+        "worker_keyid": _key(key),
         "worker_account": account,
         "layer_start": start,
         "layer_end": end,
         "price_multiplier": price,
     }
+
+
+def _signed_usage(store, hold_id, label, prompt, generated, *, final=False, **changes):
+    status = store.spend_status(hold_id)
+    worker_keyid = _key(label)
+    entry = next(item for item in status["workers"] if item["worker_keyid"] == worker_keyid)
+    layers = entry["layer_end"] - entry["layer_start"]
+    token_layers = (prompt + generated) * layers
+    cost = token_layers * entry["price_multiplier"] if entry["billable"] else 0
+    receipt = {
+        "v": 2,
+        "kind": "nakshatra-worker-usage",
+        "receipt_id": "",
+        "hold_id": hold_id,
+        "claim_response_sha256": entry["claim_response_sha256"],
+        "payer_keyid": status["payer_keyid"],
+        "payer_account_at_authorize": status["payer_account_at_authorize"],
+        "worker_keyid": worker_keyid,
+        "worker_account_at_authorize": entry["worker_account_at_authorize"],
+        "billable": entry["billable"],
+        "session_id": status["session_id"],
+        "model_id": status["model_id"],
+        "billing_mode": status["billing_mode"],
+        "layer_start": entry["layer_start"],
+        "layer_end": entry["layer_end"],
+        "sequence": entry["receipt_sequence"] + 1,
+        "cumulative_prompt_tokens": prompt,
+        "cumulative_generated_tokens": generated,
+        "cumulative_token_layers": token_layers,
+        "cumulative_cost": cost,
+        "work_completed_at": min(store._now(), status["execution_deadline"]),
+        "final": final,
+        "termination": "completed" if final else "checkpoint",
+        "output_sha256": "",
+    }
+    receipt.update(changes)
+    receipt["receipt_id"] = store.spend_receipt_id(receipt)
+    canonical = json.dumps(
+        receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    return receipt, _private(label).sign(canonical).hex()
+
+
+def _settle(store, hold_id, label, prompt, generated, *, final=False, **changes):
+    signed = _signed_usage(
+        store, hold_id, label, prompt, generated, final=final, **changes
+    )
+    return store.settle_spend_usage(*signed, relayer_keyid=_key(label))
 
 
 def _authorize(store, nonce="nonce", session="session", **overrides):
@@ -113,20 +176,18 @@ def test_prompt_output_pricing_settlement_and_release_are_zero_sum(tmp_path):
         assert hold["escrow_balance"] == 80
         assert store.balance("payer") == 920
 
-        store.claim_spend_worker(hold["hold_id"], "worker-key", "claim-1")
-        checkpoint = store.settle_spend_usage(hold["hold_id"], "worker-key", 3, 1)
+        store.claim_spend_worker(hold["hold_id"], _key("worker-key"), "claim-1")
+        checkpoint = _settle(store, hold["hold_id"], "worker-key", 3, 1)
         assert checkpoint["accepted_delta"] == (3 + 1) * 4 * 2
         assert store.balance("worker") == 32
         with pytest.raises(SpendConflict, match="prompt token count"):
-            store.settle_spend_usage(hold["hold_id"], "worker-key", 4, 1)
+            _settle(store, hold["hold_id"], "worker-key", 4, 1)
 
+        final_receipt = _signed_usage(
+            store, hold["hold_id"], "worker-key", 3, 2, final=True
+        )
         settled = store.settle_spend_usage(
-            hold["hold_id"],
-            "worker-key",
-            3,
-            2,
-            final=True,
-            final_receipt_id="receipt-final",
+            *final_receipt, relayer_keyid=_key("worker-key")
         )
         assert settled["accepted_delta"] == 8
         assert settled["state"] == "settled"
@@ -134,14 +195,10 @@ def test_prompt_output_pricing_settlement_and_release_are_zero_sum(tmp_path):
         assert store.balance("worker") == 40
         assert store.balance("payer") == 960
         replay = store.settle_spend_usage(
-            hold["hold_id"],
-            "worker-key",
-            3,
-            2,
-            final=True,
-            final_receipt_id="receipt-final",
+            *final_receipt, relayer_keyid="payer-key"
         )
-        assert replay["accepted_delta"] == 0
+        assert replay["accepted_delta"] == 8
+        assert replay["replayed"] is True
         _assert_zero_sum(store)
         _assert_spend_journals_zero_sum(store)
 
@@ -156,10 +213,8 @@ def test_payer_owned_entry_is_snapshotted_free_and_stays_zero(tmp_path):
         assert entry["billable"] is False
         assert entry["max_cost"] == 0
         assert hold["escrow_balance"] == 0
-        store.claim_spend_worker(hold["hold_id"], "worker-key", "claim")
-        result = store.settle_spend_usage(
-            hold["hold_id"], "worker-key", 5, 5, final=True
-        )
+        store.claim_spend_worker(hold["hold_id"], _key("worker-key"), "claim")
+        result = _settle(store, hold["hold_id"], "worker-key", 5, 5, final=True)
         assert result["accepted_delta"] == 0
         assert result["state"] == "settled"
         assert result["escrow_balance"] == 0
@@ -218,24 +273,22 @@ def test_abandon_releases_only_unclaimed_entry_and_claimed_release_is_deferred(
                 _worker(key="unused", account="worker-b", start=2, end=4, price=1),
             ],
         )
-        store.claim_spend_worker(hold["hold_id"], "claimed", "instance")
+        store.claim_spend_worker(hold["hold_id"], _key("claimed"), "instance")
         requested = store.request_spend_release(hold["hold_id"], "payer-key")
         assert requested["release_requested"] is True
         assert requested["state"] == "open"
         assert requested["escrow_balance"] == 40
 
         abandoned = store.abandon_spend_worker(
-            hold["hold_id"], "unused", "payer-key"
+            hold["hold_id"], _key("unused"), "payer-key"
         )
         assert abandoned["state"] == "open"
         assert abandoned["escrow_balance"] == 20
         assert store.abandon_spend_worker(
-            hold["hold_id"], "unused", "payer-key"
+            hold["hold_id"], _key("unused"), "payer-key"
         )["escrow_balance"] == 20
 
-        settled = store.settle_spend_usage(
-            hold["hold_id"], "claimed", 2, 1, final=True
-        )
+        settled = _settle(store, hold["hold_id"], "claimed", 2, 1, final=True)
         assert settled["state"] == "settled"
         assert settled["escrow_balance"] == 0
         assert store.balance("worker-a") == 6
@@ -342,7 +395,7 @@ def test_dispute_after_authorization_cannot_touch_escrow(tmp_path, monkeypatch):
     with LedgerStore(tmp_path / "ledger.db") as store:
         store.deposit("funding", "consumer", 100, 1)
         store.settle("earning", "consumer", {"payer": 100}, 100, "self")
-        clock[0] += HOLD_S + 1
+        clock[0] += HOLD_S
         hold = _authorize(
             store,
             max_prompt_tokens=100,
@@ -353,10 +406,8 @@ def test_dispute_after_authorization_cannot_touch_escrow(tmp_path, monkeypatch):
         assert store.dispute("earning") is True
         assert store.balance("payer") == -100
         assert store.spend_status(hold["hold_id"])["escrow_balance"] == 100
-        store.claim_spend_worker(hold["hold_id"], "worker-key", "claim")
-        result = store.settle_spend_usage(
-            hold["hold_id"], "worker-key", 100, 0, final=True
-        )
+        store.claim_spend_worker(hold["hold_id"], _key("worker-key"), "claim")
+        result = _settle(store, hold["hold_id"], "worker-key", 100, 0, final=True)
         assert result["state"] == "settled"
         assert result["escrow_balance"] == 0
         assert store.balance("worker") == 100
@@ -433,7 +484,7 @@ def test_release_and_two_deadline_expiry_leave_closed_accounts_empty(
                 _worker(key="unused", account="worker-b", start=2, end=4, price=1),
             ],
         )
-        store.claim_spend_worker(closing["hold_id"], "claimed", "instance")
+        store.claim_spend_worker(closing["hold_id"], _key("claimed"), "instance")
         clock[0] += SPEND_EXECUTION_S
         assert closing["hold_id"] in store.expire_spend_holds()
         status = store.spend_status(closing["hold_id"])
@@ -471,14 +522,12 @@ def test_overdue_partial_run_expires_before_late_abandon(tmp_path):
                 _worker(key="unused", account="worker-b", start=2, end=4, price=1),
             ],
         )
-        store.claim_spend_worker(hold["hold_id"], "finished", "instance")
-        store.settle_spend_usage(
-            hold["hold_id"], "finished", 1, 0, final=True
-        )
+        store.claim_spend_worker(hold["hold_id"], _key("finished"), "instance")
+        _settle(store, hold["hold_id"], "finished", 1, 0, final=True)
         clock[0] = hold["settlement_deadline"] + 1
 
         with pytest.raises(SpendExpired, match="deadline has expired"):
-            store.abandon_spend_worker(hold["hold_id"], "unused", "payer-key")
+            store.abandon_spend_worker(hold["hold_id"], _key("unused"), "payer-key")
 
         result = store.spend_status(hold["hold_id"])
         assert result["state"] == "expired"
@@ -495,20 +544,20 @@ def test_late_lifecycle_request_and_retry_raise_same_expiry_error(tmp_path, acti
     with LedgerStore(tmp_path / f"{action}.db", clock=lambda: clock[0]) as store:
         hold = _authorize(store)
         if action == "settle":
-            store.claim_spend_worker(hold["hold_id"], "worker-key", "instance")
+            store.claim_spend_worker(hold["hold_id"], _key("worker-key"), "instance")
         clock[0] = hold["settlement_deadline"]
 
         if action == "claim":
             operation = lambda: store.claim_spend_worker(
-                hold["hold_id"], "worker-key", "late-instance"
+                hold["hold_id"], _key("worker-key"), "late-instance"
             )
         elif action == "settle":
-            operation = lambda: store.settle_spend_usage(
-                hold["hold_id"], "worker-key", 1, 0, final=True
+            operation = lambda: _settle(
+                store, hold["hold_id"], "worker-key", 1, 0, final=True
             )
         else:
             operation = lambda: store.abandon_spend_worker(
-                hold["hold_id"], "worker-key", "payer-key"
+                hold["hold_id"], _key("worker-key"), "payer-key"
             )
 
         errors = []
@@ -578,7 +627,7 @@ def test_claim_samples_time_after_begin_immediate(tmp_path):
                 clock,
                 hold["execution_deadline"] + 1,
                 lambda: store.claim_spend_worker(
-                    hold["hold_id"], "worker-key", "late-instance"
+                    hold["hold_id"], _key("worker-key"), "late-instance"
                 ),
             )
         result = store.spend_status(hold["hold_id"])
@@ -591,7 +640,7 @@ def test_settle_samples_time_after_begin_immediate(tmp_path):
     clock = [7_000_000]
     with _TransactionSignallingStore(path, clock=lambda: clock[0]) as store:
         hold = _authorize(store)
-        store.claim_spend_worker(hold["hold_id"], "worker-key", "instance")
+        store.claim_spend_worker(hold["hold_id"], _key("worker-key"), "instance")
         clock[0] = hold["settlement_deadline"] - 1
         with pytest.raises(SpendExpired, match="deadline has expired"):
             _run_after_blocked_begin(
@@ -599,8 +648,8 @@ def test_settle_samples_time_after_begin_immediate(tmp_path):
                 path,
                 clock,
                 hold["settlement_deadline"] + 1,
-                lambda: store.settle_spend_usage(
-                    hold["hold_id"], "worker-key", 1, 0, final=True
+                lambda: _settle(
+                    store, hold["hold_id"], "worker-key", 1, 0, final=True
                 ),
             )
         assert store.spend_status(hold["hold_id"])["state"] == "expired"
@@ -627,7 +676,7 @@ def test_abandon_and_release_sample_time_after_begin_immediate(tmp_path, action)
         def operation():
             if action == "abandon":
                 return store.abandon_spend_worker(
-                    hold["hold_id"], "worker-key", "payer-key"
+                    hold["hold_id"], _key("worker-key"), "payer-key"
                 )
             return store.request_spend_release(hold["hold_id"], "payer-key")
 
@@ -658,7 +707,7 @@ def test_expiry_samples_time_after_begin_immediate(tmp_path):
     clock = [9_000_000]
     with _TransactionSignallingStore(path, clock=lambda: clock[0]) as store:
         hold = _authorize(store)
-        store.claim_spend_worker(hold["hold_id"], "worker-key", "instance")
+        store.claim_spend_worker(hold["hold_id"], _key("worker-key"), "instance")
         clock[0] = hold["execution_deadline"] - 1
         result = _run_after_blocked_begin(
             store,
@@ -780,7 +829,7 @@ def test_expiry_sweep_does_not_process_one_hold_at_both_deadlines(tmp_path):
             store, nonce="a", session="a", hold_id="a"
         )
         _authorize(store, nonce="b", session="b", hold_id="b")
-        store.claim_spend_worker(first["hold_id"], "worker-key", "instance")
+        store.claim_spend_worker(first["hold_id"], _key("worker-key"), "instance")
         clock[0] = first["execution_deadline"]
 
         affected = store.expire_spend_holds(batch_size=1)

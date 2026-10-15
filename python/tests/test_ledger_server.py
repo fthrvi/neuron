@@ -199,6 +199,7 @@ def v2_identities(tmp_path):
 def _v2_receipt(run_id="run-1", tokens=(1, 2), *, stages=None):
     generated = list(tokens)
     return {
+        "v": 1,
         "run_id": run_id,
         "n_generated": len(generated),
         "generated_tokens": generated,
@@ -371,7 +372,7 @@ def test_v2_valid_receipt_settles_and_replay_is_idempotent(
 ):
     base, service = v2_server
     receipt = _sign_receipt(_v2_receipt(), v2_identities)
-    payload = {"receipt": receipt, "requester": "mallory"}
+    payload = {"receipt": receipt}
     first_code, first = _v2_request(
         base, "POST", "/settle", v2_identities["alice"], payload,
         timestamp=timestamps.next(),

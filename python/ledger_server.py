@@ -296,8 +296,12 @@ class V2LedgerService:
         keyid: str,
         roster: Mapping[str, Mapping[str, object]],
     ) -> dict[str, object]:
-        if not isinstance(body, dict) or not isinstance(body.get("receipt"), dict):
-            raise ReceiptError("body.receipt must be an object")
+        if (
+            not isinstance(body, dict)
+            or set(body) != {"receipt"}
+            or not isinstance(body.get("receipt"), dict)
+        ):
+            raise ReceiptError("legacy settle body must contain exactly receipt")
         requester, tier = _row_identity(keyid, roster)
         receipt_id, credited, charged = verify_receipt(body["receipt"], keyid, roster)
         delta = self.store.settle(

@@ -213,12 +213,17 @@ def _output_sha256(tokens: list[int]) -> str:
 def _validated_receipt(receipt: dict) -> tuple[str, int, str, list[tuple[str, int, int]]]:
     if not isinstance(receipt, dict):
         raise ReceiptError("receipt must be an object")
-    missing = [
-        key for key in ("run_id", "n_generated", "generated_tokens", "output_sha256", "chain")
-        if key not in receipt
-    ]
-    if missing:
-        raise ReceiptError(f"receipt missing field: {missing[0]}")
+    fields = {
+        "v", "run_id", "n_generated", "generated_tokens", "output_sha256",
+        "chain", "worker_signatures",
+    }
+    if set(receipt) != fields:
+        missing = sorted(fields - set(receipt))
+        unknown = sorted(set(receipt) - fields)
+        detail = f"missing field: {missing[0]}" if missing else f"unknown field: {unknown[0]}"
+        raise ReceiptError(f"strict legacy-v1 receipt {detail}")
+    if isinstance(receipt["v"], bool) or not isinstance(receipt["v"], int) or receipt["v"] != 1:
+        raise ReceiptError("legacy settle accepts only receipt v=1")
 
     run_id = receipt["run_id"]
     if not isinstance(run_id, str) or not run_id:
@@ -247,6 +252,10 @@ def _validated_receipt(receipt: dict) -> tuple[str, int, str, list[tuple[str, in
     for index, stage in enumerate(raw_chain):
         if not isinstance(stage, dict):
             raise ReceiptError(f"chain[{index}] must be an object")
+        required_stage = {"node_id", "layer_start", "layer_end"}
+        allowed_stage = required_stage | {"spki_hash"}
+        if not required_stage <= set(stage) or not set(stage) <= allowed_stage:
+            raise ReceiptError(f"chain[{index}] has a non-v1 schema")
         node_id = stage.get("node_id")
         if not isinstance(node_id, str) or not node_id:
             raise ReceiptError(f"chain[{index}].node_id must be a non-empty string")
@@ -271,9 +280,13 @@ def _validated_receipt(receipt: dict) -> tuple[str, int, str, list[tuple[str, in
         if next_start != end:
             raise ReceiptError("layer map contains a gap or overlap")
 
-    signatures = receipt.get("worker_signatures", [])
-    if signatures is not None and not isinstance(signatures, list):
+    signatures = receipt["worker_signatures"]
+    if not isinstance(signatures, list):
         raise ReceiptError("worker_signatures must be a list")
+    signature_fields = {"node_id", "pubkey", "sig", "layer_start", "layer_end"}
+    for index, signature in enumerate(signatures):
+        if not isinstance(signature, dict) or set(signature) != signature_fields:
+            raise ReceiptError(f"worker_signatures[{index}] has a non-v1 schema")
     return run_id, n_generated, output_hash, chain
 
 
@@ -296,6 +309,8 @@ def _valid_participation(
     roster: Mapping[str, Mapping[str, object]],
 ) -> tuple[str, str, int, int] | None:
     if not isinstance(entry, dict):
+        return None
+    if set(entry) != {"node_id", "pubkey", "sig", "layer_start", "layer_end"}:
         return None
     try:
         node_id = entry["node_id"]

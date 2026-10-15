@@ -391,7 +391,10 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
             ).run()
             final_report = final_envelope["report"]
             assert final_report["ok"] is True
-            assert final_report["checks"][-1] == {
+            assert next(
+                check for check in final_report["checks"]
+                if check["id"] == "finalized_withdrawals"
+            ) == {
                 "id": "finalized_withdrawals",
                 "ok": True,
                 "verification": "all",

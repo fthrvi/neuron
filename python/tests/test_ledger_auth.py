@@ -55,6 +55,7 @@ def _receipt(run_id="run-1", tokens=(10, 11, 12, 13)):
         ",".join(str(token) for token in generated).encode("utf-8")
     ).hexdigest()
     return {
+        "v": 1,
         "run_id": run_id,
         "n_generated": len(generated),
         "generated_tokens": generated,
