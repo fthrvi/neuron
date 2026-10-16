@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -243,6 +244,8 @@ def test_terminal_anchored_maturity_withdrawal_boundary_and_restricted_capacity(
         with pytest.raises(CreditLimitError):
             store.withdraw_hold("worker", 1_000_000, "address", "at-boundary")
         assert store.dispute_spend_hold(hold["hold_id"]) is True
+        store.deposit("worker-independent", "worker", 500, 2)
+        assert store.eligible_spend_capacity("worker", "stranger") == 1_000_500
 
     # A separate earning proves strictly-after withdrawal without being clawed back.
     clock[0] = 2_000_000
@@ -263,6 +266,43 @@ def test_terminal_anchored_maturity_withdrawal_boundary_and_restricted_capacity(
             store.dispute_spend_hold(hold["hold_id"])
 
 
+def test_namespace_eligibility_matches_legacy_base_at_exact_hold_boundary(tmp_path):
+    clock = [3_000_000]
+    with LedgerStore(tmp_path / "boundary.db", clock=lambda: clock[0]) as store:
+        store.deposit("legacy-funding", "legacy-payer", 100, 1)
+        store.settle(
+            "legacy-earning", "legacy-payer", {"legacy-worker": 40}, 40, "self"
+        )
+        legacy_earned_at = clock[0]
+
+        store.deposit("v2-funding", "payer", 100, 2)
+        hold = _authorize(store, tokens=10)
+        _claim(store, hold["hold_id"])
+        terminal = _settle(
+            store, _receipt(store, hold["hold_id"], 3, 1, final=True)
+        )["terminal_at"]
+
+        clock[0] = legacy_earned_at + HOLD_S
+        assert store.withdrawable("legacy-worker") == 40  # 28952fb behavior
+        clock[0] = terminal + HOLD_S
+        assert store.withdrawable("worker") == 0
+        clock[0] += 1
+        assert store.withdrawable("worker") == 8
+
+
+def test_disputed_legacy_earning_is_not_double_restricted_from_capacity(tmp_path):
+    clock = [4_000_000]
+    with LedgerStore(tmp_path / "capacity.db", clock=lambda: clock[0]) as store:
+        store.deposit("payer-funding", "consumer", 100, 1)
+        store.settle("disputed", "consumer", {"worker": 100}, 100, "self")
+        assert store.dispute("disputed") is True
+        store.deposit("worker-funding", "worker", 500, 2)
+
+        assert store.balance("worker") == 500
+        assert store.withdrawable("worker") == 500
+        assert store.eligible_spend_capacity("worker", "stranger") == 1_000_500
+
+
 def _seed_reconcilable_spend(path):
     store = LedgerStore(path)
     store._db.execute(
@@ -274,6 +314,207 @@ def _seed_reconcilable_spend(path):
     _claim(store, hold["hold_id"])
     _settle(store, _receipt(store, hold["hold_id"], 3, 1, final=True))
     return store, hold
+
+
+def _run_s6_and_assert_kill(path, tmp_path, *, vault_amount=100):
+    config = _config(tmp_path)
+    _write_key(config.signing_key)
+    envelope, _ = Reconciler(
+        path,
+        FakeReconcileRPC({VAULT: vault_amount}),
+        config,
+        notify=lambda *_: {"attempted": False},
+    ).run()
+    assert envelope["report"]["outcome"] == "mismatch"
+    assert config.kill_file.is_file()
+    return envelope["report"]
+
+
+@pytest.mark.parametrize(
+    ("assignment", "value"),
+    [
+        ("receipt_sequence", 2),
+        ("last_receipt_id", "sha256:" + "1" * 64),
+        ("cumulative_prompt_tokens", 4),
+        ("cumulative_generated_tokens", 2),
+        ("cumulative_token_layers", 9),
+        ("cumulative_cost", 9),
+        ("final", 0),
+        ("final_receipt_id", "sha256:" + "2" * 64),
+    ],
+)
+def test_s6_entry_summary_is_derived_from_final_verified_receipt(
+    tmp_path, assignment, value
+):
+    path = tmp_path / f"summary-{assignment}.sqlite"
+    store, _hold = _seed_reconcilable_spend(path)
+    try:
+        store._db.execute(
+            f"UPDATE spend_hold_workers SET {assignment}=?", (value,)
+        )
+    finally:
+        store.close()
+
+    report = Reconciler(
+        path, FakeReconcileRPC({VAULT: 100}), _config(tmp_path)
+    ).collect()
+    assert report["outcome"] == "mismatch"
+    assert _check(report, "spend_usage_linkage")["ok"] is False
+
+
+def test_s6_entry_state_is_derived_from_final_verified_receipt(tmp_path):
+    path = tmp_path / "summary-state.sqlite"
+    store, _hold = _seed_reconcilable_spend(path)
+    try:
+        store._db.execute(
+            "UPDATE spend_hold_workers SET final=0, final_receipt_id=NULL, state='claimed'"
+        )
+    finally:
+        store.close()
+
+    report = Reconciler(
+        path, FakeReconcileRPC({VAULT: 100}), _config(tmp_path)
+    ).collect()
+    assert report["outcome"] == "mismatch"
+    assert _check(report, "spend_usage_linkage")["ok"] is False
+
+
+def test_s6_rejects_entry_summary_plus_unauthorized_release_bypass(tmp_path):
+    path = tmp_path / "entry-release-bypass.sqlite"
+    store = LedgerStore(path)
+    try:
+        store._db.execute(
+            "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
+            "VALUES ('payer', ?, 1)",
+            (VAULT,),
+        )
+        store.deposit_batch("payer", VAULT, [("deposit", 100 * 100, 1)], 100 * 100)
+        hold = _authorize(store)
+        _claim(store, hold["hold_id"])
+        _settle(store, _receipt(store, hold["hold_id"], 3, 1))
+
+        store._db.execute(
+            "UPDATE spend_hold_workers SET cumulative_cost=18 WHERE hold_id=?",
+            (hold["hold_id"],),
+        )
+        store._db.execute(
+            "UPDATE accounts SET balance=balance-10 WHERE id=?",
+            (hold["escrow_account"],),
+        )
+        store._db.execute("UPDATE accounts SET balance=balance+10 WHERE id='payer'")
+        event_id = f"spend-release:{hold['hold_id']}:settled"
+        detail = json.dumps(
+            {"hold_id": hold["hold_id"], "reason": "settled"},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        store._db.execute(
+            "INSERT INTO journal(ts, kind, receipt_id, account, counterparty, amount, detail) "
+            "VALUES (1, 'spend_release_debit', ?, ?, 'payer', -10, ?)",
+            (event_id, hold["escrow_account"], detail),
+        )
+        store._db.execute(
+            "INSERT INTO journal(ts, kind, receipt_id, account, counterparty, amount, detail) "
+            "VALUES (1, 'spend_release_credit', ?, 'payer', ?, 10, ?)",
+            (event_id, hold["escrow_account"], detail),
+        )
+        assert store._db.execute("SELECT SUM(balance) FROM accounts").fetchone()[0] == 0
+    finally:
+        store.close()
+
+    report = _run_s6_and_assert_kill(path, tmp_path)
+    assert _check(report, "spend_liabilities")["ok"] is False
+    assert _check(report, "spend_release_lifecycle")["ok"] is False
+
+
+def test_s6_rejects_release_amount_not_matching_lifecycle(tmp_path):
+    path = tmp_path / "release-amount.sqlite"
+    store, hold = _seed_reconcilable_spend(path)
+    try:
+        store._db.execute("DROP TRIGGER journal_no_update")
+        store._db.execute(
+            "UPDATE journal SET amount=CASE WHEN amount<0 THEN amount+1 ELSE amount-1 END "
+            "WHERE receipt_id=?",
+            (f"spend-release:{hold['hold_id']}:settled",),
+        )
+    finally:
+        store.close()
+
+    report = Reconciler(
+        path, FakeReconcileRPC({VAULT: 100}), _config(tmp_path)
+    ).collect()
+    assert report["outcome"] == "mismatch"
+    assert _check(report, "spend_release_lifecycle")["ok"] is False
+
+
+def test_legacy_funded_flag_flip_is_ineligible_and_kills_s6(tmp_path):
+    clock = [5_000_000]
+    path = tmp_path / "legacy-funded-bypass.sqlite"
+    with LedgerStore(path, clock=lambda: clock[0]) as store:
+        store.settle("unfunded", "consumer", {"worker": 50}, 50, "self")
+        clock[0] += HOLD_S + 1
+        assert store.withdrawable("worker") == 0
+        store._db.execute("DROP TRIGGER journal_no_update")
+        store._db.execute(
+            "UPDATE journal SET detail=? "
+            "WHERE receipt_id='unfunded' AND kind='earn'",
+            (json.dumps({"funded": True}, separators=(",", ":")),),
+        )
+        assert store.withdrawable("worker") == 0
+
+    report = _run_s6_and_assert_kill(path, tmp_path, vault_amount=0)
+    view = _check(report, "economic_receipt_view")
+    assert view["ok"] is False
+    assert any("funded marker" in error for error in view["errors"])
+
+
+def test_legacy_funding_requires_exact_receipt_journal_pair(tmp_path):
+    clock = [6_000_000]
+    path = tmp_path / "legacy-pair.sqlite"
+    with LedgerStore(path, clock=lambda: clock[0]) as store:
+        store._db.execute(
+            "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
+            "VALUES ('consumer', ?, 1)",
+            (VAULT,),
+        )
+        store.deposit_batch("consumer", VAULT, [("funding", 100, 1)], 100)
+        store.settle("earning", "consumer", {"worker": 40}, 40, "self")
+        clock[0] += HOLD_S
+        assert store.withdrawable("worker") == 40
+
+        store._db.execute("DROP TRIGGER journal_no_update")
+        store._db.execute(
+            "UPDATE journal SET amount=-39 WHERE receipt_id='earning' AND kind='spend'"
+        )
+        assert store.withdrawable("worker") == 0
+
+    report = Reconciler(
+        path, FakeReconcileRPC({VAULT: 1}), _config(tmp_path)
+    ).collect()
+    assert report["outcome"] == "mismatch"
+    view = _check(report, "economic_receipt_view")
+    assert any("exact earn/spend journal pair" in error for error in view["errors"])
+
+
+def test_s6_rejects_dispute_refund_not_matching_exact_receipt_amount(tmp_path):
+    path = tmp_path / "dispute-refund.sqlite"
+    store, hold = _seed_reconcilable_spend(path)
+    try:
+        assert store.dispute_spend_hold(hold["hold_id"]) is True
+        store._db.execute("DROP TRIGGER journal_no_update")
+        store._db.execute(
+            "UPDATE journal SET amount=amount+1 "
+            "WHERE kind='spend_dispute_refund'"
+        )
+    finally:
+        store.close()
+
+    report = Reconciler(
+        path, FakeReconcileRPC({VAULT: 100}), _config(tmp_path)
+    ).collect()
+    assert report["outcome"] == "mismatch"
+    view = _check(report, "economic_receipt_view")
+    assert any("equal-and-opposite" in error for error in view["errors"])
 
 
 def test_s6_detects_symmetric_double_accounting_mutation(tmp_path):
@@ -321,3 +562,37 @@ def test_s6_detects_symmetric_double_accounting_mutation(tmp_path):
     linkage = _check(report, "spend_usage_linkage")
     assert linkage["ok"] is False
     assert any("orphan or duplicate" in error for error in linkage["errors"])
+
+
+def test_s6_reconciles_10k_receipts_under_two_seconds(tmp_path):
+    path = tmp_path / "ten-thousand.sqlite"
+    with LedgerStore(path) as store:
+        store._db.execute(
+            "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
+            "VALUES ('payer', ?, 1)",
+            (VAULT,),
+        )
+        store.deposit_batch("payer", VAULT, [("deposit", 1_000_000, 1)], 1_000_000)
+        hold = _authorize(store, tokens=10_000)
+        _claim(store, hold["hold_id"])
+        for sequence in range(1, 10_001):
+            _settle(
+                store,
+                _receipt(
+                    store,
+                    hold["hold_id"],
+                    1,
+                    sequence - 1,
+                    final=sequence == 10_000,
+                ),
+            )
+
+    started = time.perf_counter()
+    report = Reconciler(
+        path, FakeReconcileRPC({VAULT: 10_000}), _config(tmp_path)
+    ).collect()
+    elapsed = time.perf_counter() - started
+
+    assert report["outcome"] == "match"
+    assert _check(report, "spend_usage_linkage")["checked"] == 10_000
+    assert elapsed < 2.0, f"10k-receipt S6 took {elapsed:.3f}s"

@@ -580,7 +580,7 @@ def test_unfunded_earnings_are_never_withdrawable(tmp_path, monkeypatch):
         _assert_zero_sum(store)
 
 
-def test_funded_earnings_use_strict_maturity_and_inclusive_dispute_boundary(
+def test_legacy_funded_earnings_use_inclusive_maturity_and_dispute_boundary(
     tmp_path, monkeypatch
 ):
     clock = [2_000_000]
@@ -595,7 +595,10 @@ def test_funded_earnings_use_strict_maturity_and_inclusive_dispute_boundary(
         assert store.withdrawable("worker") == 0
 
         clock[0] += HOLD_S
-        assert store.withdrawable("worker") == 0
+        # Preserve the inclusive legacy boundary from 28952fb.  V2 spend
+        # receipts remain strictly-after because their shared-view eligible_at
+        # is one second later than matures_at.
+        assert store.withdrawable("worker") == 40
         assert store.dispute("funded") is True
         _assert_zero_sum(store)
         assert store.withdrawable("worker") == 0

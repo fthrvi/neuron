@@ -1063,24 +1063,58 @@ class Reconciler:
             "spend_pricing": [],
             "spend_caps": [],
             "spend_liabilities": [],
+            "spend_release_lifecycle": [],
             "spend_closed_balances": [],
             "economic_namespaces": [],
             "economic_receipt_view": [],
         }
         balances = {row["id"]: int(row["balance"]) for row in ledger["accounts"]}
         journals = {int(row["seq"]): row for row in ledger["journal"]}
+        journals_by_receipt: dict[str | None, list[dict[str, Any]]] = {}
+        for row in ledger["journal"]:
+            journals_by_receipt.setdefault(row["receipt_id"], []).append(row)
         settlement_journal_seqs = {
             int(row["seq"])
             for row in ledger["journal"]
             if row["kind"] in {"spend_settle_debit", "spend_earn"}
         }
         linked_journal_seqs: set[int] = set()
+        dispute_journal_seqs = {
+            int(row["seq"])
+            for row in ledger["journal"]
+            if row["kind"] in {"spend_dispute_clawback", "spend_dispute_refund"}
+        }
+        linked_dispute_journal_seqs: set[int] = set()
         holds = {row["hold_id"]: row for row in ledger["spend_holds"]}
+        release_events_by_hold: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        release_kinds = {"spend_release_debit", "spend_release_credit"}
+        for event_id, event_rows in journals_by_receipt.items():
+            release_rows = [row for row in event_rows if row["kind"] in release_kinds]
+            if not release_rows:
+                continue
+            try:
+                detail = json.loads(release_rows[0]["detail"])
+                release_hold_id = detail["hold_id"]
+            except (KeyError, TypeError, json.JSONDecodeError):
+                errors["spend_release_lifecycle"].append(
+                    f"{event_id}: release journal has malformed hold detail"
+                )
+                continue
+            if not isinstance(event_id, str) or release_hold_id not in holds:
+                errors["spend_release_lifecycle"].append(
+                    f"{event_id}: release journal has no spend hold"
+                )
+                continue
+            release_events_by_hold.setdefault(release_hold_id, {})[event_id] = event_rows
         workers = {
             (row["hold_id"], row["worker_keyid"]): row
             for row in ledger["spend_hold_workers"]
         }
+        workers_by_hold: dict[str, list[dict[str, Any]]] = {}
+        for row in ledger["spend_hold_workers"]:
+            workers_by_hold.setdefault(row["hold_id"], []).append(row)
         usage_by_entry: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        verified_entry_summaries: dict[tuple[str, str], dict[str, Any]] = {}
         legacy_ids = {row["receipt_id"] for row in ledger["receipts"]}
         usage_ids = {row["receipt_id"] for row in ledger["spend_usage_receipts"]}
         overlap = sorted(legacy_ids & usage_ids)
@@ -1110,7 +1144,13 @@ class Reconciler:
             previous_cost = 0
             previous_prompt = 0
             previous_generated = 0
+            entry_verified = True
+            verified_last: dict[str, Any] | None = None
             for expected_sequence, stored in enumerate(rows, 1):
+                receipt_error_count = sum(
+                    len(errors[name])
+                    for name in ("spend_usage_linkage", "spend_pricing", "spend_caps")
+                )
                 rid = stored["receipt_id"]
                 if int(stored["sequence"]) != expected_sequence:
                     errors["spend_usage_linkage"].append(
@@ -1122,7 +1162,15 @@ class Reconciler:
                     receipt = None
                 if not isinstance(receipt, dict) or set(receipt) != SPEND_USAGE_FIELDS:
                     errors["spend_usage_linkage"].append(f"{rid}: invalid receipt JSON")
+                    entry_verified = False
                     continue
+                canonical = json.dumps(
+                    receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                )
+                if stored["receipt_json"] != canonical:
+                    errors["spend_usage_linkage"].append(
+                        f"{rid}: stored receipt JSON is not canonical"
+                    )
                 unsigned = {k: v for k, v in receipt.items() if k != "receipt_id"}
                 canonical_unsigned = json.dumps(
                     unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -1135,14 +1183,59 @@ class Reconciler:
                 try:
                     pubkey = bytes.fromhex(key[1])
                     signature = bytes.fromhex(stored["signature"])
-                    canonical = json.dumps(
-                        receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-                    ).encode()
+                    canonical_bytes = canonical.encode()
                     ed25519.Ed25519PublicKey.from_public_bytes(pubkey).verify(
-                        signature, canonical
+                        signature, canonical_bytes
                     )
                 except Exception:
                     errors["spend_usage_linkage"].append(f"{rid}: signature mismatch")
+
+                immutable = {
+                    "v": 2,
+                    "kind": "nakshatra-worker-usage",
+                    "hold_id": key[0],
+                    "claim_response_sha256": entry["claim_response_sha256"],
+                    "payer_keyid": hold["payer_keyid"],
+                    "payer_account_at_authorize": hold["payer_account_at_authorize"],
+                    "worker_keyid": key[1],
+                    "worker_account_at_authorize": entry["worker_account_at_authorize"],
+                    "billable": bool(entry["billable"]),
+                    "session_id": hold["session_id"],
+                    "model_id": hold["model_id"],
+                    "billing_mode": hold["billing_mode"],
+                    "layer_start": int(entry["layer_start"]),
+                    "layer_end": int(entry["layer_end"]),
+                }
+                if any(receipt.get(field) != value for field, value in immutable.items()):
+                    errors["spend_usage_linkage"].append(
+                        f"{rid}: receipt differs from immutable hold snapshot"
+                    )
+                stored_fields = {
+                    "hold_id": key[0],
+                    "worker_keyid": key[1],
+                    "sequence": receipt.get("sequence"),
+                    "cumulative_prompt_tokens": receipt.get("cumulative_prompt_tokens"),
+                    "cumulative_generated_tokens": receipt.get("cumulative_generated_tokens"),
+                    "cumulative_token_layers": receipt.get("cumulative_token_layers"),
+                    "cumulative_cost": receipt.get("cumulative_cost"),
+                    "final": int(bool(receipt.get("final"))),
+                }
+                if any(stored[field] != value for field, value in stored_fields.items()):
+                    errors["spend_usage_linkage"].append(
+                        f"{rid}: stored receipt columns differ from signed receipt"
+                    )
+                if (
+                    not isinstance(receipt.get("work_completed_at"), int)
+                    or receipt["work_completed_at"] < int(entry["claimed_at"] or 0)
+                    or receipt["work_completed_at"] > int(hold["execution_deadline"])
+                ):
+                    errors["spend_usage_linkage"].append(
+                        f"{rid}: work completion is outside the claimed execution window"
+                    )
+                if bool(receipt.get("final")) and expected_sequence != len(rows):
+                    errors["spend_usage_linkage"].append(
+                        f"{rid}: only the final verified receipt may set final"
+                    )
 
                 prompt = int(receipt.get("cumulative_prompt_tokens", -1))
                 generated_tokens = int(receipt.get("cumulative_generated_tokens", -1))
@@ -1158,6 +1251,10 @@ class Reconciler:
                     errors["spend_pricing"].append(f"{rid}: recomputed pricing differs")
                 if prompt < previous_prompt or generated_tokens < previous_generated:
                     errors["spend_pricing"].append(f"{rid}: cumulative usage regressed")
+                if expected_sequence > 1 and prompt != previous_prompt:
+                    errors["spend_pricing"].append(
+                        f"{rid}: prompt usage changed after the first receipt"
+                    )
                 delta = cost - previous_cost
                 if delta != int(stored["accepted_delta"]):
                     errors["spend_pricing"].append(f"{rid}: accepted delta differs")
@@ -1166,9 +1263,7 @@ class Reconciler:
 
                 debit_seq = stored["debit_journal_seq"]
                 credit_seq = stored["credit_journal_seq"]
-                receipt_journals = [
-                    row for row in ledger["journal"] if row["receipt_id"] == rid
-                ]
+                receipt_journals = journals_by_receipt.get(rid, [])
                 if delta == 0:
                     if debit_seq is not None or credit_seq is not None:
                         errors["spend_usage_linkage"].append(
@@ -1205,6 +1300,25 @@ class Reconciler:
                         errors["spend_usage_linkage"].append(
                             f"{rid}: expected one matched hold debit and worker credit"
                         )
+                    expected_detail = {
+                        "hold_id": key[0],
+                        "worker_keyid": key[1],
+                        "sequence": expected_sequence,
+                        "cumulative_cost": cost,
+                    }
+                    for journal_row in (debit, credit):
+                        try:
+                            detail = json.loads(journal_row["detail"]) if journal_row else None
+                        except (TypeError, json.JSONDecodeError):
+                            detail = None
+                        if detail != expected_detail or (
+                            journal_row is not None
+                            and int(journal_row["ts"]) != int(stored["accepted_at"])
+                        ):
+                            errors["spend_usage_linkage"].append(
+                                f"{rid}: settlement journal detail or time differs"
+                            )
+                            break
                     expected_seqs = {
                         int(value) for value in (debit_seq, credit_seq)
                         if value is not None
@@ -1230,6 +1344,9 @@ class Reconciler:
                         "funded": 1,
                         "hold_terminal_at": terminal,
                         "matures_at": maturity,
+                        "earned_at": int(stored["accepted_at"]),
+                        "debit_journal_seq": debit_seq,
+                        "credit_journal_seq": credit_seq,
                     }
                     if any(economic[field] != value for field, value in expected.items()):
                         errors["economic_receipt_view"].append(
@@ -1243,10 +1360,17 @@ class Reconciler:
                         errors["economic_receipt_view"].append(
                             f"{rid}: normalized view differs from source row"
                         )
-                    dispute_rows = [
-                        row for row in ledger["journal"]
-                        if row["receipt_id"] == f"spend-dispute:{rid}"
-                    ]
+                    if view["eligible_at"] != (
+                        None if maturity is None else maturity + 1
+                    ):
+                        errors["economic_receipt_view"].append(
+                            f"{rid}: v2 eligibility boundary differs from maturity policy"
+                        )
+                    dispute_rows = journals_by_receipt.get(f"spend-dispute:{rid}", [])
+                    linked_dispute_journal_seqs.update(
+                        int(row["seq"]) for row in dispute_rows
+                        if row["kind"] in {"spend_dispute_clawback", "spend_dispute_refund"}
+                    )
                     if economic["dispute_state"] == "clawed_back":
                         if hold["state"] != "disputed":
                             errors["economic_receipt_view"].append(
@@ -1254,37 +1378,142 @@ class Reconciler:
                             )
                         dispute_ok = delta == 0 and not dispute_rows
                         if delta > 0:
+                            dispute_detail = json.dumps(
+                                {"hold_id": key[0], "receipt_id": rid},
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            dispute_times = {int(row["ts"]) for row in dispute_rows}
                             dispute_ok = len(dispute_rows) == 2 and {
-                                (row["kind"], row["account"], row["counterparty"], int(row["amount"]))
+                                (
+                                    row["kind"], row["account"], row["counterparty"],
+                                    int(row["amount"]), row["detail"],
+                                )
                                 for row in dispute_rows
                             } == {
                                 ("spend_dispute_clawback", entry["worker_account_at_authorize"],
-                                 hold["payer_account_at_authorize"], -delta),
+                                 hold["payer_account_at_authorize"], -delta, dispute_detail),
                                 ("spend_dispute_refund", hold["payer_account_at_authorize"],
-                                 entry["worker_account_at_authorize"], delta),
-                            }
+                                 entry["worker_account_at_authorize"], delta, dispute_detail),
+                            } and len(dispute_times) == 1 and hold["terminal_at"] is not None
+                            if dispute_ok:
+                                dispute_at = next(iter(dispute_times))
+                                dispute_ok = (
+                                    int(hold["terminal_at"]) <= dispute_at
+                                    <= int(hold["terminal_at"]) + HOLD_S
+                                )
                         if not dispute_ok:
                             errors["economic_receipt_view"].append(
                                 f"{rid}: dispute state lacks equal-and-opposite journals"
                             )
-                    elif dispute_rows:
+                    elif dispute_rows or hold["state"] == "disputed":
                         errors["economic_receipt_view"].append(
                             f"{rid}: undisputed earning has dispute journals"
                         )
                 previous_cost = cost
                 previous_prompt = prompt
                 previous_generated = generated_tokens
+                if sum(
+                    len(errors[name])
+                    for name in ("spend_usage_linkage", "spend_pricing", "spend_caps")
+                ) != receipt_error_count:
+                    entry_verified = False
+                elif entry_verified:
+                    verified_last = {
+                        "receipt_id": rid,
+                        "sequence": expected_sequence,
+                        "prompt": prompt,
+                        "generated": generated_tokens,
+                        "token_layers": token_layers,
+                        "cost": cost,
+                        "final": bool(receipt["final"]),
+                        "accepted_at": int(stored["accepted_at"]),
+                    }
+
+            if entry_verified and verified_last is not None:
+                verified_entry_summaries[key] = verified_last
+                expected_summary = {
+                    "receipt_sequence": verified_last["sequence"],
+                    "last_receipt_id": verified_last["receipt_id"],
+                    "cumulative_prompt_tokens": verified_last["prompt"],
+                    "cumulative_generated_tokens": verified_last["generated"],
+                    "cumulative_token_layers": verified_last["token_layers"],
+                    "cumulative_cost": verified_last["cost"],
+                    "final": int(verified_last["final"]),
+                    "final_receipt_id": (
+                        verified_last["receipt_id"] if verified_last["final"] else None
+                    ),
+                }
+                if any(entry[field] != value for field, value in expected_summary.items()):
+                    errors["spend_usage_linkage"].append(
+                        f"{key[0]}/{key[1]}: entry summary differs from final verified receipt"
+                    )
+
+        derived_entry_states: dict[tuple[str, str], str] = {}
+        for key, entry in workers.items():
+            hold = holds.get(key[0])
+            summary = verified_entry_summaries.get(key)
+            if key not in usage_by_entry:
+                empty_summary = {
+                    "receipt_sequence": 0,
+                    "last_receipt_id": None,
+                    "cumulative_prompt_tokens": 0,
+                    "cumulative_generated_tokens": 0,
+                    "cumulative_token_layers": 0,
+                    "cumulative_cost": 0,
+                    "final": 0,
+                    "final_receipt_id": None,
+                }
+                if any(entry[field] != value for field, value in empty_summary.items()):
+                    errors["spend_usage_linkage"].append(
+                        f"{key[0]}/{key[1]}: receipt-free entry has nonzero receipt summary"
+                    )
+            if summary is not None and summary["final"]:
+                state = "final"
+                if entry["finalized_at"] != summary["accepted_at"]:
+                    errors["spend_usage_linkage"].append(
+                        f"{key[0]}/{key[1]}: finalization time differs from final receipt"
+                    )
+            elif (
+                hold is not None
+                and (
+                    hold["state"] == "expired"
+                    or (
+                        hold["state"] == "disputed"
+                        and bool(journals_by_receipt.get(f"spend-release:{key[0]}:expired"))
+                    )
+                )
+                and hold["terminal_at"] is not None
+                and entry["finalized_at"] == hold["terminal_at"]
+            ):
+                state = "expired"
+            elif entry["claimed_at"] is not None:
+                state = "claimed"
+            elif entry["finalized_at"] is not None:
+                state = "abandoned"
+            else:
+                state = "planned"
+            derived_entry_states[key] = state
+            if entry["state"] != state:
+                errors["spend_usage_linkage"].append(
+                    f"{key[0]}/{key[1]}: entry state {entry['state']} != derived {state}"
+                )
 
         orphan_settlement = sorted(settlement_journal_seqs - linked_journal_seqs)
         if orphan_settlement:
             errors["spend_usage_linkage"].append(
                 f"orphan or duplicate spend settlement journal seq {orphan_settlement[0]}"
             )
+        orphan_dispute = sorted(
+            dispute_journal_seqs - linked_dispute_journal_seqs
+        )
+        if orphan_dispute:
+            errors["economic_receipt_view"].append(
+                f"orphan spend dispute journal seq {orphan_dispute[0]}"
+            )
 
         for hold_id, hold in holds.items():
-            own_workers = [
-                row for (row_hold, _), row in workers.items() if row_hold == hold_id
-            ]
+            own_workers = workers_by_hold.get(hold_id, [])
             recomputed_cap = sum(
                 ((int(row["max_prompt_tokens"]) + int(row["max_output_tokens"]))
                  * int(row["layers"]) * int(row["price_multiplier"]))
@@ -1293,10 +1522,7 @@ class Reconciler:
             )
             if recomputed_cap != int(hold["max_cost"]):
                 errors["spend_pricing"].append(f"{hold_id}: hold cap pricing differs")
-            auth_rows = [
-                row for row in ledger["journal"]
-                if row["receipt_id"] == f"spend-authorize:{hold_id}"
-            ]
+            auth_rows = journals_by_receipt.get(f"spend-authorize:{hold_id}", [])
             auth_ok = int(hold["max_cost"]) == 0 and not auth_rows
             if int(hold["max_cost"]) > 0:
                 auth_ok = len(auth_rows) == 2 and {
@@ -1310,10 +1536,137 @@ class Reconciler:
                 errors["spend_usage_linkage"].append(
                     f"{hold_id}: payer-funded authorization journal is inconsistent"
                 )
-            liability = sum(
-                int(row["max_cost"]) - int(row["cumulative_cost"])
+
+            for event_id, event_rows in release_events_by_hold.get(hold_id, {}).items():
+                prefix = f"spend-release:{hold_id}:"
+                suffix = event_id[len(prefix):] if event_id.startswith(prefix) else ""
+                event_ts = int(event_rows[0]["ts"])
+                reason: str | None = None
+                expected_amount: int | None = None
+                lifecycle_ok = False
+                if suffix == "settled":
+                    reason = "settled"
+                    expected_amount = sum(
+                        int(row["max_cost"])
+                        - int(verified_entry_summaries.get(
+                            (hold_id, row["worker_keyid"]), {"cost": 0}
+                        )["cost"])
+                        for row in own_workers
+                        if derived_entry_states.get((hold_id, row["worker_keyid"]))
+                        == "final"
+                    )
+                    lifecycle_ok = (
+                        hold["state"] in {"settled", "disputed"}
+                        and hold["terminal_at"] == event_ts
+                        and all(
+                            derived_entry_states.get((hold_id, row["worker_keyid"]))
+                            in {"final", "abandoned"}
+                            for row in own_workers
+                        )
+                    )
+                elif suffix == "expired":
+                    reason = "settlement_deadline"
+                    expected_amount = sum(
+                        int(row["max_cost"])
+                        - int(verified_entry_summaries.get(
+                            (hold_id, row["worker_keyid"]), {"cost": 0}
+                        )["cost"])
+                        for row in own_workers
+                        if derived_entry_states.get((hold_id, row["worker_keyid"]))
+                        in {"expired", "final"}
+                    )
+                    lifecycle_ok = (
+                        hold["state"] in {"expired", "disputed"}
+                        and hold["terminal_at"] == event_ts
+                        and event_ts >= int(hold["settlement_deadline"])
+                    )
+                elif suffix == "cancelled":
+                    reason = "cancelled"
+                    expected_amount = sum(int(row["max_cost"]) for row in own_workers)
+                    lifecycle_ok = (
+                        hold["state"] in {"cancelled", "disputed"}
+                        and hold["terminal_at"] == event_ts
+                        and all(row["claimed_at"] is None for row in own_workers)
+                    )
+                elif suffix == "execution-expiry":
+                    reason = "execution_deadline"
+                    expired_entries = [
+                        row for row in own_workers
+                        if derived_entry_states.get((hold_id, row["worker_keyid"]))
+                        == "abandoned"
+                        and row["claimed_at"] is None
+                        and row["finalized_at"] == event_ts
+                    ]
+                    expected_amount = sum(int(row["max_cost"]) for row in expired_entries)
+                    lifecycle_ok = bool(expired_entries) and event_ts >= int(
+                        hold["execution_deadline"]
+                    )
+                elif suffix.endswith(":abandoned"):
+                    worker_keyid = suffix[:-len(":abandoned")]
+                    row = workers.get((hold_id, worker_keyid))
+                    reason = "abandoned"
+                    if row is not None:
+                        expected_amount = int(row["max_cost"])
+                        lifecycle_ok = (
+                            derived_entry_states.get((hold_id, worker_keyid))
+                            == "abandoned"
+                            and row["claimed_at"] is None
+                            and row["finalized_at"] == event_ts
+                        )
+
+                expected_detail = {"hold_id": hold_id, "reason": reason}
+                if reason == "abandoned":
+                    expected_detail["worker_keyid"] = suffix[:-len(":abandoned")]
+                rows_ok = expected_amount is not None and expected_amount > 0
+                if rows_ok:
+                    rows_ok = len(event_rows) == 2 and {
+                        (
+                            row["kind"], row["account"], row["counterparty"],
+                            int(row["amount"]), int(row["ts"]), row["detail"],
+                        )
+                        for row in event_rows
+                    } == {
+                        (
+                            "spend_release_debit", hold["escrow_account"],
+                            hold["payer_account_at_authorize"], -expected_amount,
+                            event_ts,
+                            json.dumps(expected_detail, sort_keys=True, separators=(",", ":")),
+                        ),
+                        (
+                            "spend_release_credit", hold["payer_account_at_authorize"],
+                            hold["escrow_account"], expected_amount, event_ts,
+                            json.dumps(expected_detail, sort_keys=True, separators=(",", ":")),
+                        ),
+                    }
+                if not lifecycle_ok or not rows_ok:
+                    errors["spend_release_lifecycle"].append(
+                        f"{event_id}: release does not match its exact lifecycle transition"
+                    )
+            verified_spend = sum(
+                int(verified_entry_summaries.get(
+                    (hold_id, row["worker_keyid"]), {"cost": 0}
+                )["cost"])
                 for row in own_workers
-                if row["state"] in {"planned", "claimed", "final"}
+            )
+            journal_releases = -sum(
+                int(row["amount"])
+                for event_rows in release_events_by_hold.get(hold_id, {}).values()
+                for row in event_rows
+                if row["kind"] == "spend_release_debit"
+            )
+            provenance_balance = int(hold["max_cost"]) - verified_spend - journal_releases
+            if balances.get(hold["escrow_account"], 0) != provenance_balance:
+                errors["spend_release_lifecycle"].append(
+                    f"{hold_id}: escrow balance does not follow authorization, verified usage, and releases"
+                )
+            liability = sum(
+                int(row["max_cost"])
+                - int(verified_entry_summaries.get(
+                    (hold_id, row["worker_keyid"]), {"cost": 0}
+                )["cost"])
+                for row in own_workers
+                if derived_entry_states.get((hold_id, row["worker_keyid"]))
+                in {"planned", "claimed", "final"}
             )
             expected_balance = 0 if hold["state"] in {
                 "settled", "expired", "cancelled", "disputed"
@@ -1347,10 +1700,135 @@ class Reconciler:
                 "shared economic view does not exactly cover receipt earnings"
             )
         receipts = {row["receipt_id"]: row for row in ledger["receipts"]}
+
+        first_legacy_seq: dict[int, list[dict[str, Any]]] = {}
+        for receipt in ledger["receipts"]:
+            settlement_rows = [
+                row for row in journals_by_receipt.get(receipt["receipt_id"], [])
+                if row["kind"] in {"earn", "spend"}
+            ]
+            if settlement_rows:
+                first_legacy_seq.setdefault(
+                    min(int(row["seq"]) for row in settlement_rows), []
+                ).append(receipt)
+        running_balances: dict[str, int] = {}
+        legacy_balance_before: dict[str, int] = {}
+        for journal in ledger["journal"]:
+            for receipt in first_legacy_seq.get(int(journal["seq"]), []):
+                legacy_balance_before[receipt["receipt_id"]] = running_balances.get(
+                    receipt["requester"], 0
+                )
+            account = journal["account"]
+            running_balances[account] = running_balances.get(account, 0) + int(
+                journal["amount"]
+            )
+        for account, balance in balances.items():
+            if (
+                account != TREASURY_ACCOUNT
+                and not account.startswith("__withdrawal_hold__")
+                and not account.startswith("__spend_hold__")
+                and running_balances.get(account, 0) != balance
+            ):
+                errors["economic_receipt_view"].append(
+                    f"{account}: balance differs from chronological journal provenance"
+                )
+
+        for receipt_id, receipt in receipts.items():
+            if receipt["state"] == "legacy_unsigned":
+                continue
+            try:
+                credited = json.loads(receipt["credited"])
+            except (TypeError, json.JSONDecodeError):
+                credited = None
+            rows = journals_by_receipt.get(receipt_id, [])
+            earn_rows = [row for row in rows if row["kind"] == "earn"]
+            spend_rows = [row for row in rows if row["kind"] == "spend"]
+            charged = int(receipt["charged"])
+            exact_earns = isinstance(credited, dict) and len(earn_rows) == len(credited)
+            if exact_earns:
+                exact_earns = sorted(
+                    (row["account"], row["counterparty"], int(row["amount"]), int(row["ts"]))
+                    for row in earn_rows
+                ) == sorted(
+                    (account, receipt["requester"], int(amount), int(receipt["created_at"]))
+                    for account, amount in credited.items()
+                )
+            exact_spend = (
+                (charged == 0 and not spend_rows)
+                or (
+                    charged > 0
+                    and len(spend_rows) == 1
+                    and spend_rows[0]["account"] == receipt["requester"]
+                    and spend_rows[0]["counterparty"] is None
+                    and int(spend_rows[0]["amount"]) == -charged
+                    and int(spend_rows[0]["ts"]) == int(receipt["created_at"])
+                )
+            )
+            if (
+                not exact_earns
+                or not exact_spend
+                or not isinstance(credited, dict)
+                or sum(int(amount) for amount in credited.values()) != charged
+            ):
+                errors["economic_receipt_view"].append(
+                    f"{receipt_id}: legacy receipt lacks its exact earn/spend journal pair"
+                )
+                continue
+            reconstructed_funded = legacy_balance_before.get(receipt_id, 0) >= charged
+            marker_ok = True
+            for earn in earn_rows:
+                try:
+                    marker = json.loads(earn["detail"])
+                except (TypeError, json.JSONDecodeError):
+                    marker = None
+                if marker != {"funded": reconstructed_funded}:
+                    marker_ok = False
+            if not marker_ok:
+                errors["economic_receipt_view"].append(
+                    f"{receipt_id}: legacy funded marker differs from journal provenance"
+                )
+
+            dispute_rows = [
+                row for row in rows
+                if row["kind"] in {"dispute_clawback", "dispute_refund"}
+            ]
+            expected_dispute: list[tuple[Any, ...]] = []
+            if receipt["state"] == "disputed":
+                expected_dispute.extend(
+                    (
+                        "dispute_clawback", account, receipt["requester"],
+                        -int(amount), int(receipt["disputed_at"]),
+                    )
+                    for account, amount in credited.items()
+                )
+                if charged:
+                    expected_dispute.append(
+                        (
+                            "dispute_refund", receipt["requester"], None,
+                            charged, int(receipt["disputed_at"]),
+                        )
+                    )
+            actual_dispute = [
+                (
+                    row["kind"], row["account"], row["counterparty"],
+                    int(row["amount"]), int(row["ts"]),
+                )
+                for row in dispute_rows
+            ]
+            if sorted(actual_dispute, key=repr) != sorted(expected_dispute, key=repr):
+                errors["economic_receipt_view"].append(
+                    f"{receipt_id}: legacy dispute lacks exact clawback/refund journals"
+                )
+
         for economic_id, row in economic_rows.items():
             if row["namespace"] == "v1":
                 receipt = receipts.get(row["receipt_id"])
                 credit = journals.get(int(row["credit_journal_seq"]))
+                reconstructed_funded = (
+                    receipt is not None
+                    and legacy_balance_before.get(row["receipt_id"], 0)
+                    >= int(receipt["charged"])
+                )
                 if (
                     receipt is None or credit is None
                     or row["amount"] != credit["amount"]
@@ -1358,6 +1836,8 @@ class Reconciler:
                     or row["earned_at"] != credit["ts"]
                     or row["hold_terminal_at"] != credit["ts"]
                     or row["matures_at"] != int(credit["ts"]) + HOLD_S
+                    or row["eligible_at"] != int(credit["ts"]) + HOLD_S
+                    or row["funded"] != int(reconstructed_funded)
                     or row["dispute_state"]
                        != ("clawed_back" if receipt and receipt["state"] == "disputed" else "none")
                 ):
@@ -1366,6 +1846,7 @@ class Reconciler:
                     )
             elif row["namespace"] == "legacy_import" and (
                 row["funded"] != 0 or row["matures_at"] is not None
+                or row["eligible_at"] is not None
             ):
                 errors["economic_receipt_view"].append(
                     f"{economic_id}: imported earning became eligible"
@@ -1389,8 +1870,8 @@ class Reconciler:
                 if row["worker_account"] == operator
                 and row["funded"] == 1
                 and row["dispute_state"] == "none"
-                and row["matures_at"] is not None
-                and at > int(row["matures_at"])
+                and row["eligible_at"] is not None
+                and at >= int(row["eligible_at"])
             )
             committed = sum(
                 int(other["amount"])

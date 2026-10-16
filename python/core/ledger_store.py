@@ -705,11 +705,23 @@ class LedgerStore:
                 j.receipt_id AS receipt_id, NULL AS hold_id,
                 j.counterparty AS payer_account, j.account AS worker_account,
                 j.amount AS amount,
-                CASE WHEN json_valid(j.detail)
-                          AND json_extract(j.detail, '$.funded') = 1
-                     THEN 1 ELSE 0 END AS funded,
+                CASE WHEN
+                    (SELECT COUNT(*) FROM journal AS s
+                     WHERE s.receipt_id=j.receipt_id AND s.kind='spend'
+                       AND s.account=r.requester AND s.amount=-r.charged) = 1
+                    AND (SELECT COUNT(*) FROM journal AS s
+                         WHERE s.receipt_id=j.receipt_id AND s.kind='spend') = 1
+                    AND COALESCE((SELECT SUM(p.amount) FROM journal AS p
+                                  WHERE p.account=r.requester
+                                    AND p.seq < (SELECT MIN(first.seq)
+                                                 FROM journal AS first
+                                                 WHERE first.receipt_id=j.receipt_id
+                                                   AND first.kind IN ('earn','spend'))), 0)
+                        >= r.charged
+                    THEN 1 ELSE 0 END AS funded,
                 j.ts AS earned_at, j.ts AS hold_terminal_at,
                 j.ts + {HOLD_S} AS matures_at,
+                j.ts + {HOLD_S} AS eligible_at,
                 CASE WHEN r.state = 'disputed' THEN 'clawed_back' ELSE 'none' END
                     AS dispute_state,
                 (SELECT d.seq FROM journal AS d
@@ -721,13 +733,15 @@ class LedgerStore:
             UNION ALL
             SELECT 'legacy_import:' || j.seq, 'legacy_import', j.receipt_id,
                 NULL, j.counterparty, j.account, j.amount, 0, j.ts, NULL, NULL,
-                'none', NULL, j.seq
+                NULL, 'none', NULL, j.seq
             FROM journal AS j
             WHERE j.kind='legacy_import' AND j.amount > 0
             UNION ALL
             SELECT 'v2:' || e.receipt_id, 'v2', e.receipt_id, e.hold_id,
                 e.payer_account, e.worker_account, e.amount, e.funded,
-                e.earned_at, e.hold_terminal_at, e.matures_at, e.dispute_state,
+                e.earned_at, e.hold_terminal_at, e.matures_at,
+                CASE WHEN e.matures_at IS NULL THEN NULL ELSE e.matures_at + 1 END,
+                e.dispute_state,
                 e.debit_journal_seq, e.credit_journal_seq
             FROM spend_economic_receipts AS e;
 
@@ -937,16 +951,20 @@ class LedgerStore:
         """Return paid earnings excluded from new-hold collateral.
 
         This is deliberately the same normalized economic view consumed by
-        withdrawal eligibility and S6.  An earning becomes usable only after
-        its terminal-anchored maturity and only while funded and undisputed.
+        withdrawal eligibility and S6.  Clawed-back value is no longer in the
+        balance and therefore cannot also be restricted.  The remaining
+        restricted rows are imports, unfunded earnings, and funded earnings
+        whose namespace-specific eligibility time has not arrived.
         """
         return int(
             db.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM economic_receipts "
-                "WHERE worker_account=? AND amount>0 AND NOT "
-                "(funded=1 AND dispute_state='none' "
-                "AND matures_at IS NOT NULL AND ?>matures_at)",
-                (account, now),
+                "SELECT MIN(MAX(COALESCE((SELECT balance FROM accounts "
+                "WHERE id=?), 0), 0), COALESCE(SUM(amount), 0)) "
+                "FROM economic_receipts WHERE worker_account=? AND amount>0 "
+                "AND dispute_state='none' AND "
+                "(namespace='legacy_import' OR funded=0 OR eligible_at IS NULL "
+                "OR ?<eligible_at)",
+                (account, account, now),
             ).fetchone()[0]
         )
 
@@ -1066,8 +1084,8 @@ class LedgerStore:
             db.execute(
                 "SELECT COALESCE(SUM(amount), 0) FROM economic_receipts "
                 "WHERE worker_account=? AND amount>0 AND funded=1 "
-                "AND dispute_state='none' AND matures_at IS NOT NULL "
-                "AND ?>matures_at",
+                "AND dispute_state='none' AND eligible_at IS NOT NULL "
+                "AND ?>=eligible_at",
                 (operator, now),
             ).fetchone()[0]
         )
