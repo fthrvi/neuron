@@ -284,10 +284,13 @@ def test_namespace_eligibility_matches_legacy_base_at_exact_hold_boundary(tmp_pa
 
         clock[0] = legacy_earned_at + HOLD_S
         assert store.withdrawable("legacy-worker") == 40  # 28952fb behavior
+        assert store.eligible_spend_capacity("legacy-worker", "stranger") == 1_000_000
         clock[0] = terminal + HOLD_S
         assert store.withdrawable("worker") == 0
         clock[0] += 1
         assert store.withdrawable("worker") == 8
+        assert store.eligible_spend_capacity("legacy-worker", "stranger") == 1_000_040
+        assert store.eligible_spend_capacity("worker", "stranger") == 1_000_008
 
 
 def test_disputed_legacy_earning_is_not_double_restricted_from_capacity(tmp_path):
@@ -328,6 +331,149 @@ def _run_s6_and_assert_kill(path, tmp_path, *, vault_amount=100):
     assert envelope["report"]["outcome"] == "mismatch"
     assert config.kill_file.is_file()
     return envelope["report"]
+
+
+def _duplicate_v2_economic_row(db):
+    """Rebuild the source table without its PK to model raw storage corruption."""
+    view_sql = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='view' AND name='economic_receipts'"
+    ).fetchone()[0]
+    db.execute("DROP VIEW economic_receipts")
+    db.execute("ALTER TABLE spend_economic_receipts RENAME TO original_economic")
+    db.execute(
+        "CREATE TABLE spend_economic_receipts AS "
+        "SELECT * FROM original_economic WHERE 0"
+    )
+    db.execute(
+        "INSERT INTO spend_economic_receipts SELECT * FROM original_economic"
+    )
+    db.execute(
+        "INSERT INTO spend_economic_receipts SELECT * FROM original_economic"
+    )
+    db.execute(view_sql)
+
+
+@pytest.mark.parametrize(
+    "inconsistent_state",
+    [
+        "economic_without_usage",
+        "amount_differs",
+        "worker_differs",
+        "maturity_differs",
+        "duplicate_economic",
+        "usage_without_economic",
+        "journal_pair_without_receipt",
+        "legacy_economic_without_provenance",
+    ],
+)
+def test_inconsistent_economic_states_fail_closed(
+    tmp_path, inconsistent_state
+):
+    """Every row of the N2 inconsistent-state table stays fail closed."""
+    path = tmp_path / f"fail-closed-{inconsistent_state}.sqlite"
+    store, hold = _seed_reconcilable_spend(path)
+    receipt_id = store._db.execute(
+        "SELECT receipt_id FROM spend_usage_receipts"
+    ).fetchone()[0]
+    terminal = int(store.spend_status(hold["hold_id"])["terminal_at"])
+    store._clock = lambda: terminal + HOLD_S + (
+        1 if inconsistent_state == "duplicate_economic" else 0
+    )
+    withdrawable_before = store.withdrawable("worker")
+    capacity_before = store.eligible_spend_capacity("worker", "stranger")
+    if inconsistent_state == "duplicate_economic":
+        assert withdrawable_before == 8
+    else:
+        assert withdrawable_before == 0
+
+    try:
+        if inconsistent_state == "economic_without_usage":
+            fabricated_id = "sha256:" + "e" * 64
+            store._db.execute("PRAGMA foreign_keys=OFF")
+            store._db.execute(
+                "INSERT INTO spend_economic_receipts "
+                "SELECT ?, hold_id, payer_account, worker_account, amount, funded, "
+                "earned_at, hold_terminal_at, matures_at, dispute_state, "
+                "debit_journal_seq, credit_journal_seq "
+                "FROM spend_economic_receipts WHERE receipt_id=?",
+                (fabricated_id, receipt_id),
+            )
+        elif inconsistent_state == "amount_differs":
+            store._db.execute("DROP TRIGGER spend_economic_core_immutable")
+            store._db.execute(
+                "UPDATE spend_economic_receipts SET amount=amount-1"
+            )
+        elif inconsistent_state == "worker_differs":
+            store._db.execute("DROP TRIGGER spend_economic_core_immutable")
+            store._db.execute(
+                "UPDATE spend_economic_receipts SET worker_account='other-worker'"
+            )
+        elif inconsistent_state == "maturity_differs":
+            store._db.execute(
+                "UPDATE spend_economic_receipts SET "
+                "hold_terminal_at=hold_terminal_at+1, matures_at=matures_at+1"
+            )
+        elif inconsistent_state == "duplicate_economic":
+            _duplicate_v2_economic_row(store._db)
+        elif inconsistent_state == "usage_without_economic":
+            store._db.execute("DROP TRIGGER spend_economic_receipts_no_delete")
+            store._db.execute("DELETE FROM spend_economic_receipts")
+        elif inconsistent_state == "journal_pair_without_receipt":
+            fake_id = "sha256:" + "a" * 64
+            detail = json.dumps({"hold_id": hold["hold_id"], "mutation": True})
+            store._db.execute(
+                "UPDATE accounts SET balance=balance-8 WHERE id=?",
+                (hold["escrow_account"],),
+            )
+            store._db.execute(
+                "UPDATE accounts SET balance=balance+8 WHERE id='worker'"
+            )
+            store._db.execute(
+                "INSERT INTO journal(ts, kind, receipt_id, account, counterparty, "
+                "amount, detail) VALUES (?, 'spend_settle_debit', ?, ?, 'worker', -8, ?)",
+                (terminal, fake_id, hold["escrow_account"], detail),
+            )
+            store._db.execute(
+                "INSERT INTO journal(ts, kind, receipt_id, account, counterparty, "
+                "amount, detail) VALUES (?, 'spend_earn', ?, 'worker', ?, 8, ?)",
+                (terminal, fake_id, hold["escrow_account"], detail),
+            )
+        elif inconsistent_state == "legacy_economic_without_provenance":
+            fake_id = "legacy-without-receipt"
+            store._db.execute(
+                "UPDATE accounts SET balance=balance-8 WHERE id='payer'"
+            )
+            store._db.execute(
+                "UPDATE accounts SET balance=balance+8 WHERE id='worker'"
+            )
+            store._db.execute(
+                "INSERT INTO journal(ts, kind, receipt_id, account, amount, detail) "
+                "VALUES (?, 'spend', ?, 'payer', -8, ?)",
+                (terminal, fake_id, json.dumps({"tier": "self"})),
+            )
+            store._db.execute(
+                "INSERT INTO journal(ts, kind, receipt_id, account, counterparty, "
+                "amount, detail) VALUES (?, 'earn', ?, 'worker', 'payer', 8, ?)",
+                (terminal, fake_id, json.dumps({"funded": True})),
+            )
+    finally:
+        withdrawable_after = store.withdrawable("worker")
+        capacity_after = store.eligible_spend_capacity("worker", "stranger")
+        store.close()
+
+    assert withdrawable_after == withdrawable_before
+    assert capacity_after <= capacity_before
+
+    report = _run_s6_and_assert_kill(path, tmp_path)
+    if inconsistent_state != "journal_pair_without_receipt":
+        assert _check(report, "economic_receipt_view")["ok"] is False
+    if inconsistent_state in {
+        "economic_without_usage", "duplicate_economic", "usage_without_economic"
+    }:
+        assert any(
+            "raw v2 cardinality" in error
+            for error in _check(report, "economic_receipt_view")["errors"]
+        )
 
 
 @pytest.mark.parametrize(

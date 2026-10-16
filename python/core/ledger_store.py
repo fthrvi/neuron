@@ -1069,28 +1069,22 @@ class LedgerStore:
         return f"{_SPEND_HOLD_PREFIX}{hold_id}"
 
     @staticmethod
-    def _restricted_paid_earnings_in(
+    def _restricted_unproven_balance_in(
         db: sqlite3.Connection, account: str, now: int
     ) -> int:
-        """Return paid earnings excluded from new-hold collateral.
+        """Return positive balance not backed by proven eligible value.
 
-        This is deliberately the same normalized economic view consumed by
-        withdrawal eligibility and S6.  Clawed-back value is no longer in the
-        balance and therefore cannot also be restricted.  The remaining
-        restricted rows are imports, unfunded earnings, and funded earnings
-        whose namespace-specific eligibility time has not arrived.
+        Eligibility is intentionally constructed from positive evidence and
+        shared with withdrawal verification.  A missing or inconsistent
+        economic row therefore cannot make value usable as paid-hold
+        collateral: it reduces proven eligibility instead of disappearing
+        from a list of restrictions.
         """
-        return int(
-            db.execute(
-                "SELECT MIN(MAX(COALESCE((SELECT balance FROM accounts "
-                "WHERE id=?), 0), 0), COALESCE(SUM(amount), 0)) "
-                "FROM economic_receipts WHERE worker_account=? AND amount>0 "
-                "AND dispute_state='none' AND "
-                "(namespace='legacy_import' OR funded=0 OR eligible_at IS NULL "
-                "OR ?<eligible_at)",
-                (account, account, now),
-            ).fetchone()[0]
+        positive_balance = max(0, LedgerStore._balance_in(db, account))
+        proven_eligible = LedgerStore._proven_eligible_balance_in(
+            db, account, now, strict_legacy_maturity=True
         )
+        return max(0, positive_balance - proven_eligible)
 
     @staticmethod
     def _spend_liability_in(db: sqlite3.Connection, hold_id: str) -> int:
@@ -1185,6 +1179,7 @@ class LedgerStore:
     ) -> int:
         """Sum only mature v2 rows proven by a signed usage receipt and journals."""
         total = 0
+        credited_receipt_ids: set[str] = set()
         candidates = db.execute(
             "SELECT * FROM spend_economic_receipts "
             "WHERE worker_account=? AND amount>0 AND funded=1 "
@@ -1376,12 +1371,26 @@ class LedgerStore:
                 and int(economic["matures_at"]) == int(terminal) + HOLD_S
                 and stored["hold_state"] != "disputed"
             )
-            if economic_ok:
+            receipt_id = str(economic["receipt_id"])
+            if economic_ok and receipt_id not in credited_receipt_ids:
                 total += delta
+                credited_receipt_ids.add(receipt_id)
         return total
 
     @staticmethod
-    def _withdrawable_in(db: sqlite3.Connection, operator: str, now: int) -> int:
+    def _proven_eligible_balance_in(
+        db: sqlite3.Connection,
+        operator: str,
+        now: int,
+        *,
+        strict_legacy_maturity: bool = False,
+    ) -> int:
+        """Return current positive balance backed by eligible provenance.
+
+        N1 made legacy earnings withdrawable at the inclusive maturity
+        boundary but usable as spend collateral only strictly after it.  Keep
+        that historical distinction while v2 remains strictly-after for both.
+        """
         balance = LedgerStore._balance_in(db, operator)
         deposited = int(
             db.execute(
@@ -1405,12 +1414,15 @@ class LedgerStore:
             ).fetchone()[0]
         )
 
+        legacy_maturity_predicate = (
+            "?>eligible_at" if strict_legacy_maturity else "?>=eligible_at"
+        )
         matured_legacy_earnings = int(
             db.execute(
                 "SELECT COALESCE(SUM(amount), 0) FROM economic_receipts "
                 "WHERE namespace!='v2' AND worker_account=? AND amount>0 AND funded=1 "
                 "AND dispute_state='none' AND eligible_at IS NOT NULL "
-                "AND ?>=eligible_at",
+                f"AND {legacy_maturity_predicate}",
                 (operator, now),
             ).fetchone()[0]
         )
@@ -1426,6 +1438,10 @@ class LedgerStore:
             + matured_v2_earnings
         )
         return max(0, min(balance, entitlement))
+
+    @staticmethod
+    def _withdrawable_in(db: sqlite3.Connection, operator: str, now: int) -> int:
+        return LedgerStore._proven_eligible_balance_in(db, operator, now)
 
     @staticmethod
     def _net_deposits_in(db: sqlite3.Connection, operator: str) -> int:
@@ -2710,7 +2726,7 @@ class LedgerStore:
         with self._lock:
             now = self._now()
             balance = self._balance_in(self._db, account)
-            restricted = self._restricted_paid_earnings_in(self._db, account, now)
+            restricted = self._restricted_unproven_balance_in(self._db, account, now)
         limit = TIER_LIMITS[tier]
         if limit is None:
             return None
@@ -2904,7 +2920,7 @@ class LedgerStore:
             now = self._now()
 
             balance = self._balance_in(db, resolved_payer_account)
-            restricted = self._restricted_paid_earnings_in(
+            restricted = self._restricted_unproven_balance_in(
                 db, resolved_payer_account, now
             )
             limit = TIER_LIMITS[resolved_tier]

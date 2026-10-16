@@ -1122,6 +1122,29 @@ class Reconciler:
         usage_by_entry: dict[tuple[str, str], list[dict[str, Any]]] = {}
         verified_entry_summaries: dict[tuple[str, str], dict[str, Any]] = {}
         verified_v2_economic_ids: set[str] = set()
+        usage_cardinality: dict[str, int] = {}
+        economic_cardinality: dict[str, int] = {}
+        for row in ledger["spend_usage_receipts"]:
+            receipt_id = row["receipt_id"]
+            usage_cardinality[receipt_id] = usage_cardinality.get(receipt_id, 0) + 1
+        for row in ledger["spend_economic_receipts"]:
+            receipt_id = row["receipt_id"]
+            economic_cardinality[receipt_id] = (
+                economic_cardinality.get(receipt_id, 0) + 1
+            )
+        cardinality_mismatches = sorted(
+            receipt_id
+            for receipt_id in set(usage_cardinality) | set(economic_cardinality)
+            if usage_cardinality.get(receipt_id, 0) != 1
+            or economic_cardinality.get(receipt_id, 0) != 1
+        )
+        if cardinality_mismatches:
+            receipt_id = cardinality_mismatches[0]
+            errors["economic_receipt_view"].append(
+                f"{receipt_id}: raw v2 cardinality requires exactly one usage row "
+                f"and one economic row (usage={usage_cardinality.get(receipt_id, 0)}, "
+                f"economic={economic_cardinality.get(receipt_id, 0)})"
+            )
         legacy_ids = {row["receipt_id"] for row in ledger["receipts"]}
         usage_ids = {row["receipt_id"] for row in ledger["spend_usage_receipts"]}
         overlap = sorted(legacy_ids & usage_ids)
