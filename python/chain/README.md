@@ -99,6 +99,12 @@ loopback clients. Its exact route set is `POST /spend/authorize`, `/spend/claim`
 `/spend/ready`. Every route requires the existing signed envelope. Spend GET requests must
 have an empty body; all request bodies are capped at 64 KiB.
 
+When the ledger's primary listener must remain on its mesh address, start it with
+`--loopback-port PORT` to expose the same in-process service on loopback as well. Point the
+VPS reverse tunnel's hub-side target at `127.0.0.1:<loopback-port>`, not at the mesh listener.
+Both listeners share one store, roster cache, nonce table, and expiry sweeper; the
+`/spend/*` routes continue to return the unknown-route 404 to non-loopback clients.
+
 The authorization claim token is returned once and only its SHA-256 digest is stored. An
 identical authorization retry before any worker has claimed rotates to a fresh token on the
 same hold and atomically invalidates the previous token. After any worker claim, the retry

@@ -4,9 +4,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -31,7 +33,11 @@ from core.ledger_store import (  # noqa: E402
     SpendNotFound,
 )
 from ledger_auth import canonical_string  # noqa: E402
-from ledger_server import V2LedgerService, _make_v2_handler  # noqa: E402
+from ledger_server import (  # noqa: E402
+    V2LedgerService,
+    _DualHTTPServer,
+    _make_v2_handler,
+)
 from http.server import ThreadingHTTPServer  # noqa: E402
 
 
@@ -528,6 +534,107 @@ def _request(base, method, path, identity=None, obj=None):
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
+
+
+def _direct_request(
+    host, port, method, path, identity=None, obj=None, *, timestamp=None
+):
+    body = json.dumps(obj, separators=(",", ":")).encode() if obj is not None else b""
+    headers = {}
+    if identity is not None:
+        timestamp = int(time.time()) if timestamp is None else timestamp
+        signature = identity["private"].sign(
+            canonical_string(method, path, body, timestamp)
+        )
+        headers["Authorization"] = (
+            f'Sthambha-Ed25519 keyid="{identity["public"]}",'
+            f'sig="{base64.b64encode(signature).decode()}",ts="{timestamp}"'
+        )
+    if obj is not None:
+        headers["Content-Type"] = "application/json"
+    connection = http.client.HTTPConnection(host, port, timeout=5)
+    try:
+        connection.request(method, path, body=body if obj is not None else None,
+                           headers=headers)
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def _non_loopback_ipv4() -> str:
+    # A UDP connect selects the local interface without sending a packet.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.connect(("192.0.2.1", 9))
+        address = probe.getsockname()[0]
+    assert not ipaddress.ip_address(address).is_loopback
+    return address
+
+
+def test_dual_listener_shares_service_but_keeps_spend_loopback_only(
+    tmp_path, identities, monkeypatch
+):
+    monkeypatch.setenv("NAK_SPEND_ROUTES", "on")
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite", identities["roster"], sweep_interval=0.05
+    )
+    mesh_host = _non_loopback_ipv4()
+    servers = _DualHTTPServer(
+        mesh_host, 0, 0, _make_v2_handler(service)
+    )
+    runner = threading.Thread(target=servers.serve_forever, daemon=True)
+    runner.start()
+    mesh_port = servers.primary.server_address[1]
+    loopback_port = servers.loopback.server_address[1]
+    try:
+        health = (200, b'{"ok":true,"store":"sqlite","signed":true}')
+        assert _direct_request(mesh_host, mesh_port, "GET", "/health") == health
+        assert _direct_request("127.0.0.1", loopback_port, "GET", "/health") == health
+
+        timestamp = int(time.time())
+        balance = (200, b'{"account":"payer","balance":0}')
+        assert _direct_request(
+            mesh_host, mesh_port, "GET", "/balance", identities["payer"],
+            timestamp=timestamp,
+        ) == balance
+        # The replay is rejected across listeners because they share one nonce table.
+        assert _direct_request(
+            "127.0.0.1", loopback_port, "GET", "/balance", identities["payer"],
+            timestamp=timestamp,
+        ) == (401, b'{"error":"invalid or replayed signed envelope"}')
+        assert _direct_request(
+            "127.0.0.1", loopback_port, "GET", "/balance", identities["payer"],
+            timestamp=timestamp + 1,
+        ) == balance
+
+        authorization = _authorize_body(identities)
+        not_found = (404, b'{"error":"not found"}')
+        assert _direct_request(
+            mesh_host, mesh_port, "POST", "/spend/authorize",
+            identities["payer"], authorization, timestamp=timestamp + 2,
+        ) == not_found
+        code, raw = _direct_request(
+            "127.0.0.1", loopback_port, "POST", "/spend/authorize",
+            identities["payer"], authorization, timestamp=timestamp + 2,
+        )
+        assert code == 200
+        assert json.loads(raw)["claim_token"]
+
+        sweepers = [
+            thread for thread in threading.enumerate()
+            if thread.name == "neuron-spend-expiry" and thread.is_alive()
+        ]
+        assert sweepers == [service._sweeper]
+    finally:
+        servers.shutdown()
+        runner.join(timeout=5)
+        service.close()
+
+    assert not runner.is_alive()
+    assert servers.primary.socket.fileno() == -1
+    assert servers.loopback.socket.fileno() == -1
+    assert servers._loopback_thread is not None
+    assert not servers._loopback_thread.is_alive()
 
 
 def _resign_usage(service, payload, identity):

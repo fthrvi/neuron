@@ -1145,11 +1145,59 @@ def _make_v2_handler(svc: V2LedgerService):
     return H
 
 
+class _DualHTTPServer:
+    """Serve one handler on the mesh address and a loopback address."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        loopback_port: int,
+        handler: type[BaseHTTPRequestHandler],
+    ):
+        self.primary = ThreadingHTTPServer((host, port), handler)
+        try:
+            self.loopback = ThreadingHTTPServer(
+                ("127.0.0.1", loopback_port), handler
+            )
+        except BaseException:
+            self.primary.server_close()
+            raise
+        self._loopback_thread: threading.Thread | None = None
+
+    def serve_forever(self) -> None:
+        self._loopback_thread = threading.Thread(
+            target=self.loopback.serve_forever,
+            name="neuron-ledger-loopback-listener",
+            daemon=True,
+        )
+        self._loopback_thread.start()
+        try:
+            self.primary.serve_forever()
+        finally:
+            self.loopback.shutdown()
+            self._loopback_thread.join()
+            self.server_close()
+
+    def shutdown(self) -> None:
+        """Stop both serving loops when called from another thread."""
+        self.primary.shutdown()
+        self.loopback.shutdown()
+
+    def server_close(self) -> None:
+        self.primary.server_close()
+        self.loopback.server_close()
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8093)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument(
+        "--loopback-port", type=int,
+        help="also listen on 127.0.0.1:PORT using the same service instance",
+    )
     ap.add_argument("--path", default=DEFAULT_PATH)
     ap.add_argument("--store", help="enable v2 with this SQLite ledger path")
     ap.add_argument("--roster", default=DEFAULT_ROSTER,
@@ -1164,11 +1212,26 @@ def main():
         svc = LedgerService(args.path, grace=args.grace)
         handler = _make_handler(svc)
         description = args.path
-    srv = ThreadingHTTPServer((args.host, args.port), handler)
+    if args.loopback_port is None:
+        srv = ThreadingHTTPServer((args.host, args.port), handler)
+        print(f"[ledger] serving on {args.host}:{args.port}  store={description}", flush=True)
+        try:
+            srv.serve_forever()
+        finally:
+            if isinstance(svc, V2LedgerService):
+                svc.close()
+        return
+
+    servers = _DualHTTPServer(args.host, args.port, args.loopback_port, handler)
     print(f"[ledger] serving on {args.host}:{args.port}  store={description}", flush=True)
+    print(
+        f"[ledger] also serving on 127.0.0.1:{args.loopback_port}",
+        flush=True,
+    )
     try:
-        srv.serve_forever()
+        servers.serve_forever()
     finally:
+        servers.server_close()
         if isinstance(svc, V2LedgerService):
             svc.close()
 
