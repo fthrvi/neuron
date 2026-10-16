@@ -20,9 +20,13 @@ current trusted mesh.
 """
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
 import os
 import re
+import secrets
+import stat
 import tempfile
 import threading
 import time
@@ -30,6 +34,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 from urllib.parse import parse_qs, urlparse
+
+from cryptography.fernet import Fernet, InvalidToken
 
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
@@ -44,6 +50,11 @@ from core.ledger_store import (  # noqa: E402
     LedgerValueError,
     PayoutAddressError,
     ReceiptStateError,
+    SPEND_EXPIRY_BATCH_SIZE,
+    SPEND_USAGE_FIELDS,
+    SpendConflict,
+    SpendExpired,
+    SpendStateError,
     WithdrawalRateLimitError,
     WithdrawalTierError,
     is_reserved,
@@ -59,7 +70,32 @@ from ledger_auth import (  # noqa: E402
 DEFAULT_PATH = os.path.expanduser("~/.neuron/credits/ledger.json")
 DEFAULT_ROSTER = os.path.expanduser("~/.nakshatra/admission-peers.tsv")
 MAX_BODY_BYTES = 64 * 1024
+MAX_SPEND_IDENTIFIER_BYTES = 256
+MAX_SPEND_WORKERS = 128
+MAX_SPEND_PROMPT_TOKENS = 1_000_000
+MAX_SPEND_OUTPUT_TOKENS = 1_000_000
+MAX_SPEND_LAYERS = 1_000_000
+SPEND_PRICE_MULTIPLIER = 1
+SPEND_SWEEP_INTERVAL_S = 30.0
+SPEND_CAPABILITY = "spend_online_claim_v1"
 _BASE58_ALPHABET = frozenset("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+_SPEND_POST_PATHS = frozenset(
+    {
+        "/spend/authorize",
+        "/spend/claim",
+        "/spend/settle",
+        "/spend/abandon",
+        "/spend/release",
+    }
+)
+_SPEND_GET_PATHS = frozenset(
+    {"/spend/status", "/spend/ready", "/spend/readiness", "/spend/claim"}
+)
+_SPEND_PATHS = _SPEND_POST_PATHS | _SPEND_GET_PATHS
+
+
+class SpendDependencyError(RuntimeError):
+    """A local dependency required by the spend API is unavailable."""
 
 
 class LedgerService:
@@ -257,6 +293,167 @@ def _funds_routes_enabled() -> bool:
     return os.environ.get("NAK_FUNDS_ROUTES", "").strip().lower() == "on"
 
 
+def _spend_routes_enabled() -> bool:
+    return os.environ.get("NAK_SPEND_ROUTES", "").strip().lower() == "on"
+
+
+def _strict_json_object(body: bytes) -> dict[str, object]:
+    """Decode one JSON object while rejecting duplicate object keys."""
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise LedgerValueError(f"duplicate field {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        decoded = json.loads(body or b"{}", object_pairs_hook=object_pairs)
+    except LedgerValueError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LedgerValueError("body must be valid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise LedgerValueError("request body must be an object")
+    return decoded
+
+
+def _strict_fields(
+    body: object, expected: set[str] | frozenset[str], *, name: str = "request"
+) -> dict[str, object]:
+    if not isinstance(body, dict):
+        raise LedgerValueError(f"{name} body must be an object")
+    actual = set(body)
+    if actual != set(expected):
+        missing = sorted(set(expected) - actual)
+        unknown = sorted(actual - set(expected))
+        detail = f"missing {missing[0]!r}" if missing else f"unknown {unknown[0]!r}"
+        raise LedgerValueError(f"strict {name} schema: {detail}")
+    return body
+
+
+def _bounded_text(value: object, name: str, *, maximum: int = MAX_SPEND_IDENTIFIER_BYTES) -> str:
+    if not isinstance(value, str) or not value:
+        raise LedgerValueError(f"{name} must be a non-empty string")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise LedgerValueError(f"{name} must be valid UTF-8") from exc
+    if size > maximum:
+        raise LedgerValueError(f"{name} exceeds {maximum} bytes")
+    if any(ord(char) < 0x20 or ord(char) == 0x7f for char in value):
+        raise LedgerValueError(f"{name} contains a control character")
+    return value
+
+
+def _bounded_integer(value: object, name: str, *, low: int, high: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise LedgerValueError(f"{name} must be an integer")
+    if value < low or value > high:
+        raise LedgerValueError(f"{name} must be between {low} and {high}")
+    return value
+
+
+def _ed25519_keyid(value: object, name: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise LedgerValueError(f"{name} must be a lowercase Ed25519 public key")
+    return value
+
+
+def _claim_token(value: object) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]{43}", value) is None:
+        raise LedgerValueError("claim_token must be 256-bit unpadded base64url")
+    return value
+
+
+def _exact_query(target, expected: set[str]) -> dict[str, str]:
+    parsed = parse_qs(target.query, keep_blank_values=True)
+    if set(parsed) != expected or any(len(values) != 1 for values in parsed.values()):
+        missing = sorted(expected - set(parsed))
+        unknown = sorted(set(parsed) - expected)
+        if missing:
+            detail = f"missing {missing[0]!r}"
+        elif unknown:
+            detail = f"unknown {unknown[0]!r}"
+        else:
+            detail = "duplicate query field"
+        raise LedgerValueError(f"strict query schema: {detail}")
+    return {key: values[0] for key, values in parsed.items()}
+
+
+def _loopback_client(address: object) -> bool:
+    try:
+        host = address[0]  # type: ignore[index]
+        return ipaddress.ip_address(host).is_loopback
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
+class _SpendTokenSealer:
+    """Persistent service-local key for short-lived authorize retry ciphertext."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fernet = Fernet(self._load_or_create_key())
+
+    def _load_or_create_key(self) -> bytes:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.path, flags)
+        except FileNotFoundError:
+            key = Fernet.generate_key()
+            create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                create_flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(self.path, create_flags, 0o600)
+            except FileExistsError:
+                fd = os.open(self.path, flags)
+            else:
+                try:
+                    pending = memoryview(key + b"\n")
+                    while pending:
+                        written = os.write(fd, pending)
+                        if written <= 0:
+                            raise OSError("short write creating spend token key")
+                        pending = pending[written:]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                directory_fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                return key
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise PermissionError("spend token key is not a regular file")
+            if metadata.st_uid != os.geteuid():
+                raise PermissionError("spend token key must be owned by the service uid")
+            if metadata.st_mode & 0o077:
+                raise PermissionError("spend token key must have mode 0600")
+            key = os.read(fd, 256).strip()
+        finally:
+            os.close(fd)
+        if len(key) != 44:
+            raise PermissionError("spend token key has an invalid encoding")
+        return key
+
+    def seal(self, token: str) -> str:
+        return self._fernet.encrypt(token.encode("ascii")).decode("ascii")
+
+    def open(self, sealed: str) -> str:
+        try:
+            return self._fernet.decrypt(sealed.encode("ascii")).decode("ascii")
+        except (InvalidToken, UnicodeError, ValueError) as exc:
+            raise SpendStateError("spend authorization token recovery failed") from exc
+
+
 def _solana_address(value: object) -> str:
     if not isinstance(value, str) or not 32 <= len(value) <= 44:
         raise LedgerValueError("address must be a Solana base58 public key")
@@ -283,12 +480,395 @@ def _credits_as_usdc(credits: int) -> str:
 class V2LedgerService:
     """Authenticated service boundary for the durable SQLite ledger."""
 
-    def __init__(self, store_path: str | Path, roster_path: str | Path):
-        self.store = LedgerStore(store_path)
+    def __init__(
+        self,
+        store_path: str | Path,
+        roster_path: str | Path,
+        *,
+        clock: Callable[[], float] | None = None,
+        token_key_path: str | Path | None = None,
+        sweep_interval: float = SPEND_SWEEP_INTERVAL_S,
+        start_sweeper: bool = True,
+    ):
+        self.store = LedgerStore(store_path, clock=clock)
         self.rosters = RosterCache(roster_path)
+        self._token_key_path = Path(
+            token_key_path or (str(store_path) + ".spend-token.key")
+        )
+        self._sealer_lock = threading.Lock()
+        self._token_sealer: _SpendTokenSealer | None = None
+        self._sweep_interval = max(0.01, float(sweep_interval))
+        self._sweep_stop = threading.Event()
+        self._sweep_error: str | None = None
+        self._sweeper: threading.Thread | None = None
+        if start_sweeper:
+            self._sweeper = threading.Thread(
+                target=self._sweep_spend_holds,
+                name="neuron-spend-expiry",
+                daemon=True,
+            )
+            self._sweeper.start()
 
     def close(self) -> None:
+        self._sweep_stop.set()
+        if self._sweeper is not None:
+            self._sweeper.join(timeout=max(1.0, self._sweep_interval * 2))
         self.store.close()
+
+    def _sealer(self) -> _SpendTokenSealer:
+        with self._sealer_lock:
+            if self._token_sealer is None:
+                try:
+                    self._token_sealer = _SpendTokenSealer(self._token_key_path)
+                except (OSError, ValueError) as exc:
+                    raise SpendDependencyError(
+                        "spend token sealing key is unavailable"
+                    ) from exc
+            return self._token_sealer
+
+    def _sweep_spend_holds(self) -> None:
+        while not self._sweep_stop.wait(self._sweep_interval):
+            try:
+                self.store.expire_spend_holds(SPEND_EXPIRY_BATCH_SIZE)
+                self._sweep_error = None
+            except Exception as exc:
+                # The readiness result goes false; the daemon stays alive so a
+                # transient SQLite failure can recover on the next bounded tick.
+                self._sweep_error = type(exc).__name__
+
+    @staticmethod
+    def _status_response(status: Mapping[str, object]) -> dict[str, object]:
+        workers = []
+        for raw in status["workers"]:  # type: ignore[index]
+            entry = raw  # type: ignore[assignment]
+            workers.append(
+                {
+                    "worker_keyid": entry["worker_keyid"],
+                    "worker_account_at_authorize": entry["worker_account_at_authorize"],
+                    "billable": bool(entry["billable"]),
+                    "layer_start": int(entry["layer_start"]),
+                    "layer_end": int(entry["layer_end"]),
+                    "price_multiplier": int(entry["price_multiplier"]),
+                    "max_prompt_tokens": int(entry["max_prompt_tokens"]),
+                    "max_output_tokens": int(entry["max_output_tokens"]),
+                    "max_token_layers": int(entry["max_token_layers"]),
+                    "max_cost": int(entry["max_cost"]),
+                    "state": entry["state"],
+                    "claimed_at": entry["claimed_at"],
+                    "cumulative_prompt_tokens": int(entry["cumulative_prompt_tokens"]),
+                    "cumulative_generated_tokens": int(entry["cumulative_generated_tokens"]),
+                    "cumulative_token_layers": int(entry["cumulative_token_layers"]),
+                    "cumulative_cost": int(entry["cumulative_cost"]),
+                    "final": bool(entry["final"]),
+                    "final_receipt_id": entry["final_receipt_id"],
+                    "claim_response_sha256": entry["claim_response_sha256"],
+                }
+            )
+        return {
+            "v": 1,
+            "hold_id": status["hold_id"],
+            "payer_keyid": status["payer_keyid"],
+            "payer_account_at_authorize": status["payer_account_at_authorize"],
+            "session_id": status["session_id"],
+            "model_id": status["model_id"],
+            "billing_mode": status["billing_mode"],
+            "max_prompt_tokens": int(status["max_prompt_tokens"]),
+            "max_output_tokens": int(status["max_output_tokens"]),
+            "max_token_layers": int(status["max_token_layers"]),
+            "max_cost": int(status["max_cost"]),
+            "state": status["state"],
+            "release_requested": bool(status["release_requested"]),
+            "authorized_at": int(status["authorized_at"]),
+            "execution_deadline": int(status["execution_deadline"]),
+            "settlement_deadline": int(status["settlement_deadline"]),
+            "terminal_at": status["terminal_at"],
+            "escrow_balance": int(status["escrow_balance"]),
+            "workers": workers,
+        }
+
+    @staticmethod
+    def _claim_response(
+        status: Mapping[str, object], worker_keyid: str
+    ) -> dict[str, object]:
+        entry = next(
+            worker
+            for worker in status["workers"]  # type: ignore[index]
+            if worker["worker_keyid"] == worker_keyid
+        )
+        if entry["claimed_at"] is None or entry["claim_response_sha256"] is None:
+            raise SpendStateError("worker claim snapshot was not persisted")
+        return {
+            "v": 1,
+            "hold_id": status["hold_id"],
+            "token_sha256": status["token_digest"],
+            "claim_instance": entry["claim_instance"],
+            "payer_keyid": status["payer_keyid"],
+            "payer_account_at_authorize": status["payer_account_at_authorize"],
+            "worker_keyid": entry["worker_keyid"],
+            "worker_account_at_authorize": entry["worker_account_at_authorize"],
+            "billable": bool(entry["billable"]),
+            "session_id": status["session_id"],
+            "model_id": status["model_id"],
+            "billing_mode": status["billing_mode"],
+            "layer_start": int(entry["layer_start"]),
+            "layer_end": int(entry["layer_end"]),
+            "price_multiplier": int(entry["price_multiplier"]),
+            "max_prompt_tokens": int(entry["max_prompt_tokens"]),
+            "max_output_tokens": int(entry["max_output_tokens"]),
+            "max_token_layers": int(entry["max_token_layers"]),
+            "max_cost": int(entry["max_cost"]),
+            "execution_deadline": int(status["execution_deadline"]),
+            "settlement_deadline": int(status["settlement_deadline"]),
+            "server_time": int(entry["claimed_at"]),
+            "claim_response_sha256": entry["claim_response_sha256"],
+        }
+
+    def authorize_spend(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        request = _strict_fields(
+            body,
+            {
+                "client_nonce", "session_id", "model_id", "billing_mode",
+                "max_prompt_tokens", "max_output_tokens", "workers",
+            },
+            name="spend authorize",
+        )
+        payer_account, payer_tier = _row_identity(keyid, roster)
+        client_nonce = _bounded_text(request["client_nonce"], "client_nonce")
+        session_id = _bounded_text(request["session_id"], "session_id")
+        model_id = _bounded_text(request["model_id"], "model_id")
+        billing_mode = _bounded_text(request["billing_mode"], "billing_mode")
+        if billing_mode != "greedy-direct-v1":
+            raise LedgerValueError("billing_mode must be greedy-direct-v1")
+        prompt_cap = _bounded_integer(
+            request["max_prompt_tokens"], "max_prompt_tokens",
+            low=0, high=MAX_SPEND_PROMPT_TOKENS,
+        )
+        output_cap = _bounded_integer(
+            request["max_output_tokens"], "max_output_tokens",
+            low=0, high=MAX_SPEND_OUTPUT_TOKENS,
+        )
+        if prompt_cap + output_cap == 0:
+            raise LedgerValueError("prompt and output caps cannot both be zero")
+        raw_workers = request["workers"]
+        if not isinstance(raw_workers, list):
+            raise LedgerValueError("workers must be a list")
+        if not 1 <= len(raw_workers) <= MAX_SPEND_WORKERS:
+            raise LedgerValueError(
+                f"workers must contain between 1 and {MAX_SPEND_WORKERS} entries"
+            )
+        workers = []
+        seen: set[str] = set()
+        for index, raw in enumerate(raw_workers):
+            worker = _strict_fields(
+                raw,
+                {"worker_keyid", "layer_start", "layer_end"},
+                name=f"spend authorize worker[{index}]",
+            )
+            worker_keyid = _ed25519_keyid(worker["worker_keyid"], "worker_keyid")
+            if worker_keyid in seen:
+                raise LedgerValueError("worker_keyid entries must be unique")
+            seen.add(worker_keyid)
+            worker_account, _worker_tier = _row_identity(worker_keyid, roster)
+            layer_start = _bounded_integer(
+                worker["layer_start"], "layer_start", low=0, high=MAX_SPEND_LAYERS - 1
+            )
+            layer_end = _bounded_integer(
+                worker["layer_end"], "layer_end", low=1, high=MAX_SPEND_LAYERS
+            )
+            if layer_end <= layer_start:
+                raise LedgerValueError("layer_end must be greater than layer_start")
+            workers.append(
+                {
+                    "worker_keyid": worker_keyid,
+                    "worker_account": worker_account,
+                    "layer_start": layer_start,
+                    "layer_end": layer_end,
+                    "price_multiplier": SPEND_PRICE_MULTIPLIER,
+                }
+            )
+
+        token = secrets.token_urlsafe(32)
+        token_digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+        sealed = self._sealer().seal(token)
+        status = self.store.authorize_spend(
+            payer_keyid=keyid,
+            payer_account=payer_account,
+            tier=payer_tier,
+            client_nonce=client_nonce,
+            session_id=session_id,
+            model_id=model_id,
+            billing_mode=billing_mode,
+            max_prompt_tokens=prompt_cap,
+            max_output_tokens=output_cap,
+            workers=workers,
+            token_digest=token_digest,
+            sealed_token=sealed,
+        )
+        stored_sealed, stored_digest = self.store.spend_authorize_recovery(
+            str(status["hold_id"])
+        )
+        recovered = self._sealer().open(stored_sealed)
+        if hashlib.sha256(recovered.encode("ascii")).hexdigest() != stored_digest:
+            raise SpendStateError("spend authorization token recovery digest mismatch")
+        return {
+            "v": 1,
+            "claim_token": recovered,
+            "hold_id": status["hold_id"],
+            "max_token_layers": int(status["max_token_layers"]),
+            "max_cost": int(status["max_cost"]),
+            "execution_deadline": int(status["execution_deadline"]),
+            "settlement_deadline": int(status["settlement_deadline"]),
+            "workers": [
+                {
+                    "worker_keyid": worker["worker_keyid"],
+                    "billable": bool(worker["billable"]),
+                    "max_token_layers": int(worker["max_token_layers"]),
+                    "max_cost": int(worker["max_cost"]),
+                }
+                for worker in status["workers"]
+            ],
+        }
+
+    def claim_spend(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _row_identity(keyid, roster)
+        request = _strict_fields(
+            body, {"claim_token", "claim_instance"}, name="spend claim"
+        )
+        token = _claim_token(request["claim_token"])
+        claim_instance = _bounded_text(request["claim_instance"], "claim_instance")
+        digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+        try:
+            hold_id = self.store.spend_hold_for_token(digest)
+        except SpendStateError as exc:
+            raise PermissionError("claim token is invalid") from exc
+        current = self.store.spend_status(hold_id)
+        if keyid not in {entry["worker_keyid"] for entry in current["workers"]}:
+            raise PermissionError("signer is not a listed worker")
+        status = self.store.claim_spend_worker(hold_id, keyid, claim_instance)
+        return self._claim_response(status, keyid)
+
+    def settle_spend(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _row_identity(keyid, roster)
+        request = _strict_fields(
+            body, {"receipt", "signature"}, name="spend settle"
+        )
+        receipt = request["receipt"]
+        signature = request["signature"]
+        if not isinstance(receipt, dict):
+            raise LedgerValueError("receipt must be an object")
+        if set(receipt) == SPEND_USAGE_FIELDS:
+            _ed25519_keyid(receipt["payer_keyid"], "payer_keyid")
+            _ed25519_keyid(receipt["worker_keyid"], "worker_keyid")
+            for field in (
+                "hold_id", "payer_account_at_authorize",
+                "worker_account_at_authorize", "session_id", "model_id",
+                "billing_mode",
+            ):
+                _bounded_text(receipt[field], field)
+            _bounded_text(receipt["termination"], "termination", maximum=64)
+            if keyid not in {receipt["worker_keyid"], receipt["payer_keyid"]}:
+                raise PermissionError("signer is neither the worker nor payer")
+        if (
+            not isinstance(signature, str)
+            or re.fullmatch(r"[0-9a-f]{128}", signature) is None
+        ):
+            raise LedgerValueError("signature must be 64-byte lowercase hex")
+        status = self.store.settle_spend_usage(
+            receipt, signature, relayer_keyid=keyid
+        )
+        worker = next(
+            entry for entry in status["workers"]
+            if entry["worker_keyid"] == receipt.get("worker_keyid")
+        )
+        return {
+            "v": 1,
+            "hold_id": status["hold_id"],
+            "receipt_id": status["receipt_id"],
+            "accepted_delta": int(status["accepted_delta"]),
+            "cumulative_charge": int(worker["cumulative_cost"]),
+            "replayed": bool(status["replayed"]),
+            "state": status["state"],
+        }
+
+    def abandon_spend(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _row_identity(keyid, roster)
+        request = _strict_fields(
+            body, {"hold_id", "worker_keyid"}, name="spend abandon"
+        )
+        hold_id = _bounded_text(request["hold_id"], "hold_id")
+        worker_keyid = _ed25519_keyid(request["worker_keyid"], "worker_keyid")
+        current = self.store.spend_status(hold_id)
+        if current["payer_keyid"] != keyid:
+            raise PermissionError("signer does not own the spend hold")
+        status = self.store.abandon_spend_worker(hold_id, worker_keyid, keyid)
+        return self._status_response(status)
+
+    def release_spend(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _row_identity(keyid, roster)
+        request = _strict_fields(body, {"hold_id"}, name="spend release")
+        hold_id = _bounded_text(request["hold_id"], "hold_id")
+        current = self.store.spend_status(hold_id)
+        if current["payer_keyid"] != keyid:
+            raise PermissionError("signer does not own the spend hold")
+        status = self.store.request_spend_release(hold_id, keyid)
+        return self._status_response(status)
+
+    def spend_status(
+        self,
+        hold_id: str,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _row_identity(keyid, roster)
+        hold_id = _bounded_text(hold_id, "hold_id")
+        status = self.store.refresh_spend_status(hold_id)
+        allowed = keyid == status["payer_keyid"] or any(
+            entry["worker_keyid"] == keyid for entry in status["workers"]
+        )
+        if not allowed:
+            raise PermissionError("signer is outside the spend hold scope")
+        return self._status_response(status)
+
+    def spend_ready(
+        self,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _row_identity(keyid, roster)
+        self._sealer()
+        with self.store._lock:
+            self.store._db.execute("SELECT 1").fetchone()
+        return {
+            "v": 1,
+            "ready": self._sweep_error is None,
+            "capability": SPEND_CAPABILITY,
+            "server_time": self.store._now(),
+        }
 
     def settle(
         self,
@@ -493,8 +1073,16 @@ def _make_v2_handler(svc: V2LedgerService):
             if funds_path and not _funds_routes_enabled():
                 self._send(404, {"error": "not found"})
                 return
+            spend_endpoint = target.path in _SPEND_PATHS
+            if spend_endpoint and (
+                not _spend_routes_enabled() or not _loopback_client(self.client_address)
+            ):
+                self._send(404, {"error": "not found"})
+                return
+            spend_path = target.path in _SPEND_GET_PATHS
             if target.path not in (
-                "/balance", "/history", "/can_consume", "/wallet", "/wallet/status"
+                "/balance", "/history", "/can_consume", "/wallet", "/wallet/status",
+                *_SPEND_GET_PATHS,
             ):
                 self._send(404, {"error": "not found"})
                 return
@@ -522,11 +1110,26 @@ def _make_v2_handler(svc: V2LedgerService):
                     result = svc.can_consume(operator, tier, cost)
                 elif target.path == "/wallet":
                     result = svc.wallet(keyid, roster)
-                else:
+                elif target.path == "/wallet/status":
                     result = svc.wallet_status(keyid, roster)
+                elif target.path == "/spend/status":
+                    query = _exact_query(target, {"hold_id"})
+                    result = svc.spend_status(query["hold_id"], keyid, roster)
+                else:
+                    _exact_query(target, set())
+                    result = svc.spend_ready(keyid, roster)
                 self._send(200, result)
             except PermissionError as exc:
                 self._send(403, {"error": str(exc)})
+            except SpendConflict as exc:
+                self._send(409, {"error": str(exc)})
+            except SpendExpired as exc:
+                self._send(410, {"error": str(exc), "code": "spend_expired"})
+            except SpendStateError as exc:
+                code = 404 if "does not exist" in str(exc) else 409
+                self._send(code, {"error": str(exc)})
+            except SpendDependencyError as exc:
+                self._send(503, {"error": str(exc)})
             except LedgerValueError as exc:
                 self._send(422, {"error": str(exc)})
 
@@ -536,6 +1139,13 @@ def _make_v2_handler(svc: V2LedgerService):
             if funds_path and not _funds_routes_enabled():
                 self._send(404, {"error": "not found"})
                 return
+            spend_endpoint = target.path in _SPEND_PATHS
+            if spend_endpoint and (
+                not _spend_routes_enabled() or not _loopback_client(self.client_address)
+            ):
+                self._send(404, {"error": "not found"})
+                return
+            spend_path = target.path in _SPEND_POST_PATHS
             body_bytes = self._raw_body()
             if body_bytes is None:
                 return
@@ -544,16 +1154,23 @@ def _make_v2_handler(svc: V2LedgerService):
                 return
             keyid, roster = authenticated
             if target.path not in (
-                "/settle", "/transfer", "/dispute", "/wallet/bind", "/withdraw"
+                "/settle", "/transfer", "/dispute", "/wallet/bind", "/withdraw",
+                *_SPEND_POST_PATHS,
             ):
                 self._send(404, {"error": "not found"})
                 return
             try:
-                body = json.loads(body_bytes or b"{}")
-            except (UnicodeDecodeError, json.JSONDecodeError):
+                body = (
+                    _strict_json_object(body_bytes)
+                    if spend_path
+                    else json.loads(body_bytes or b"{}")
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, LedgerValueError):
                 self._send(400, {"error": "body must be valid JSON"})
                 return
             try:
+                if spend_path and target.query:
+                    raise LedgerValueError("spend POST routes do not accept a query")
                 if target.path == "/settle":
                     result = svc.settle(body, keyid, roster)
                 elif target.path == "/transfer":
@@ -562,8 +1179,18 @@ def _make_v2_handler(svc: V2LedgerService):
                     result = svc.dispute(body, keyid, roster)
                 elif target.path == "/wallet/bind":
                     result = svc.bind_wallet(body, keyid, roster)
-                else:
+                elif target.path == "/withdraw":
                     result = svc.withdraw(body, keyid, roster)
+                elif target.path == "/spend/authorize":
+                    result = svc.authorize_spend(body, keyid, roster)
+                elif target.path == "/spend/claim":
+                    result = svc.claim_spend(body, keyid, roster)
+                elif target.path == "/spend/settle":
+                    result = svc.settle_spend(body, keyid, roster)
+                elif target.path == "/spend/abandon":
+                    result = svc.abandon_spend(body, keyid, roster)
+                else:
+                    result = svc.release_spend(body, keyid, roster)
                 self._send(200, result)
             except CreditLimitError as exc:
                 self._send(422 if target.path == "/withdraw" else 402,
@@ -572,8 +1199,22 @@ def _make_v2_handler(svc: V2LedgerService):
                 self._send(403, {"error": str(exc)})
             except WithdrawalRateLimitError as exc:
                 self._send(429, {"error": str(exc)})
+            except SpendConflict as exc:
+                self._send(409, {"error": str(exc)})
+            except SpendExpired as exc:
+                expiry = (
+                    "execution_expired"
+                    if target.path in ("/spend/claim", "/spend/abandon")
+                    else "settlement_expired"
+                )
+                self._send(410, {"error": str(exc), "code": expiry})
+            except SpendStateError as exc:
+                code = 404 if "does not exist" in str(exc) else 409
+                self._send(code, {"error": str(exc)})
             except ReceiptStateError as exc:
                 self._send(409, {"error": str(exc)})
+            except SpendDependencyError as exc:
+                self._send(503, {"error": str(exc)})
             except PermissionError as exc:
                 self._send(403, {"error": str(exc)})
             except LookupError as exc:

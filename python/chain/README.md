@@ -76,6 +76,10 @@ path, and `nak-credit-reconciliation-v1` purpose inside the signed payload.
 - `NAK_FUNDS=off` is the payout worker's safe default. Only `on` permits treasury writes.
 - `NAK_FUNDS_ROUTES=on` exposes the wallet/withdraw HTTP routes. Leave it unset or `off`
   until the indexer, treasury, and first reconciliation are healthy.
+- `NAK_SPEND_ROUTES=on` exposes the signed loopback-only `/spend/*` routes. It defaults
+  off; disabled routes return the same JSON 404 as an unknown route. The authenticated
+  claim-capability probe is `GET /spend/ready`. The expiry worker continues closing any
+  already-created holds after this switch is turned off so rollback cannot strand escrow.
 - `NAK_PAYOUT_KILL_FILE` defaults to `~/.neuron/credits/payout.off`. Its presence halts
   payouts immediately. Reconciliation creates it on any stable mismatch, collection
   exception, or repeated inconclusive result and never removes it. Creation is exclusive,

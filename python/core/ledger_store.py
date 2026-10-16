@@ -482,6 +482,14 @@ class LedgerStore:
                 CHECK(final = 0 OR state = 'final')
             );
 
+            CREATE TABLE IF NOT EXISTS spend_authorize_recovery (
+                hold_id TEXT PRIMARY KEY,
+                sealed_token TEXT NOT NULL,
+                recover_until INTEGER NOT NULL
+                    CHECK(typeof(recover_until) = 'integer'),
+                FOREIGN KEY(hold_id) REFERENCES spend_holds(hold_id)
+            );
+
             CREATE TABLE IF NOT EXISTS spend_usage_receipts (
                 receipt_id TEXT PRIMARY KEY,
                 hold_id TEXT NOT NULL,
@@ -606,6 +614,12 @@ class LedgerStore:
             BEFORE DELETE ON spend_hold_workers
             BEGIN
                 SELECT RAISE(ABORT, 'spend worker entries are permanent');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS spend_authorize_recovery_no_update
+            BEFORE UPDATE ON spend_authorize_recovery
+            BEGIN
+                SELECT RAISE(ABORT, 'spend authorize recovery is immutable');
             END;
 
             CREATE TRIGGER IF NOT EXISTS spend_usage_receipts_no_update
@@ -998,6 +1012,7 @@ class LedgerStore:
         response = {
             "v": 1,
             "hold_id": str(hold["hold_id"]),
+            "token_sha256": str(hold["token_digest"] or ""),
             "claim_instance": claim_instance,
             "payer_keyid": str(hold["payer_keyid"]),
             "payer_account_at_authorize": str(hold["payer_account_at_authorize"]),
@@ -2746,12 +2761,14 @@ class LedgerStore:
         max_output_tokens: int,
         workers: Iterable[Mapping[str, Any]],
         hold_id: str | None = None,
+        token_digest: str | None = None,
+        sealed_token: str | None = None,
     ) -> dict[str, Any]:
         """Reserve one immutable, worst-case-priced paid execution plan.
 
-        The caller supplies an already authenticated roster snapshot.  N2 has
-        no HTTP route or opaque-token claim surface; N3 will bind this primitive
-        to its opaque authorization token.
+        The caller supplies an already authenticated roster snapshot.  The N3
+        HTTP boundary may additionally supply an opaque-token digest and its
+        short-lived encrypted idempotency copy.
         """
         # Parse only fields covered by the authenticated wire request before
         # looking up its idempotency key.  Roster accounts, tiers, billability,
@@ -2771,6 +2788,15 @@ class LedgerStore:
             raise LedgerValueError("prompt and output caps cannot both be zero")
         if hold_id is not None:
             hold_id = _identifier(hold_id, "hold_id")
+        if (token_digest is None) != (sealed_token is None):
+            raise LedgerValueError(
+                "token_digest and sealed_token must be supplied together"
+            )
+        if token_digest is not None:
+            if re.fullmatch(r"[0-9a-f]{64}", token_digest) is None:
+                raise LedgerValueError("token_digest must be 64 lowercase hex")
+            if not isinstance(sealed_token, str) or not sealed_token:
+                raise LedgerValueError("sealed_token must be a non-empty string")
         proposed_hold_id = hold_id or uuid.uuid4().hex
 
         if isinstance(workers, (str, bytes, Mapping)):
@@ -2940,9 +2966,9 @@ class LedgerStore:
                 "payer_account_at_authorize, payer_tier_at_authorize, client_nonce, "
                 "session_id, model_id, billing_mode, max_prompt_tokens, "
                 "max_output_tokens, max_token_layers, max_cost, "
-                "authorization_digest, request_digest, escrow_account, state, authorized_at, "
+                "authorization_digest, request_digest, token_digest, escrow_account, state, authorized_at, "
                 "execution_deadline, settlement_deadline, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
                 (
                     proposed_hold_id,
                     payer_keyid,
@@ -2958,6 +2984,7 @@ class LedgerStore:
                     total_cost,
                     authorization_digest,
                     request_digest,
+                    token_digest,
                     escrow_account,
                     now,
                     execution_deadline,
@@ -2965,6 +2992,12 @@ class LedgerStore:
                     now,
                 ),
             )
+            if sealed_token is not None:
+                db.execute(
+                    "INSERT INTO spend_authorize_recovery"
+                    "(hold_id, sealed_token, recover_until) VALUES (?, ?, ?)",
+                    (proposed_hold_id, sealed_token, execution_deadline),
+                )
             for worker in clean_workers:
                 db.execute(
                     "INSERT INTO spend_hold_workers(hold_id, entry_index, "
@@ -3015,10 +3048,53 @@ class LedgerStore:
 
         return self._tx(operation)
 
+    def spend_authorize_recovery(self, hold_id: str) -> tuple[str, str]:
+        """Return the encrypted idempotency token and its digest while recoverable."""
+        hold_id = _identifier(hold_id, "hold_id")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT r.sealed_token, r.recover_until, h.token_digest "
+                "FROM spend_authorize_recovery AS r "
+                "JOIN spend_holds AS h ON h.hold_id=r.hold_id "
+                "WHERE r.hold_id=?",
+                (hold_id,),
+            ).fetchone()
+            if row is None or self._now() >= int(row["recover_until"]):
+                raise SpendExpired("spend authorization token is no longer recoverable")
+            if row["token_digest"] is None:
+                raise LedgerInvariantError("spend authorization token digest is missing")
+            return str(row["sealed_token"]), str(row["token_digest"])
+
+    def spend_hold_for_token(self, token_digest: str) -> str:
+        """Resolve an opaque claim token digest without exposing token state."""
+        if not isinstance(token_digest, str) or re.fullmatch(
+            r"[0-9a-f]{64}", token_digest
+        ) is None:
+            raise LedgerValueError("token_digest must be 64 lowercase hex")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT hold_id FROM spend_holds WHERE token_digest=?",
+                (token_digest,),
+            ).fetchone()
+        if row is None:
+            raise SpendStateError("claim token is invalid")
+        return str(row["hold_id"])
+
+    def refresh_spend_status(self, hold_id: str) -> dict[str, Any]:
+        """Advance due lifecycle transitions, then return the current status."""
+        hold_id = _identifier(hold_id, "hold_id")
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            now = self._now()
+            self._advance_spend_hold_in(db, hold_id, now)
+            return self._spend_status_in(db, hold_id)
+
+        return self._tx(operation)
+
     def claim_spend_worker(
         self, hold_id: str, worker_keyid: str, claim_instance: str
     ) -> dict[str, Any]:
-        """Claim one planned entry by stable instance (internal pre-N3 primitive)."""
+        """Claim one planned entry by authenticated worker and stable instance."""
         hold_id = _identifier(hold_id, "hold_id")
         worker_keyid = _identifier(worker_keyid, "worker_keyid")
         claim_instance = _identifier(claim_instance, "claim_instance")
@@ -3481,6 +3557,10 @@ class LedgerStore:
 
         def operation(db: sqlite3.Connection) -> SpendExpiryBatch:
             sweep_cutoff = self._now() if cutoff is None else cutoff
+            db.execute(
+                "DELETE FROM spend_authorize_recovery WHERE recover_until<=?",
+                (sweep_cutoff,),
+            )
             rows = db.execute(
                 "SELECT hold_id FROM spend_holds "
                 "WHERE (state='open' AND execution_deadline<=?) "
