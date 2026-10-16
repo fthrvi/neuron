@@ -18,6 +18,7 @@ from core.ledger_store import (  # noqa: E402
     LedgerStore,
     LedgerValueError,
     SpendConflict,
+    SpendNotFound,
     SpendStateError,
 )
 from ledger_auth import ReceiptError, verify_receipt  # noqa: E402
@@ -169,7 +170,7 @@ def test_receipt_schema_hash_signature_and_hold_worker_binding_are_strict(tmp_pa
             store.settle_spend_usage(
                 receipt, "00" * 64, relayer_keyid=_public("worker")
             )
-        with pytest.raises(SpendStateError, match="relayer"):
+        with pytest.raises(SpendNotFound, match="not found"):
             store.settle_spend_usage(
                 receipt, signature, relayer_keyid=_public("attacker")
             )
@@ -177,7 +178,7 @@ def test_receipt_schema_hash_signature_and_hold_worker_binding_are_strict(tmp_pa
         wrong_worker = dict(receipt, worker_keyid=_public("attacker"))
         wrong_worker["receipt_id"] = store.spend_receipt_id(wrong_worker)
         canonical = json.dumps(wrong_worker, sort_keys=True, separators=(",", ":")).encode()
-        with pytest.raises(SpendStateError, match="not part"):
+        with pytest.raises(SpendNotFound, match="not found"):
             store.settle_spend_usage(
                 wrong_worker,
                 _private("attacker").sign(canonical).hex(),

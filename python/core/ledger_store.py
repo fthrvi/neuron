@@ -135,6 +135,10 @@ class SpendStateError(ReceiptStateError):
     """A spend hold or worker entry cannot make the requested transition."""
 
 
+class SpendNotFound(SpendStateError):
+    """A spend hold is absent or outside the authenticated caller's scope."""
+
+
 class SpendExpired(SpendStateError):
     """A spend lifecycle request arrived after its applicable deadline."""
 
@@ -482,14 +486,6 @@ class LedgerStore:
                 CHECK(final = 0 OR state = 'final')
             );
 
-            CREATE TABLE IF NOT EXISTS spend_authorize_recovery (
-                hold_id TEXT PRIMARY KEY,
-                sealed_token TEXT NOT NULL,
-                recover_until INTEGER NOT NULL
-                    CHECK(typeof(recover_until) = 'integer'),
-                FOREIGN KEY(hold_id) REFERENCES spend_holds(hold_id)
-            );
-
             CREATE TABLE IF NOT EXISTS spend_usage_receipts (
                 receipt_id TEXT PRIMARY KEY,
                 hold_id TEXT NOT NULL,
@@ -616,12 +612,6 @@ class LedgerStore:
                 SELECT RAISE(ABORT, 'spend worker entries are permanent');
             END;
 
-            CREATE TRIGGER IF NOT EXISTS spend_authorize_recovery_no_update
-            BEFORE UPDATE ON spend_authorize_recovery
-            BEGIN
-                SELECT RAISE(ABORT, 'spend authorize recovery is immutable');
-            END;
-
             CREATE TRIGGER IF NOT EXISTS spend_usage_receipts_no_update
             BEFORE UPDATE ON spend_usage_receipts
             BEGIN
@@ -722,6 +712,22 @@ class LedgerStore:
             )
         self._db.executescript(
             """
+            DROP TRIGGER IF EXISTS spend_authorize_recovery_no_update;
+            DROP TABLE IF EXISTS spend_authorize_recovery;
+
+            DROP TRIGGER IF EXISTS spend_holds_snapshots_immutable;
+            CREATE TRIGGER spend_holds_snapshots_immutable
+            BEFORE UPDATE OF payer_keyid, payer_account_at_authorize,
+                payer_tier_at_authorize, client_nonce, session_id, model_id,
+                billing_mode, max_prompt_tokens, max_output_tokens,
+                max_token_layers, max_cost, authorization_digest,
+                escrow_account, authorized_at, execution_deadline,
+                settlement_deadline
+            ON spend_holds
+            BEGIN
+                SELECT RAISE(ABORT, 'spend hold snapshot is immutable');
+            END;
+
             CREATE TRIGGER IF NOT EXISTS spend_holds_request_digest_immutable
             BEFORE UPDATE OF request_digest ON spend_holds
             BEGIN
@@ -2762,13 +2768,12 @@ class LedgerStore:
         workers: Iterable[Mapping[str, Any]],
         hold_id: str | None = None,
         token_digest: str | None = None,
-        sealed_token: str | None = None,
     ) -> dict[str, Any]:
         """Reserve one immutable, worst-case-priced paid execution plan.
 
         The caller supplies an already authenticated roster snapshot.  The N3
-        HTTP boundary may additionally supply an opaque-token digest and its
-        short-lived encrypted idempotency copy.
+        HTTP boundary may additionally supply an opaque-token digest. Identical
+        retries rotate that digest until the first worker claim.
         """
         # Parse only fields covered by the authenticated wire request before
         # looking up its idempotency key.  Roster accounts, tiers, billability,
@@ -2788,15 +2793,9 @@ class LedgerStore:
             raise LedgerValueError("prompt and output caps cannot both be zero")
         if hold_id is not None:
             hold_id = _identifier(hold_id, "hold_id")
-        if (token_digest is None) != (sealed_token is None):
-            raise LedgerValueError(
-                "token_digest and sealed_token must be supplied together"
-            )
         if token_digest is not None:
             if re.fullmatch(r"[0-9a-f]{64}", token_digest) is None:
                 raise LedgerValueError("token_digest must be 64 lowercase hex")
-            if not isinstance(sealed_token, str) or not sealed_token:
-                raise LedgerValueError("sealed_token must be a non-empty string")
         proposed_hold_id = hold_id or uuid.uuid4().hex
 
         if isinstance(workers, (str, bytes, Mapping)):
@@ -2857,6 +2856,21 @@ class LedgerStore:
                     )
                 now = self._now()
                 self._advance_spend_hold_in(db, str(existing["hold_id"]), now)
+                if token_digest is not None:
+                    claimed = db.execute(
+                        "SELECT 1 FROM spend_hold_workers WHERE hold_id=? "
+                        "AND claimed_at IS NOT NULL LIMIT 1",
+                        (existing["hold_id"],),
+                    ).fetchone()
+                    if claimed is not None:
+                        raise SpendConflict(
+                            "spend authorization token is already in use"
+                        )
+                    db.execute(
+                        "UPDATE spend_holds SET token_digest=?, updated_at=? "
+                        "WHERE hold_id=?",
+                        (token_digest, now, existing["hold_id"]),
+                    )
                 self._assert_spend_hold_in(db, str(existing["hold_id"]))
                 return self._spend_status_in(db, str(existing["hold_id"]))
 
@@ -2992,12 +3006,6 @@ class LedgerStore:
                     now,
                 ),
             )
-            if sealed_token is not None:
-                db.execute(
-                    "INSERT INTO spend_authorize_recovery"
-                    "(hold_id, sealed_token, recover_until) VALUES (?, ?, ?)",
-                    (proposed_hold_id, sealed_token, execution_deadline),
-                )
             for worker in clean_workers:
                 db.execute(
                     "INSERT INTO spend_hold_workers(hold_id, entry_index, "
@@ -3048,23 +3056,6 @@ class LedgerStore:
 
         return self._tx(operation)
 
-    def spend_authorize_recovery(self, hold_id: str) -> tuple[str, str]:
-        """Return the encrypted idempotency token and its digest while recoverable."""
-        hold_id = _identifier(hold_id, "hold_id")
-        with self._lock:
-            row = self._db.execute(
-                "SELECT r.sealed_token, r.recover_until, h.token_digest "
-                "FROM spend_authorize_recovery AS r "
-                "JOIN spend_holds AS h ON h.hold_id=r.hold_id "
-                "WHERE r.hold_id=?",
-                (hold_id,),
-            ).fetchone()
-            if row is None or self._now() >= int(row["recover_until"]):
-                raise SpendExpired("spend authorization token is no longer recoverable")
-            if row["token_digest"] is None:
-                raise LedgerInvariantError("spend authorization token digest is missing")
-            return str(row["sealed_token"]), str(row["token_digest"])
-
     def spend_hold_for_token(self, token_digest: str) -> str:
         """Resolve an opaque claim token digest without exposing token state."""
         if not isinstance(token_digest, str) or re.fullmatch(
@@ -3091,6 +3082,84 @@ class LedgerStore:
 
         return self._tx(operation)
 
+    def refresh_spend_status_scoped(
+        self, hold_id: str, caller_keyid: str
+    ) -> dict[str, Any]:
+        """Atomically authorize, advance, and return a caller-scoped hold."""
+        hold_id = _identifier(hold_id, "hold_id")
+        caller_keyid = _identifier(caller_keyid, "caller_keyid")
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            scoped = db.execute(
+                "SELECT 1 FROM spend_holds AS h WHERE h.hold_id=? AND "
+                "(h.payer_keyid=? OR EXISTS (SELECT 1 FROM spend_hold_workers AS w "
+                "WHERE w.hold_id=h.hold_id AND w.worker_keyid=?))",
+                (hold_id, caller_keyid, caller_keyid),
+            ).fetchone()
+            if scoped is None:
+                raise SpendNotFound("spend hold not found")
+            self._advance_spend_hold_in(db, hold_id, self._now())
+            return self._spend_status_in(db, hold_id)
+
+        return self._tx(operation)
+
+    @classmethod
+    def _claim_spend_worker_in(
+        cls,
+        db: sqlite3.Connection,
+        hold_id: str,
+        worker_keyid: str,
+        claim_instance: str,
+        now: int,
+    ) -> dict[str, Any] | SpendExpired:
+        cls._advance_spend_hold_in(db, hold_id, now)
+        hold = db.execute(
+            "SELECT * FROM spend_holds WHERE hold_id=?",
+            (hold_id,),
+        ).fetchone()
+        if hold is None:
+            raise SpendNotFound("spend hold not found")
+        entry = db.execute(
+            "SELECT * FROM spend_hold_workers "
+            "WHERE hold_id=? AND worker_keyid=?",
+            (hold_id, worker_keyid),
+        ).fetchone()
+        if entry is None:
+            raise SpendNotFound("spend hold not found")
+        if cls._spend_lifecycle_expired_in(db, hold_id, worker_keyid):
+            return SpendExpired("spend hold deadline has expired")
+        if entry["claim_instance"] is not None:
+            if entry["claim_instance"] != claim_instance:
+                raise SpendConflict("worker entry was claimed by another instance")
+            if entry["claim_response_sha256"] is None:
+                claimed_at = int(entry["claimed_at"])
+                claim_digest = cls._claim_response_digest(
+                    hold, entry, claim_instance, claimed_at
+                )
+                db.execute(
+                    "UPDATE spend_hold_workers SET claim_response_sha256=? "
+                    "WHERE hold_id=? AND worker_keyid=?",
+                    (claim_digest, hold_id, worker_keyid),
+                )
+            return cls._spend_status_in(db, hold_id)
+        if hold["state"] != "open":
+            raise SpendStateError(f"spend hold is {hold['state']}")
+        if now >= int(hold["execution_deadline"]):
+            raise SpendStateError("spend execution deadline has passed")
+        if entry["state"] != "planned":
+            raise SpendStateError(f"worker entry is {entry['state']}")
+        claim_digest = cls._claim_response_digest(
+            hold, entry, claim_instance, now
+        )
+        db.execute(
+            "UPDATE spend_hold_workers SET state='claimed', claim_instance=?, "
+            "claim_response_sha256=?, claimed_at=?, updated_at=? "
+            "WHERE hold_id=? AND worker_keyid=?",
+            (claim_instance, claim_digest, now, now, hold_id, worker_keyid),
+        )
+        cls._assert_spend_hold_in(db, hold_id)
+        return cls._spend_status_in(db, hold_id)
+
     def claim_spend_worker(
         self, hold_id: str, worker_keyid: str, claim_instance: str
     ) -> dict[str, Any]:
@@ -3100,54 +3169,38 @@ class LedgerStore:
         claim_instance = _identifier(claim_instance, "claim_instance")
 
         def operation(db: sqlite3.Connection) -> dict[str, Any] | SpendExpired:
-            now = self._now()
-            self._advance_spend_hold_in(db, hold_id, now)
-            hold = db.execute(
-                "SELECT * FROM spend_holds WHERE hold_id=?",
-                (hold_id,),
-            ).fetchone()
-            if hold is None:
-                raise SpendStateError(f"spend hold {hold_id!r} does not exist")
-            entry = db.execute(
-                "SELECT * FROM spend_hold_workers "
-                "WHERE hold_id=? AND worker_keyid=?",
-                (hold_id, worker_keyid),
-            ).fetchone()
-            if entry is None:
-                raise SpendStateError("worker is not part of the spend hold")
-            if self._spend_lifecycle_expired_in(db, hold_id, worker_keyid):
-                return SpendExpired("spend hold deadline has expired")
-            if entry["claim_instance"] is not None:
-                if entry["claim_instance"] != claim_instance:
-                    raise SpendConflict("worker entry was claimed by another instance")
-                if entry["claim_response_sha256"] is None:
-                    claimed_at = int(entry["claimed_at"])
-                    claim_digest = self._claim_response_digest(
-                        hold, entry, claim_instance, claimed_at
-                    )
-                    db.execute(
-                        "UPDATE spend_hold_workers SET claim_response_sha256=? "
-                        "WHERE hold_id=? AND worker_keyid=?",
-                        (claim_digest, hold_id, worker_keyid),
-                    )
-                return self._spend_status_in(db, hold_id)
-            if hold["state"] != "open":
-                raise SpendStateError(f"spend hold is {hold['state']}")
-            if now >= int(hold["execution_deadline"]):
-                raise SpendStateError("spend execution deadline has passed")
-            if entry["state"] != "planned":
-                raise SpendStateError(f"worker entry is {entry['state']}")
-            claim_digest = self._claim_response_digest(
-                hold, entry, claim_instance, now
+            return self._claim_spend_worker_in(
+                db, hold_id, worker_keyid, claim_instance, self._now()
             )
-            db.execute(
-                "UPDATE spend_hold_workers SET state='claimed', claim_instance=?, "
-                "claim_response_sha256=?, claimed_at=?, updated_at=? "
-                "WHERE hold_id=? AND worker_keyid=?",
-                (claim_instance, claim_digest, now, now, hold_id, worker_keyid),
+
+        result = self._tx(operation)
+        if isinstance(result, SpendExpired):
+            raise result
+        return result
+
+    def claim_spend_worker_for_token(
+        self, token_digest: str, worker_keyid: str, claim_instance: str
+    ) -> dict[str, Any]:
+        """Atomically resolve a token in worker scope and claim its entry."""
+        if not isinstance(token_digest, str) or re.fullmatch(
+            r"[0-9a-f]{64}", token_digest
+        ) is None:
+            raise LedgerValueError("token_digest must be 64 lowercase hex")
+        worker_keyid = _identifier(worker_keyid, "worker_keyid")
+        claim_instance = _identifier(claim_instance, "claim_instance")
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any] | SpendExpired:
+            row = db.execute(
+                "SELECT h.hold_id FROM spend_holds AS h "
+                "JOIN spend_hold_workers AS w ON w.hold_id=h.hold_id "
+                "WHERE h.token_digest=? AND w.worker_keyid=?",
+                (token_digest, worker_keyid),
+            ).fetchone()
+            if row is None:
+                raise SpendNotFound("spend hold not found")
+            return self._claim_spend_worker_in(
+                db, str(row["hold_id"]), worker_keyid, claim_instance, self._now()
             )
-            self._assert_spend_hold_in(db, hold_id)
-            return self._spend_status_in(db, hold_id)
 
         result = self._tx(operation)
         if isinstance(result, SpendExpired):
@@ -3223,11 +3276,20 @@ class LedgerStore:
             raise LedgerValueError("worker usage receipt signature is invalid") from exc
         relayer_keyid = _identifier(relayer_keyid, "relayer_keyid")
         if relayer_keyid not in {worker_keyid, payer_keyid}:
-            raise SpendStateError("relayer is neither the worker nor payer")
+            raise SpendNotFound("spend hold not found")
         receipt_json = canonical
 
         def operation(db: sqlite3.Connection) -> dict[str, Any] | SpendExpired:
             now = self._now()
+            scoped = db.execute(
+                "SELECT 1 FROM spend_holds AS h WHERE h.hold_id=? AND "
+                "(h.payer_keyid=? OR EXISTS (SELECT 1 FROM spend_hold_workers AS w "
+                "WHERE w.hold_id=h.hold_id AND w.worker_keyid=?))",
+                (hold_id, relayer_keyid, relayer_keyid),
+            ).fetchone()
+            if scoped is None:
+                raise SpendNotFound("spend hold not found")
+            self._advance_spend_hold_in(db, hold_id, now)
             existing = db.execute(
                 "SELECT receipt_json, signature, accepted_delta, hold_id "
                 "FROM spend_usage_receipts WHERE receipt_id=?",
@@ -3244,12 +3306,11 @@ class LedgerStore:
                 )
                 return result
 
-            self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
                 "SELECT * FROM spend_holds WHERE hold_id=?", (hold_id,)
             ).fetchone()
             if hold is None:
-                raise SpendStateError(f"spend hold {hold_id!r} does not exist")
+                raise SpendNotFound("spend hold not found")
             entry = db.execute(
                 "SELECT * FROM spend_hold_workers WHERE hold_id=? AND worker_keyid=?",
                 (hold_id, worker_keyid),
@@ -3412,16 +3473,19 @@ class LedgerStore:
 
         def operation(db: sqlite3.Connection) -> dict[str, Any] | SpendExpired:
             now = self._now()
+            hold = db.execute(
+                "SELECT payer_keyid, payer_account_at_authorize, escrow_account, state "
+                "FROM spend_holds WHERE hold_id=? AND payer_keyid=?",
+                (hold_id, payer_keyid),
+            ).fetchone()
+            if hold is None:
+                raise SpendNotFound("spend hold not found")
             self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
                 "SELECT payer_keyid, payer_account_at_authorize, escrow_account, state "
                 "FROM spend_holds WHERE hold_id=?",
                 (hold_id,),
             ).fetchone()
-            if hold is None:
-                raise SpendStateError(f"spend hold {hold_id!r} does not exist")
-            if hold["payer_keyid"] != payer_keyid:
-                raise SpendStateError("payer does not own the spend hold")
             entry = db.execute(
                 "SELECT state, max_cost, cumulative_cost FROM spend_hold_workers "
                 "WHERE hold_id=? AND worker_keyid=?",
@@ -3476,16 +3540,19 @@ class LedgerStore:
 
         def operation(db: sqlite3.Connection) -> dict[str, Any]:
             now = self._now()
+            hold = db.execute(
+                "SELECT payer_keyid, payer_account_at_authorize, escrow_account, state, "
+                "release_requested FROM spend_holds WHERE hold_id=? AND payer_keyid=?",
+                (hold_id, payer_keyid),
+            ).fetchone()
+            if hold is None:
+                raise SpendNotFound("spend hold not found")
             self._advance_spend_hold_in(db, hold_id, now)
             hold = db.execute(
                 "SELECT payer_keyid, payer_account_at_authorize, escrow_account, state, "
                 "release_requested FROM spend_holds WHERE hold_id=?",
                 (hold_id,),
             ).fetchone()
-            if hold is None:
-                raise SpendStateError(f"spend hold {hold_id!r} does not exist")
-            if hold["payer_keyid"] != payer_keyid:
-                raise SpendStateError("payer does not own the spend hold")
             if hold["state"] in {"settled", "expired", "cancelled", "disputed"}:
                 return self._spend_status_in(db, hold_id)
             claimed = db.execute(
@@ -3557,10 +3624,6 @@ class LedgerStore:
 
         def operation(db: sqlite3.Connection) -> SpendExpiryBatch:
             sweep_cutoff = self._now() if cutoff is None else cutoff
-            db.execute(
-                "DELETE FROM spend_authorize_recovery WHERE recover_until<=?",
-                (sweep_cutoff,),
-            )
             rows = db.execute(
                 "SELECT hold_id FROM spend_holds "
                 "WHERE (state='open' AND execution_deadline<=?) "

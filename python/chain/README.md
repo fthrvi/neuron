@@ -91,6 +91,24 @@ The reconcile alert path calls Trisul's existing
 the host's existing Buzz identity; reconcile does not acquire or store new credentials.
 Delivery success or failure is recorded in the signed report and durable alert record.
 
+## Spend HTTP routes
+
+The spend API is disabled unless `NAK_SPEND_ROUTES=on`, and even then it is served only to
+loopback clients. Its exact route set is `POST /spend/authorize`, `/spend/claim`,
+`/spend/settle`, `/spend/abandon`, and `/spend/release`, plus `GET /spend/status` and
+`/spend/ready`. Every route requires the existing signed envelope. Spend GET requests must
+have an empty body; all request bodies are capped at 64 KiB.
+
+The authorization claim token is returned once and only its SHA-256 digest is stored. An
+identical authorization retry before any worker has claimed rotates to a fresh token on the
+same hold and atomically invalidates the previous token. After any worker claim, the retry
+returns a conflict instead of a token. There is no token-recovery key or backup dependency.
+
+Each ledger store has a neighboring `.spend-sweeper.lock` advisory-lock file. Exactly one
+service instance holds that lock and runs the expiry sweeper; other instances continue
+serving without a sweeper. The kernel releases ownership if the process exits or crashes,
+so a subsequently started instance takes over without deleting the lock file.
+
 ## Rollback and incident response
 
 To roll back S6, disable the timer (and stop an in-progress service):

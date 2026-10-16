@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from urllib.parse import urlparse
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -25,6 +28,7 @@ from core.ledger_store import (  # noqa: E402
     LedgerValueError,
     SpendConflict,
     SpendExpired,
+    SpendNotFound,
 )
 from ledger_auth import canonical_string  # noqa: E402
 from ledger_server import V2LedgerService, _make_v2_handler  # noqa: E402
@@ -123,13 +127,12 @@ def _service(tmp_path, identities, clock, **kwargs):
         tmp_path / "ledger.sqlite",
         identities["roster"],
         clock=lambda: clock[0],
-        token_key_path=tmp_path / "token.key",
         start_sweeper=False,
         **kwargs,
     )
 
 
-def test_opaque_claim_is_worker_bound_persisted_and_restart_idempotent(
+def test_authorize_retry_rotates_digest_until_claim_and_survives_restart(
     tmp_path, identities
 ):
     clock = [1_000_000]
@@ -140,29 +143,52 @@ def test_opaque_claim_is_worker_bound_persisted_and_restart_idempotent(
     try:
         roster = service.rosters.snapshot()
         authorization = service.authorize_spend(body, payer, roster)
-        token = authorization["claim_token"]
-        assert re.fullmatch(r"[A-Za-z0-9_-]{43}", token)
-        token_digest = hashlib.sha256(token.encode()).hexdigest()
+        token1 = authorization["claim_token"]
+        assert re.fullmatch(r"[A-Za-z0-9_-]{43}", token1)
+        token1_digest = hashlib.sha256(token1.encode()).hexdigest()
         row = service.store._db.execute(
             "SELECT token_digest FROM spend_holds WHERE hold_id=?",
             (authorization["hold_id"],),
         ).fetchone()
-        recovery = service.store._db.execute(
-            "SELECT sealed_token FROM spend_authorize_recovery WHERE hold_id=?",
-            (authorization["hold_id"],),
-        ).fetchone()
-        assert row["token_digest"] == token_digest
-        assert token not in recovery["sealed_token"]
-        assert token.encode() not in (tmp_path / "ledger.sqlite").read_bytes()
-        assert (tmp_path / "token.key").stat().st_mode & 0o777 == 0o600
+        assert row["token_digest"] == token1_digest
+        tables = {
+            item[0]
+            for item in service.store._db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "spend_authorize_recovery" not in tables
+        assert not (tmp_path / "ledger.sqlite.spend-token.key").exists()
 
-        with pytest.raises(PermissionError, match="listed worker"):
+        rotated = service.authorize_spend(body, payer, roster)
+        token2 = rotated["claim_token"]
+        assert rotated["hold_id"] == authorization["hold_id"]
+        assert token2 != token1
+        with pytest.raises(SpendNotFound, match="not found"):
             service.claim_spend(
-                {"claim_token": token, "claim_instance": "wrong-worker"},
+                {"claim_token": token1, "claim_instance": "stale"}, worker, roster
+            )
+    finally:
+        service.close()
+
+    reopened = _service(tmp_path, identities, clock)
+    try:
+        roster = reopened.rosters.snapshot()
+        rotated_after_restart = reopened.authorize_spend(body, payer, roster)
+        token3 = rotated_after_restart["claim_token"]
+        assert rotated_after_restart["hold_id"] == authorization["hold_id"]
+        assert token3 not in {token1, token2}
+        with pytest.raises(SpendNotFound, match="not found"):
+            reopened.claim_spend(
+                {"claim_token": token2, "claim_instance": "stale"}, worker, roster
+            )
+        with pytest.raises(SpendNotFound, match="not found"):
+            reopened.claim_spend(
+                {"claim_token": token3, "claim_instance": "wrong-worker"},
                 identities["outsider"]["public"], roster,
             )
-        claim = service.claim_spend(
-            {"claim_token": token, "claim_instance": "instance-1"}, worker, roster
+        claim = reopened.claim_spend(
+            {"claim_token": token3, "claim_instance": "instance-1"}, worker, roster
         )
         digest_input = dict(claim)
         response_digest = digest_input.pop("claim_response_sha256")
@@ -170,40 +196,30 @@ def test_opaque_claim_is_worker_bound_persisted_and_restart_idempotent(
             json.dumps(digest_input, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         assert response_digest == expected
-        assert claim["token_sha256"] == token_digest
+        assert claim["token_sha256"] == hashlib.sha256(token3.encode()).hexdigest()
         assert claim["payer_keyid"] == payer
         assert claim["worker_keyid"] == worker
         assert claim["worker_account_at_authorize"] == "worker"
         assert claim["billable"] is True
 
-        public_status = service.spend_status(
+        public_status = reopened.spend_status(
             authorization["hold_id"], payer, roster
         )
-        assert token not in json.dumps(public_status)
+        assert token3 not in json.dumps(public_status)
         assert "token_digest" not in public_status
         assert "claim_token" not in public_status
 
-        persisted = service.store.spend_status(authorization["hold_id"])["workers"][0]
+        persisted = reopened.store.spend_status(authorization["hold_id"])["workers"][0]
         assert persisted["claim_instance"] == "instance-1"
         assert persisted["claim_response_sha256"] == response_digest
-    finally:
-        service.close()
-
-    reopened = _service(tmp_path, identities, clock)
-    try:
-        replay = reopened.authorize_spend(
-            body, payer, reopened.rosters.snapshot()
-        )
-        assert replay["hold_id"] == authorization["hold_id"]
-        assert replay["claim_token"] == token
+        with pytest.raises(SpendConflict, match="token is already in use"):
+            reopened.authorize_spend(body, payer, roster)
         assert reopened.claim_spend(
-            {"claim_token": token, "claim_instance": "instance-1"},
-            worker, reopened.rosters.snapshot(),
+            {"claim_token": token3, "claim_instance": "instance-1"}, worker, roster,
         ) == claim
         with pytest.raises(SpendConflict, match="another instance"):
             reopened.claim_spend(
-                {"claim_token": token, "claim_instance": "instance-2"},
-                worker, reopened.rosters.snapshot(),
+                {"claim_token": token3, "claim_instance": "instance-2"}, worker, roster,
             )
     finally:
         reopened.close()
@@ -356,7 +372,7 @@ def test_abandon_release_status_and_payer_receipt_relay(tmp_path, identities):
         assert service.spend_status(
             authorization["hold_id"], worker, roster
         )["state"] == "settled"
-        with pytest.raises(PermissionError, match="scope"):
+        with pytest.raises(SpendNotFound, match="not found"):
             service.spend_status(
                 authorization["hold_id"], identities["outsider"]["public"], roster
             )
@@ -375,31 +391,105 @@ def test_abandon_release_status_and_payer_receipt_relay(tmp_path, identities):
         service.close()
 
 
-def test_periodic_sweeper_uses_bounded_batch(tmp_path, identities, monkeypatch):
+def test_periodic_sweeper_is_single_instance_and_lock_allows_takeover(
+    tmp_path, identities, monkeypatch
+):
     monkeypatch.setenv("NAK_SPEND_ROUTES", "on")
     clock = [4_000_000]
-    service = V2LedgerService(
+    primary = V2LedgerService(
         tmp_path / "ledger.sqlite",
         identities["roster"],
         clock=lambda: clock[0],
-        token_key_path=tmp_path / "token.key",
         sweep_interval=0.01,
     )
+    secondary = V2LedgerService(
+        tmp_path / "ledger.sqlite",
+        identities["roster"],
+        clock=lambda: clock[0],
+        sweep_interval=0.01,
+    )
+    takeover = None
     try:
-        authorization = service.authorize_spend(
+        assert primary._sweeper is not None
+        assert primary._sweep_lock_fd is not None
+        assert secondary._sweeper is None
+        assert secondary._sweep_lock_fd is None
+        authorization = primary.authorize_spend(
             _authorize_body(identities),
             identities["payer"]["public"],
-            service.rosters.snapshot(),
+            primary.rosters.snapshot(),
         )
         monkeypatch.delenv("NAK_SPEND_ROUTES", raising=False)
         clock[0] = authorization["execution_deadline"]
         deadline = time.monotonic() + 2
-        while service.store.spend_status(authorization["hold_id"])["state"] == "open":
+        while primary.store.spend_status(authorization["hold_id"])["state"] == "open":
             assert time.monotonic() < deadline
             time.sleep(0.01)
-        assert service.store.spend_status(authorization["hold_id"])["state"] == "cancelled"
+        assert primary.store.spend_status(authorization["hold_id"])["state"] == "cancelled"
+
+        primary.close()
+        takeover = V2LedgerService(
+            tmp_path / "ledger.sqlite",
+            identities["roster"],
+            clock=lambda: clock[0],
+            sweep_interval=0.01,
+        )
+        assert takeover._sweeper is not None
+        assert takeover._sweep_lock_fd is not None
     finally:
-        service.close()
+        if primary._sweep_lock_fd is not None:
+            primary.close()
+        secondary.close()
+        if takeover is not None:
+            takeover.close()
+
+
+def test_sweeper_lock_is_released_after_owner_process_crash(tmp_path, identities):
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys,time; "
+                "sys.path.insert(0, 'python'); "
+                "from ledger_server import V2LedgerService; "
+                "svc=V2LedgerService(sys.argv[1], sys.argv[2], sweep_interval=0.05); "
+                "print('locked' if svc._sweep_lock_fd is not None else 'unlocked', "
+                "flush=True); time.sleep(60)"
+            ),
+            str(tmp_path / "ledger.sqlite"),
+            str(identities["roster"]),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    contender = None
+    takeover = None
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "locked"
+        contender = V2LedgerService(
+            tmp_path / "ledger.sqlite", identities["roster"], sweep_interval=0.05
+        )
+        assert contender._sweeper is None
+        assert contender._sweep_lock_fd is None
+
+        child.kill()
+        child.wait(timeout=5)
+        takeover = V2LedgerService(
+            tmp_path / "ledger.sqlite", identities["roster"], sweep_interval=0.05
+        )
+        assert takeover._sweeper is not None
+        assert takeover._sweep_lock_fd is not None
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+        if contender is not None:
+            contender.close()
+        if takeover is not None:
+            takeover.close()
 
 
 @contextmanager
@@ -429,7 +519,7 @@ def _request(base, method, path, identity=None, obj=None):
         )
     request = urllib.request.Request(
         base + path,
-        data=body if method == "POST" else None,
+        data=body if obj is not None else None,
         headers=headers,
         method=method,
     )
@@ -438,6 +528,42 @@ def _request(base, method, path, identity=None, obj=None):
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
+
+
+def _resign_usage(service, payload, identity):
+    receipt = payload["receipt"]
+    receipt["receipt_id"] = service.store.spend_receipt_id(receipt)
+    canonical = json.dumps(
+        receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    payload["signature"] = identity["private"].sign(canonical).hex()
+    return payload
+
+
+def _signed_raw_request(
+    base, method, path, identity, body=b"", *, content_length=None
+):
+    timestamp = int(time.time())
+    signature = identity["private"].sign(
+        canonical_string(method, path, body, timestamp)
+    )
+    headers = {
+        "Authorization": (
+            f'Sthambha-Ed25519 keyid="{identity["public"]}",'
+            f'sig="{base64.b64encode(signature).decode()}",ts="{timestamp}"'
+        ),
+        "Content-Length": str(
+            len(body) if content_length is None else content_length
+        ),
+    }
+    target = urlparse(base)
+    connection = http.client.HTTPConnection(target.hostname, target.port, timeout=5)
+    try:
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
 
 
 def test_signed_http_routes_flag_off_golden_and_readiness(
@@ -512,5 +638,149 @@ def test_signed_http_routes_flag_off_golden_and_readiness(
             claim = json.loads(raw)
             assert claim["payer_keyid"] == identities["payer"]["public"]
             assert claim["worker_keyid"] == identities["worker"]["public"]
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("path", ("/spend/ready", "/spend/status?hold_id=x"))
+def test_spend_get_routes_authenticate_exact_empty_bounded_body(
+    tmp_path, identities, monkeypatch, path
+):
+    monkeypatch.setenv("NAK_SPEND_ROUTES", "on")
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite", identities["roster"], start_sweeper=False
+    )
+    try:
+        with _running(service) as base:
+            assert _signed_raw_request(
+                base, "GET", path, identities["payer"], b"x"
+            ) == (400, b'{"error":"spend GET routes require an empty body"}')
+            assert _signed_raw_request(
+                base, "GET", path, identities["payer"], b"", content_length=65_537
+            ) == (413, b'{"error":"request body exceeds 64 KB"}')
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("path", ("/spend/readiness", "/spend/claim"))
+def test_spend_get_aliases_are_unknown_routes(
+    tmp_path, identities, monkeypatch, path
+):
+    monkeypatch.setenv("NAK_SPEND_ROUTES", "on")
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite", identities["roster"], start_sweeper=False
+    )
+    try:
+        with _running(service) as base:
+            assert _request(base, "GET", path, identities["payer"]) == (
+                404, b'{"error":"not found"}'
+            )
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize(
+    ("path", "signer", "body_kind"),
+    (
+        ("/spend/authorize", "payer", "authorize"),
+        ("/spend/claim", "worker", "claim"),
+        ("/spend/settle", "worker", "settle"),
+        ("/spend/abandon", "payer", "abandon"),
+        ("/spend/release", "payer", "release"),
+    ),
+)
+def test_spend_post_routes_reject_unknown_schema_fields(
+    tmp_path, identities, monkeypatch, path, signer, body_kind
+):
+    monkeypatch.setenv("NAK_SPEND_ROUTES", "on")
+    bodies = {
+        "authorize": {**_authorize_body(identities), "extra": True},
+        "claim": {"claim_token": "A" * 43, "claim_instance": "x", "extra": True},
+        "settle": {"receipt": {}, "signature": "0" * 128, "extra": True},
+        "abandon": {
+            "hold_id": "x",
+            "worker_keyid": identities["worker"]["public"],
+            "extra": True,
+        },
+        "release": {"hold_id": "x", "extra": True},
+    }
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite", identities["roster"], start_sweeper=False
+    )
+    try:
+        with _running(service) as base:
+            code, raw = _request(
+                base, "POST", path, identities[signer], bodies[body_kind]
+            )
+            assert code == 422
+            assert b"unknown 'extra'" in raw
+    finally:
+        service.close()
+
+
+def test_spend_scope_and_missing_holds_are_http_indistinguishable(
+    tmp_path, identities, monkeypatch
+):
+    monkeypatch.setenv("NAK_SPEND_ROUTES", "on")
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite", identities["roster"], start_sweeper=False
+    )
+    try:
+        roster = service.rosters.snapshot()
+        authorization = service.authorize_spend(
+            _authorize_body(identities), identities["payer"]["public"], roster
+        )
+        claim = service.claim_spend(
+            {
+                "claim_token": authorization["claim_token"],
+                "claim_instance": "scope-test",
+            },
+            identities["worker"]["public"],
+            roster,
+        )
+        foreign_settle = _usage(
+            service, claim, identities["worker"]["private"]
+        )
+        foreign_settle["receipt"]["worker_keyid"] = identities["worker2"]["public"]
+        foreign_settle["receipt"]["worker_account_at_authorize"] = "worker2"
+        _resign_usage(service, foreign_settle, identities["worker2"])
+        missing_settle = json.loads(json.dumps(foreign_settle))
+        missing_settle["receipt"]["hold_id"] = "missing-hold"
+        _resign_usage(service, missing_settle, identities["worker2"])
+
+        hold_id = authorization["hold_id"]
+        expected = (404, b'{"error":"spend hold not found"}')
+        comparisons = (
+            (
+                "GET",
+                f"/spend/status?hold_id={hold_id}",
+                "/spend/status?hold_id=missing-hold",
+                identities["outsider"],
+                None,
+                None,
+            ),
+            (
+                "POST", "/spend/claim", "/spend/claim", identities["outsider"],
+                {"claim_token": authorization["claim_token"], "claim_instance": "x"},
+                {"claim_token": "A" * 43, "claim_instance": "x"},
+            ),
+            (
+                "POST", "/spend/settle", "/spend/settle", identities["worker2"],
+                foreign_settle, missing_settle,
+            ),
+            (
+                "POST", "/spend/abandon", "/spend/abandon", identities["outsider"],
+                {"hold_id": hold_id, "worker_keyid": identities["worker"]["public"]},
+                {"hold_id": "missing-hold", "worker_keyid": identities["worker"]["public"]},
+            ),
+            (
+                "POST", "/spend/release", "/spend/release", identities["outsider"],
+                {"hold_id": hold_id}, {"hold_id": "missing-hold"},
+            ),
+        )
+        with _running(service) as base:
+            for method, known_path, missing_path, signer, known, missing in comparisons:
+                assert _request(base, method, known_path, signer, known) == expected
+                assert _request(base, method, missing_path, signer, missing) == expected
     finally:
         service.close()

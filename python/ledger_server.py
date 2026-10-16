@@ -20,13 +20,13 @@ current trusted mesh.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import ipaddress
 import json
 import os
 import re
 import secrets
-import stat
 import tempfile
 import threading
 import time
@@ -34,8 +34,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 from urllib.parse import parse_qs, urlparse
-
-from cryptography.fernet import Fernet, InvalidToken
 
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
@@ -54,6 +52,7 @@ from core.ledger_store import (  # noqa: E402
     SPEND_USAGE_FIELDS,
     SpendConflict,
     SpendExpired,
+    SpendNotFound,
     SpendStateError,
     WithdrawalRateLimitError,
     WithdrawalTierError,
@@ -89,13 +88,9 @@ _SPEND_POST_PATHS = frozenset(
     }
 )
 _SPEND_GET_PATHS = frozenset(
-    {"/spend/status", "/spend/ready", "/spend/readiness", "/spend/claim"}
+    {"/spend/status", "/spend/ready"}
 )
 _SPEND_PATHS = _SPEND_POST_PATHS | _SPEND_GET_PATHS
-
-
-class SpendDependencyError(RuntimeError):
-    """A local dependency required by the spend API is unavailable."""
 
 
 class LedgerService:
@@ -389,71 +384,6 @@ def _loopback_client(address: object) -> bool:
         return False
 
 
-class _SpendTokenSealer:
-    """Persistent service-local key for short-lived authorize retry ciphertext."""
-
-    def __init__(self, path: str | Path):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fernet = Fernet(self._load_or_create_key())
-
-    def _load_or_create_key(self) -> bytes:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            fd = os.open(self.path, flags)
-        except FileNotFoundError:
-            key = Fernet.generate_key()
-            create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_NOFOLLOW"):
-                create_flags |= os.O_NOFOLLOW
-            try:
-                fd = os.open(self.path, create_flags, 0o600)
-            except FileExistsError:
-                fd = os.open(self.path, flags)
-            else:
-                try:
-                    pending = memoryview(key + b"\n")
-                    while pending:
-                        written = os.write(fd, pending)
-                        if written <= 0:
-                            raise OSError("short write creating spend token key")
-                        pending = pending[written:]
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                directory_fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-                return key
-        try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise PermissionError("spend token key is not a regular file")
-            if metadata.st_uid != os.geteuid():
-                raise PermissionError("spend token key must be owned by the service uid")
-            if metadata.st_mode & 0o077:
-                raise PermissionError("spend token key must have mode 0600")
-            key = os.read(fd, 256).strip()
-        finally:
-            os.close(fd)
-        if len(key) != 44:
-            raise PermissionError("spend token key has an invalid encoding")
-        return key
-
-    def seal(self, token: str) -> str:
-        return self._fernet.encrypt(token.encode("ascii")).decode("ascii")
-
-    def open(self, sealed: str) -> str:
-        try:
-            return self._fernet.decrypt(sealed.encode("ascii")).decode("ascii")
-        except (InvalidToken, UnicodeError, ValueError) as exc:
-            raise SpendStateError("spend authorization token recovery failed") from exc
-
-
 def _solana_address(value: object) -> str:
     if not isinstance(value, str) or not 32 <= len(value) <= 44:
         raise LedgerValueError("address must be a Solana base58 public key")
@@ -486,22 +416,18 @@ class V2LedgerService:
         roster_path: str | Path,
         *,
         clock: Callable[[], float] | None = None,
-        token_key_path: str | Path | None = None,
         sweep_interval: float = SPEND_SWEEP_INTERVAL_S,
         start_sweeper: bool = True,
     ):
         self.store = LedgerStore(store_path, clock=clock)
         self.rosters = RosterCache(roster_path)
-        self._token_key_path = Path(
-            token_key_path or (str(store_path) + ".spend-token.key")
-        )
-        self._sealer_lock = threading.Lock()
-        self._token_sealer: _SpendTokenSealer | None = None
         self._sweep_interval = max(0.01, float(sweep_interval))
         self._sweep_stop = threading.Event()
         self._sweep_error: str | None = None
         self._sweeper: threading.Thread | None = None
-        if start_sweeper:
+        self._sweep_lock_path = Path(str(store_path) + ".spend-sweeper.lock")
+        self._sweep_lock_fd: int | None = None
+        if start_sweeper and self._acquire_sweeper_lock():
             self._sweeper = threading.Thread(
                 target=self._sweep_spend_holds,
                 name="neuron-spend-expiry",
@@ -513,18 +439,25 @@ class V2LedgerService:
         self._sweep_stop.set()
         if self._sweeper is not None:
             self._sweeper.join(timeout=max(1.0, self._sweep_interval * 2))
+        if self._sweep_lock_fd is not None:
+            fcntl.flock(self._sweep_lock_fd, fcntl.LOCK_UN)
+            os.close(self._sweep_lock_fd)
+            self._sweep_lock_fd = None
         self.store.close()
 
-    def _sealer(self) -> _SpendTokenSealer:
-        with self._sealer_lock:
-            if self._token_sealer is None:
-                try:
-                    self._token_sealer = _SpendTokenSealer(self._token_key_path)
-                except (OSError, ValueError) as exc:
-                    raise SpendDependencyError(
-                        "spend token sealing key is unavailable"
-                    ) from exc
-            return self._token_sealer
+    def _acquire_sweeper_lock(self) -> bool:
+        self._sweep_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(self._sweep_lock_path, flags, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        self._sweep_lock_fd = fd
+        return True
 
     def _sweep_spend_holds(self) -> None:
         while not self._sweep_stop.wait(self._sweep_interval):
@@ -694,7 +627,6 @@ class V2LedgerService:
 
         token = secrets.token_urlsafe(32)
         token_digest = hashlib.sha256(token.encode("ascii")).hexdigest()
-        sealed = self._sealer().seal(token)
         status = self.store.authorize_spend(
             payer_keyid=keyid,
             payer_account=payer_account,
@@ -707,17 +639,10 @@ class V2LedgerService:
             max_output_tokens=output_cap,
             workers=workers,
             token_digest=token_digest,
-            sealed_token=sealed,
         )
-        stored_sealed, stored_digest = self.store.spend_authorize_recovery(
-            str(status["hold_id"])
-        )
-        recovered = self._sealer().open(stored_sealed)
-        if hashlib.sha256(recovered.encode("ascii")).hexdigest() != stored_digest:
-            raise SpendStateError("spend authorization token recovery digest mismatch")
         return {
             "v": 1,
-            "claim_token": recovered,
+            "claim_token": token,
             "hold_id": status["hold_id"],
             "max_token_layers": int(status["max_token_layers"]),
             "max_cost": int(status["max_cost"]),
@@ -747,14 +672,9 @@ class V2LedgerService:
         token = _claim_token(request["claim_token"])
         claim_instance = _bounded_text(request["claim_instance"], "claim_instance")
         digest = hashlib.sha256(token.encode("ascii")).hexdigest()
-        try:
-            hold_id = self.store.spend_hold_for_token(digest)
-        except SpendStateError as exc:
-            raise PermissionError("claim token is invalid") from exc
-        current = self.store.spend_status(hold_id)
-        if keyid not in {entry["worker_keyid"] for entry in current["workers"]}:
-            raise PermissionError("signer is not a listed worker")
-        status = self.store.claim_spend_worker(hold_id, keyid, claim_instance)
+        status = self.store.claim_spend_worker_for_token(
+            digest, keyid, claim_instance
+        )
         return self._claim_response(status, keyid)
 
     def settle_spend(
@@ -782,7 +702,7 @@ class V2LedgerService:
                 _bounded_text(receipt[field], field)
             _bounded_text(receipt["termination"], "termination", maximum=64)
             if keyid not in {receipt["worker_keyid"], receipt["payer_keyid"]}:
-                raise PermissionError("signer is neither the worker nor payer")
+                raise SpendNotFound("spend hold not found")
         if (
             not isinstance(signature, str)
             or re.fullmatch(r"[0-9a-f]{128}", signature) is None
@@ -817,9 +737,6 @@ class V2LedgerService:
         )
         hold_id = _bounded_text(request["hold_id"], "hold_id")
         worker_keyid = _ed25519_keyid(request["worker_keyid"], "worker_keyid")
-        current = self.store.spend_status(hold_id)
-        if current["payer_keyid"] != keyid:
-            raise PermissionError("signer does not own the spend hold")
         status = self.store.abandon_spend_worker(hold_id, worker_keyid, keyid)
         return self._status_response(status)
 
@@ -832,9 +749,6 @@ class V2LedgerService:
         _row_identity(keyid, roster)
         request = _strict_fields(body, {"hold_id"}, name="spend release")
         hold_id = _bounded_text(request["hold_id"], "hold_id")
-        current = self.store.spend_status(hold_id)
-        if current["payer_keyid"] != keyid:
-            raise PermissionError("signer does not own the spend hold")
         status = self.store.request_spend_release(hold_id, keyid)
         return self._status_response(status)
 
@@ -846,12 +760,7 @@ class V2LedgerService:
     ) -> dict[str, object]:
         _row_identity(keyid, roster)
         hold_id = _bounded_text(hold_id, "hold_id")
-        status = self.store.refresh_spend_status(hold_id)
-        allowed = keyid == status["payer_keyid"] or any(
-            entry["worker_keyid"] == keyid for entry in status["workers"]
-        )
-        if not allowed:
-            raise PermissionError("signer is outside the spend hold scope")
+        status = self.store.refresh_spend_status_scoped(hold_id, keyid)
         return self._status_response(status)
 
     def spend_ready(
@@ -860,7 +769,6 @@ class V2LedgerService:
         roster: Mapping[str, Mapping[str, object]],
     ) -> dict[str, object]:
         _row_identity(keyid, roster)
-        self._sealer()
         with self.store._lock:
             self.store._db.execute("SELECT 1").fetchone()
         return {
@@ -1086,10 +994,19 @@ def _make_v2_handler(svc: V2LedgerService):
             ):
                 self._send(404, {"error": "not found"})
                 return
-            authenticated = self._authenticate("GET", b"")
+            body_bytes = b""
+            if spend_path:
+                raw_body = self._raw_body()
+                if raw_body is None:
+                    return
+                body_bytes = raw_body
+            authenticated = self._authenticate("GET", body_bytes)
             if authenticated is None:
                 return
             keyid, roster = authenticated
+            if spend_path and body_bytes:
+                self._send(400, {"error": "spend GET routes require an empty body"})
+                return
             try:
                 operator, tier = _row_identity(keyid, roster)
                 query = parse_qs(target.query, keep_blank_values=True)
@@ -1115,9 +1032,12 @@ def _make_v2_handler(svc: V2LedgerService):
                 elif target.path == "/spend/status":
                     query = _exact_query(target, {"hold_id"})
                     result = svc.spend_status(query["hold_id"], keyid, roster)
-                else:
+                elif target.path == "/spend/ready":
                     _exact_query(target, set())
                     result = svc.spend_ready(keyid, roster)
+                else:
+                    self._send(404, {"error": "not found"})
+                    return
                 self._send(200, result)
             except PermissionError as exc:
                 self._send(403, {"error": str(exc)})
@@ -1125,11 +1045,11 @@ def _make_v2_handler(svc: V2LedgerService):
                 self._send(409, {"error": str(exc)})
             except SpendExpired as exc:
                 self._send(410, {"error": str(exc), "code": "spend_expired"})
+            except SpendNotFound:
+                self._send(404, {"error": "spend hold not found"})
             except SpendStateError as exc:
                 code = 404 if "does not exist" in str(exc) else 409
                 self._send(code, {"error": str(exc)})
-            except SpendDependencyError as exc:
-                self._send(503, {"error": str(exc)})
             except LedgerValueError as exc:
                 self._send(422, {"error": str(exc)})
 
@@ -1208,13 +1128,13 @@ def _make_v2_handler(svc: V2LedgerService):
                     else "settlement_expired"
                 )
                 self._send(410, {"error": str(exc), "code": expiry})
+            except SpendNotFound:
+                self._send(404, {"error": "spend hold not found"})
             except SpendStateError as exc:
                 code = 404 if "does not exist" in str(exc) else 409
                 self._send(code, {"error": str(exc)})
             except ReceiptStateError as exc:
                 self._send(409, {"error": str(exc)})
-            except SpendDependencyError as exc:
-                self._send(503, {"error": str(exc)})
             except PermissionError as exc:
                 self._send(403, {"error": str(exc)})
             except LookupError as exc:
