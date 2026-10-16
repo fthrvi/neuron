@@ -524,6 +524,12 @@ class Reconciler:
                         dict(row)
                         for row in db.execute("SELECT * FROM receipts ORDER BY receipt_id")
                     ],
+                    "legacy_funding_projection": [
+                        dict(row)
+                        for row in db.execute(
+                            "SELECT * FROM legacy_funding_projection ORDER BY receipt_id"
+                        )
+                    ],
                     "spend_holds": [
                         dict(row)
                         for row in db.execute("SELECT * FROM spend_holds ORDER BY hold_id")
@@ -1115,6 +1121,7 @@ class Reconciler:
             workers_by_hold.setdefault(row["hold_id"], []).append(row)
         usage_by_entry: dict[tuple[str, str], list[dict[str, Any]]] = {}
         verified_entry_summaries: dict[tuple[str, str], dict[str, Any]] = {}
+        verified_v2_economic_ids: set[str] = set()
         legacy_ids = {row["receipt_id"] for row in ledger["receipts"]}
         usage_ids = {row["receipt_id"] for row in ledger["spend_usage_receipts"]}
         overlap = sorted(legacy_ids & usage_ids)
@@ -1151,6 +1158,7 @@ class Reconciler:
                     len(errors[name])
                     for name in ("spend_usage_linkage", "spend_pricing", "spend_caps")
                 )
+                economic_error_count = len(errors["economic_receipt_view"])
                 rid = stored["receipt_id"]
                 if int(stored["sequence"]) != expected_sequence:
                     errors["spend_usage_linkage"].append(
@@ -1416,9 +1424,12 @@ class Reconciler:
                 if sum(
                     len(errors[name])
                     for name in ("spend_usage_linkage", "spend_pricing", "spend_caps")
-                ) != receipt_error_count:
+                ) != receipt_error_count or (
+                    len(errors["economic_receipt_view"]) != economic_error_count
+                ):
                     entry_verified = False
                 elif entry_verified:
+                    verified_v2_economic_ids.add(f"v2:{rid}")
                     verified_last = {
                         "receipt_id": rid,
                         "sequence": expected_sequence,
@@ -1687,10 +1698,27 @@ class Reconciler:
                     f"orphan spend hold account {account} has balance {balance}"
                 )
 
-        expected_economic_ids = {
+        expected_v2_ids = {f"v2:{receipt_id}" for receipt_id in usage_ids}
+        source_v2_ids = {
             f"v2:{row['receipt_id']}" for row in ledger["spend_economic_receipts"]
-        } | {
-            f"v1:{row['seq']}" for row in ledger["journal"] if row["kind"] == "earn" and int(row["amount"]) > 0
+        }
+        view_v2_ids = {
+            economic_id for economic_id, row in economic_rows.items()
+            if row["namespace"] == "v2"
+        }
+        if source_v2_ids != expected_v2_ids or view_v2_ids != expected_v2_ids:
+            errors["economic_receipt_view"].append(
+                "v2 economic rows do not exactly and bidirectionally match usage receipts"
+            )
+        for economic_id in sorted(source_v2_ids - verified_v2_economic_ids):
+            errors["economic_receipt_view"].append(
+                f"{economic_id}: v2 economic row is not backed by a verified "
+                "signed usage receipt, accepted delta, and exact journal pair"
+            )
+        expected_economic_ids = expected_v2_ids | {
+            f"v1:{row['seq']}"
+            for row in ledger["journal"]
+            if row["kind"] == "earn" and int(row["amount"]) > 0
         } | {
             f"legacy_import:{row['seq']}" for row in ledger["journal"]
             if row["kind"] == "legacy_import" and int(row["amount"]) > 0
@@ -1700,6 +1728,17 @@ class Reconciler:
                 "shared economic view does not exactly cover receipt earnings"
             )
         receipts = {row["receipt_id"]: row for row in ledger["receipts"]}
+        legacy_projection = {
+            row["receipt_id"]: row for row in ledger["legacy_funding_projection"]
+        }
+        expected_projection_ids = {
+            receipt_id for receipt_id, receipt in receipts.items()
+            if receipt["state"] != "legacy_unsigned"
+        }
+        if set(legacy_projection) != expected_projection_ids:
+            errors["economic_receipt_view"].append(
+                "legacy funding projection does not exactly cover verified receipts"
+            )
 
         first_legacy_seq: dict[int, list[dict[str, Any]]] = {}
         for receipt in ledger["receipts"]:
@@ -1736,6 +1775,15 @@ class Reconciler:
         for receipt_id, receipt in receipts.items():
             if receipt["state"] == "legacy_unsigned":
                 continue
+            reconstructed_funded = (
+                int(receipt["charged"]) == 0
+                or legacy_balance_before.get(receipt_id, 0) >= int(receipt["charged"])
+            )
+            projection = legacy_projection.get(receipt_id)
+            if projection is None or projection["funded"] != int(reconstructed_funded):
+                errors["economic_receipt_view"].append(
+                    f"{receipt_id}: legacy funding projection differs from journal provenance"
+                )
             try:
                 credited = json.loads(receipt["credited"])
             except (TypeError, json.JSONDecodeError):
@@ -1774,7 +1822,6 @@ class Reconciler:
                     f"{receipt_id}: legacy receipt lacks its exact earn/spend journal pair"
                 )
                 continue
-            reconstructed_funded = legacy_balance_before.get(receipt_id, 0) >= charged
             marker_ok = True
             for earn in earn_rows:
                 try:

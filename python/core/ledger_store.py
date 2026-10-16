@@ -544,6 +544,18 @@ class LedgerStore:
                       OR matures_at = hold_terminal_at + {HOLD_S})
             );
 
+            CREATE TABLE IF NOT EXISTS legacy_funding_projection (
+                receipt_id TEXT PRIMARY KEY,
+                funded INTEGER NOT NULL CHECK(funded IN (0, 1)),
+                FOREIGN KEY(receipt_id) REFERENCES receipts(receipt_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS journal_receipt_kind_seq
+            ON journal(receipt_id, kind, seq);
+
+            CREATE INDEX IF NOT EXISTS journal_account_seq
+            ON journal(account, seq);
+
             CREATE INDEX IF NOT EXISTS spend_holds_due
             ON spend_holds(state, execution_deadline, settlement_deadline);
 
@@ -621,8 +633,21 @@ class LedgerStore:
             BEGIN
                 SELECT RAISE(ABORT, 'spend economic receipt core is immutable');
             END;
+
+            CREATE TRIGGER IF NOT EXISTS legacy_funding_projection_no_update
+            BEFORE UPDATE ON legacy_funding_projection
+            BEGIN
+                SELECT RAISE(ABORT, 'legacy funding projection is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS legacy_funding_projection_no_delete
+            BEFORE DELETE ON legacy_funding_projection
+            BEGIN
+                SELECT RAISE(ABORT, 'legacy funding projection is permanent');
+            END;
             """
         )
+        self._backfill_legacy_funding_projection()
         collision = self._db.execute(
             "SELECT a.id, a.balance FROM accounts AS a "
             "LEFT JOIN spend_holds AS h ON h.escrow_account=a.id "
@@ -705,31 +730,26 @@ class LedgerStore:
                 j.receipt_id AS receipt_id, NULL AS hold_id,
                 j.counterparty AS payer_account, j.account AS worker_account,
                 j.amount AS amount,
-                CASE WHEN
-                    (SELECT COUNT(*) FROM journal AS s
-                     WHERE s.receipt_id=j.receipt_id AND s.kind='spend'
-                       AND s.account=r.requester AND s.amount=-r.charged) = 1
-                    AND (SELECT COUNT(*) FROM journal AS s
-                         WHERE s.receipt_id=j.receipt_id AND s.kind='spend') = 1
-                    AND COALESCE((SELECT SUM(p.amount) FROM journal AS p
-                                  WHERE p.account=r.requester
-                                    AND p.seq < (SELECT MIN(first.seq)
-                                                 FROM journal AS first
-                                                 WHERE first.receipt_id=j.receipt_id
-                                                   AND first.kind IN ('earn','spend'))), 0)
-                        >= r.charged
-                    THEN 1 ELSE 0 END AS funded,
+                f.funded AS funded,
                 j.ts AS earned_at, j.ts AS hold_terminal_at,
                 j.ts + {HOLD_S} AS matures_at,
                 j.ts + {HOLD_S} AS eligible_at,
                 CASE WHEN r.state = 'disputed' THEN 'clawed_back' ELSE 'none' END
                     AS dispute_state,
-                (SELECT d.seq FROM journal AS d
-                 WHERE d.receipt_id=j.receipt_id AND d.kind='spend'
-                 ORDER BY d.seq LIMIT 1) AS debit_journal_seq,
+                s.seq AS debit_journal_seq,
                 j.seq AS credit_journal_seq
-            FROM journal AS j JOIN receipts AS r ON r.receipt_id=j.receipt_id
+            FROM journal AS j
+            JOIN receipts AS r ON r.receipt_id=j.receipt_id
+            JOIN legacy_funding_projection AS f ON f.receipt_id=r.receipt_id
+            JOIN journal AS s ON s.receipt_id=r.receipt_id AND s.kind='spend'
+              AND s.account=r.requester AND s.counterparty IS NULL
+              AND s.amount=-r.charged AND s.ts=r.created_at
             WHERE j.kind='earn' AND j.amount > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM journal AS other
+                  WHERE other.receipt_id=r.receipt_id AND other.kind='spend'
+                    AND other.seq!=s.seq
+              )
             UNION ALL
             SELECT 'legacy_import:' || j.seq, 'legacy_import', j.receipt_id,
                 NULL, j.counterparty, j.account, j.amount, 0, j.ts, NULL, NULL,
@@ -743,7 +763,48 @@ class LedgerStore:
                 CASE WHEN e.matures_at IS NULL THEN NULL ELSE e.matures_at + 1 END,
                 e.dispute_state,
                 e.debit_journal_seq, e.credit_journal_seq
-            FROM spend_economic_receipts AS e;
+            FROM spend_economic_receipts AS e
+            JOIN spend_usage_receipts AS u ON u.receipt_id=e.receipt_id
+            JOIN spend_holds AS h ON h.hold_id=u.hold_id
+            JOIN spend_hold_workers AS w
+              ON w.hold_id=u.hold_id AND w.worker_keyid=u.worker_keyid
+            LEFT JOIN journal AS d ON d.seq=u.debit_journal_seq
+            LEFT JOIN journal AS c ON c.seq=u.credit_journal_seq
+            WHERE e.hold_id=u.hold_id
+              AND e.payer_account=h.payer_account_at_authorize
+              AND e.worker_account=w.worker_account_at_authorize
+              AND e.amount=u.accepted_delta
+              AND e.funded=1
+              AND e.earned_at=u.accepted_at
+              AND e.hold_terminal_at IS h.terminal_at
+              AND e.matures_at IS CASE WHEN h.terminal_at IS NULL THEN NULL
+                  ELSE h.terminal_at + {HOLD_S} END
+              AND e.debit_journal_seq IS u.debit_journal_seq
+              AND e.credit_journal_seq IS u.credit_journal_seq
+              AND e.dispute_state=CASE WHEN h.state='disputed'
+                  THEN 'clawed_back' ELSE 'none' END
+              AND (
+                (u.accepted_delta=0 AND u.debit_journal_seq IS NULL
+                 AND u.credit_journal_seq IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM journal AS z
+                                 WHERE z.receipt_id=u.receipt_id))
+                OR
+                (u.accepted_delta>0
+                 AND d.kind='spend_settle_debit'
+                 AND d.receipt_id=u.receipt_id
+                 AND d.account=h.escrow_account
+                 AND d.counterparty=w.worker_account_at_authorize
+                 AND d.amount=-u.accepted_delta
+                 AND d.ts=u.accepted_at
+                 AND c.kind='spend_earn'
+                 AND c.receipt_id=u.receipt_id
+                 AND c.account=w.worker_account_at_authorize
+                 AND c.counterparty=h.escrow_account
+                 AND c.amount=u.accepted_delta
+                 AND c.ts=u.accepted_at
+                 AND (SELECT COUNT(*) FROM journal AS x
+                      WHERE x.receipt_id=u.receipt_id)=2)
+              );
 
             CREATE TRIGGER IF NOT EXISTS spend_terminal_at_immutable
             BEFORE UPDATE OF terminal_at ON spend_holds
@@ -785,6 +846,69 @@ class LedgerStore:
                 self._db.execute(
                     f"ALTER TABLE withdrawals ADD COLUMN {name} {definition}"
                 )
+
+    def _backfill_legacy_funding_projection(self) -> None:
+        """Materialize legacy funding once from chronological journal provenance."""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            missing = self._db.execute(
+                "SELECT 1 FROM receipts AS r "
+                "LEFT JOIN legacy_funding_projection AS f "
+                "ON f.receipt_id=r.receipt_id "
+                "WHERE r.state!='legacy_unsigned' AND f.receipt_id IS NULL LIMIT 1"
+            ).fetchone()
+            if missing is None:
+                self._db.execute("COMMIT")
+                return
+            receipts = {
+                str(row["receipt_id"]): row
+                for row in self._db.execute(
+                    "SELECT receipt_id, requester, charged FROM receipts "
+                    "WHERE state != 'legacy_unsigned'"
+                )
+            }
+            projected = {
+                str(row["receipt_id"])
+                for row in self._db.execute(
+                    "SELECT receipt_id FROM legacy_funding_projection"
+                )
+            }
+            funding = {
+                receipt_id: 1
+                for receipt_id, row in receipts.items()
+                if int(row["charged"]) == 0
+            }
+            running: dict[str, int] = {}
+            for row in self._db.execute(
+                "SELECT seq, kind, receipt_id, account, amount "
+                "FROM journal ORDER BY seq"
+            ):
+                receipt_id = row["receipt_id"]
+                if (
+                    receipt_id in receipts
+                    and receipt_id not in funding
+                    and row["kind"] in {"earn", "spend"}
+                ):
+                    receipt = receipts[str(receipt_id)]
+                    funding[str(receipt_id)] = int(
+                        running.get(str(receipt["requester"]), 0)
+                        >= int(receipt["charged"])
+                    )
+                account = str(row["account"])
+                running[account] = running.get(account, 0) + int(row["amount"])
+            self._db.executemany(
+                "INSERT OR IGNORE INTO legacy_funding_projection(receipt_id, funded) "
+                "VALUES (?, ?)",
+                (
+                    (receipt_id, funded)
+                    for receipt_id, funded in funding.items()
+                    if receipt_id not in projected
+                ),
+            )
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -1056,6 +1180,207 @@ class LedgerStore:
         )
 
     @staticmethod
+    def _verified_v2_matured_earnings_in(
+        db: sqlite3.Connection, operator: str, now: int
+    ) -> int:
+        """Sum only mature v2 rows proven by a signed usage receipt and journals."""
+        total = 0
+        candidates = db.execute(
+            "SELECT * FROM spend_economic_receipts "
+            "WHERE worker_account=? AND amount>0 AND funded=1 "
+            "AND dispute_state='none' AND matures_at IS NOT NULL AND ?>matures_at",
+            (operator, now),
+        ).fetchall()
+        for economic in candidates:
+            stored = db.execute(
+                "SELECT u.*, h.payer_keyid, h.payer_account_at_authorize, "
+                "h.session_id, h.model_id, h.billing_mode, h.execution_deadline, "
+                "h.escrow_account, h.state AS hold_state, h.terminal_at, "
+                "w.claim_response_sha256, w.worker_account_at_authorize, "
+                "w.billable, w.layer_start, w.layer_end, w.layers, "
+                "w.price_multiplier, w.max_cost, w.max_token_layers, w.claimed_at "
+                "FROM spend_usage_receipts AS u "
+                "JOIN spend_holds AS h ON h.hold_id=u.hold_id "
+                "JOIN spend_hold_workers AS w "
+                "ON w.hold_id=u.hold_id AND w.worker_keyid=u.worker_keyid "
+                "WHERE u.receipt_id=?",
+                (economic["receipt_id"],),
+            ).fetchone()
+            if stored is None:
+                continue
+            try:
+                receipt = json.loads(stored["receipt_json"])
+                if not isinstance(receipt, dict) or set(receipt) != SPEND_USAGE_FIELDS:
+                    continue
+                canonical = json.dumps(
+                    receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                )
+                if canonical != stored["receipt_json"]:
+                    continue
+                unsigned = {
+                    key: value
+                    for key, value in receipt.items()
+                    if key != "receipt_id"
+                }
+                expected_id = "sha256:" + hashlib.sha256(
+                    SPEND_RECEIPT_DOMAIN
+                    + json.dumps(
+                        unsigned, sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=True,
+                    ).encode()
+                ).hexdigest()
+                if (
+                    receipt["receipt_id"] != stored["receipt_id"]
+                    or expected_id != stored["receipt_id"]
+                ):
+                    continue
+                ed25519.Ed25519PublicKey.from_public_bytes(
+                    bytes.fromhex(str(stored["worker_keyid"]))
+                ).verify(bytes.fromhex(str(stored["signature"])), canonical.encode())
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+                InvalidSignature,
+            ):
+                continue
+
+            immutable = {
+                "v": 2,
+                "kind": "nakshatra-worker-usage",
+                "hold_id": stored["hold_id"],
+                "claim_response_sha256": stored["claim_response_sha256"],
+                "payer_keyid": stored["payer_keyid"],
+                "payer_account_at_authorize": stored["payer_account_at_authorize"],
+                "worker_keyid": stored["worker_keyid"],
+                "worker_account_at_authorize": stored["worker_account_at_authorize"],
+                "billable": bool(stored["billable"]),
+                "session_id": stored["session_id"],
+                "model_id": stored["model_id"],
+                "billing_mode": stored["billing_mode"],
+                "layer_start": int(stored["layer_start"]),
+                "layer_end": int(stored["layer_end"]),
+            }
+            if any(receipt.get(field) != value for field, value in immutable.items()):
+                continue
+            column_values = {
+                "sequence": receipt.get("sequence"),
+                "cumulative_prompt_tokens": receipt.get("cumulative_prompt_tokens"),
+                "cumulative_generated_tokens": receipt.get("cumulative_generated_tokens"),
+                "cumulative_token_layers": receipt.get("cumulative_token_layers"),
+                "cumulative_cost": receipt.get("cumulative_cost"),
+                "final": int(bool(receipt.get("final"))),
+            }
+            if any(stored[field] != value for field, value in column_values.items()):
+                continue
+            try:
+                sequence = int(receipt["sequence"])
+                prompt = int(receipt["cumulative_prompt_tokens"])
+                generated = int(receipt["cumulative_generated_tokens"])
+                token_layers = (prompt + generated) * int(stored["layers"])
+                cost = (
+                    token_layers * int(stored["price_multiplier"])
+                    if stored["billable"] else 0
+                )
+                previous = None
+                if sequence > 1:
+                    previous = db.execute(
+                        "SELECT cumulative_prompt_tokens, cumulative_generated_tokens, "
+                        "cumulative_cost FROM spend_usage_receipts "
+                        "WHERE hold_id=? AND worker_keyid=? AND sequence=?",
+                        (stored["hold_id"], stored["worker_keyid"], sequence - 1),
+                    ).fetchone()
+                    if (
+                        previous is None
+                        or prompt != int(previous["cumulative_prompt_tokens"])
+                    ):
+                        continue
+                    if generated < int(previous["cumulative_generated_tokens"]):
+                        continue
+                elif sequence != 1:
+                    continue
+                previous_cost = (
+                    0 if previous is None else int(previous["cumulative_cost"])
+                )
+                delta = cost - previous_cost
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                prompt < 0
+                or generated < 0
+                or delta <= 0
+                or token_layers != int(stored["cumulative_token_layers"])
+                or cost != int(stored["cumulative_cost"])
+                or delta != int(stored["accepted_delta"])
+                or cost > int(stored["max_cost"])
+                or token_layers > int(stored["max_token_layers"])
+                or not isinstance(receipt.get("work_completed_at"), int)
+                or int(receipt["work_completed_at"]) < int(stored["claimed_at"] or 0)
+                or int(receipt["work_completed_at"]) > int(stored["execution_deadline"])
+            ):
+                continue
+
+            debit = db.execute(
+                "SELECT * FROM journal WHERE seq=?", (stored["debit_journal_seq"],)
+            ).fetchone()
+            credit = db.execute(
+                "SELECT * FROM journal WHERE seq=?", (stored["credit_journal_seq"],)
+            ).fetchone()
+            detail = json.dumps(
+                {
+                    "hold_id": stored["hold_id"],
+                    "worker_keyid": stored["worker_keyid"],
+                    "sequence": sequence,
+                    "cumulative_cost": cost,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            journals_ok = (
+                debit is not None
+                and credit is not None
+                and debit["kind"] == "spend_settle_debit"
+                and debit["receipt_id"] == stored["receipt_id"]
+                and debit["account"] == stored["escrow_account"]
+                and debit["counterparty"] == stored["worker_account_at_authorize"]
+                and int(debit["amount"]) == -delta
+                and int(debit["ts"]) == int(stored["accepted_at"])
+                and debit["detail"] == detail
+                and credit["kind"] == "spend_earn"
+                and credit["receipt_id"] == stored["receipt_id"]
+                and credit["account"] == stored["worker_account_at_authorize"]
+                and credit["counterparty"] == stored["escrow_account"]
+                and int(credit["amount"]) == delta
+                and int(credit["ts"]) == int(stored["accepted_at"])
+                and credit["detail"] == detail
+                and int(
+                    db.execute(
+                        "SELECT COUNT(*) FROM journal WHERE receipt_id=?",
+                        (stored["receipt_id"],),
+                    ).fetchone()[0]
+                ) == 2
+            )
+            terminal = stored["terminal_at"]
+            economic_ok = (
+                journals_ok
+                and economic["hold_id"] == stored["hold_id"]
+                and economic["payer_account"] == stored["payer_account_at_authorize"]
+                and economic["worker_account"] == stored["worker_account_at_authorize"]
+                and int(economic["amount"]) == delta
+                and int(economic["earned_at"]) == int(stored["accepted_at"])
+                and economic["debit_journal_seq"] == stored["debit_journal_seq"]
+                and economic["credit_journal_seq"] == stored["credit_journal_seq"]
+                and terminal is not None
+                and economic["hold_terminal_at"] == terminal
+                and int(economic["matures_at"]) == int(terminal) + HOLD_S
+                and stored["hold_state"] != "disputed"
+            )
+            if economic_ok:
+                total += delta
+        return total
+
+    @staticmethod
     def _withdrawable_in(db: sqlite3.Connection, operator: str, now: int) -> int:
         balance = LedgerStore._balance_in(db, operator)
         deposited = int(
@@ -1080,17 +1405,26 @@ class LedgerStore:
             ).fetchone()[0]
         )
 
-        matured_earnings = int(
+        matured_legacy_earnings = int(
             db.execute(
                 "SELECT COALESCE(SUM(amount), 0) FROM economic_receipts "
-                "WHERE worker_account=? AND amount>0 AND funded=1 "
+                "WHERE namespace!='v2' AND worker_account=? AND amount>0 AND funded=1 "
                 "AND dispute_state='none' AND eligible_at IS NOT NULL "
                 "AND ?>=eligible_at",
                 (operator, now),
             ).fetchone()[0]
         )
+        matured_v2_earnings = LedgerStore._verified_v2_matured_earnings_in(
+            db, operator, now
+        )
 
-        entitlement = deposited - withdrawn - held + matured_earnings
+        entitlement = (
+            deposited
+            - withdrawn
+            - held
+            + matured_legacy_earnings
+            + matured_v2_earnings
+        )
         return max(0, min(balance, entitlement))
 
     @staticmethod
@@ -1193,6 +1527,10 @@ class LedgerStore:
                 "INSERT INTO receipts(receipt_id, requester, credited, charged, delta, tier, "
                 "state, created_at) VALUES (?, ?, ?, ?, ?, ?, 'settled', ?)",
                 (receipt_id, requester, credited_json, charged, delta, tier, now),
+            )
+            db.execute(
+                "INSERT INTO legacy_funding_projection(receipt_id, funded) VALUES (?, ?)",
+                (receipt_id, int(funded)),
             )
             for account in final:
                 account_tier = (

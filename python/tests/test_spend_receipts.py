@@ -564,6 +564,40 @@ def test_s6_detects_symmetric_double_accounting_mutation(tmp_path):
     assert any("orphan or duplicate" in error for error in linkage["errors"])
 
 
+def test_orphan_mature_v2_economic_row_is_not_withdrawable_and_kills_s6(tmp_path):
+    path = tmp_path / "orphan-v2-economic.sqlite"
+    store, hold = _seed_reconcilable_spend(path)
+    try:
+        terminal = int(store.spend_status(hold["hold_id"])["terminal_at"])
+        store._clock = lambda: terminal
+        assert store.withdrawable("worker") == 0
+
+        fabricated_id = "sha256:" + "f" * 64
+        store._db.execute("PRAGMA foreign_keys=OFF")
+        store._db.execute(
+            "INSERT INTO spend_economic_receipts("
+            "receipt_id, hold_id, payer_account, worker_account, amount, funded, "
+            "earned_at, hold_terminal_at, matures_at, dispute_state, "
+            "debit_journal_seq, credit_journal_seq) "
+            "VALUES (?, ?, 'payer', 'worker', 8, 1, ?, ?, ?, 'none', NULL, NULL)",
+            (fabricated_id, hold["hold_id"], terminal - HOLD_S - 1,
+             terminal - HOLD_S - 1, terminal - 1),
+        )
+
+        # The fabricated mature row has enough value to unlock the worker's
+        # whole balance under the old economic-view-only calculation.
+        assert store.balance("worker") == 8
+        assert store.withdrawable("worker") == 0
+    finally:
+        store.close()
+
+    report = _run_s6_and_assert_kill(path, tmp_path)
+    view = _check(report, "economic_receipt_view")
+    assert view["ok"] is False
+    assert any("bidirectionally match" in error for error in view["errors"])
+    assert any(fabricated_id in error for error in view["errors"])
+
+
 def test_s6_reconciles_10k_receipts_under_two_seconds(tmp_path):
     path = tmp_path / "ten-thousand.sqlite"
     with LedgerStore(path) as store:
@@ -596,3 +630,36 @@ def test_s6_reconciles_10k_receipts_under_two_seconds(tmp_path):
     assert report["outcome"] == "match"
     assert _check(report, "spend_usage_linkage")["checked"] == 10_000
     assert elapsed < 2.0, f"10k-receipt S6 took {elapsed:.3f}s"
+
+
+def test_legacy_10k_earnings_withdrawable_and_s6_are_bounded(tmp_path):
+    path = tmp_path / "legacy-ten-thousand.sqlite"
+    clock = [7_000_000]
+    with LedgerStore(path, clock=lambda: clock[0]) as store:
+        store._db.execute(
+            "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
+            "VALUES ('payer', ?, 1)",
+            (VAULT,),
+        )
+        store.deposit_batch("payer", VAULT, [("funding", 10_000, 1)], 10_000)
+        for sequence in range(10_000):
+            store.settle(
+                f"legacy-earning-{sequence}", "payer", {"worker": 1}, 1, "self"
+            )
+        clock[0] += HOLD_S
+
+        started = time.perf_counter()
+        assert store.withdrawable("worker") == 10_000
+        withdrawable_elapsed = time.perf_counter() - started
+
+    started = time.perf_counter()
+    report = Reconciler(
+        path, FakeReconcileRPC({VAULT: 100}), _config(tmp_path)
+    ).collect()
+    s6_elapsed = time.perf_counter() - started
+
+    assert report["outcome"] == "match"
+    assert withdrawable_elapsed < 2.0, (
+        f"10k legacy withdrawable took {withdrawable_elapsed:.3f}s"
+    )
+    assert s6_elapsed < 5.0, f"10k legacy S6 took {s6_elapsed:.3f}s"
