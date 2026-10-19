@@ -801,10 +801,14 @@ class V2LedgerService:
             request["amount"], "amount", low=1, high=TASK_MAX_AMOUNT
         )
         now = self.store._now()
+        # An identical replay of an already-authorized (payer, client_nonce) is answered by the
+        # store (same hold, or 409 if any field differs) BEFORE the new-hold deadline window, so a
+        # crash-recovery re-assign close to the deadline gets its hold back instead of a 422.
+        replay = self.store.has_task_hold_nonce(keyid, client_nonce)
         deadline = _bounded_integer(
             request["deadline"],
             "deadline",
-            low=now + TASK_DEADLINE_MIN_S,
+            low=0 if replay else now + TASK_DEADLINE_MIN_S,
             high=now + TASK_DEADLINE_MAX_S,
         )
         status = self.store.authorize_task_hold(
