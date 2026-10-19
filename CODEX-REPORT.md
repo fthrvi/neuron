@@ -21,3 +21,14 @@ Contract ambiguities noted (contract unchanged):
 - `TASK_MAX_AMOUNT` has no numeric definition in the shared contract. Implemented it as the ledger's existing `MAX_UNITS` cap, `10^12`, which also matches the node-side M2 reward/budget decision.
 - Exact success bodies for pay and refund are not enumerated. Implemented the authorize hold fields (`v`, `hold_id`, `task_hash`, `worker_keyid`, `amount`, `deadline`, `state`) plus the contract-required `replayed` boolean.
 - “Past deadline + 24 h” does not state inclusive/exclusive boundary behavior. Implemented expiry at `now >= deadline + 24h`, matching the existing inference sweep's deadline convention.
+
+## Fix round 1
+
+Review: rv-m2.md. Suites: `python3 -m pytest -q python/tests/test_task_holds.py test_spend_api test_spend_escrow test_spend_receipts test_ledger_store test_ledger_server`: before 162 passed, after 165 passed.
+
+| Finding | Change | Proven by |
+|---|---|---|
+| 3 Rollback blocker | Task escrow accounts moved from `__spend_hold__:task:<id>` to `__task_hold__:<id>` (`_TASK_HOLD_STEM`, `_task_hold_account`); `is_reserved` covers the new stem; a startup check refuses any `__task_hold__` account not backed by `task_holds.escrow_account` (same shape as the spend-hold check, which still tolerates legacy task rows under the old stem). | `test_forgejo_main_code_still_opens_a_store_with_paid_and_open_task_holds` (one paid + one open hold, opened by `git show forgejo/main:python/core/ledger_store.py` in a subprocess: starts, balances sum 0 and match), `test_task_accounts_use_their_own_reserved_stem_and_unbacked_ones_refuse_startup`; forward migration test unchanged and passing. Mutation (stem reverted) fails both. |
+| 7 Authorize replay near deadline | `ledger_server.authorize_task_hold` probes `LedgerStore.has_task_hold_nonce(payer, nonce)`; on a replay the +60 s floor is skipped and the store answers (same hold, or 409 if any field differs). New holds still need the window. | `test_identical_authorize_replay_near_the_deadline_returns_the_same_hold` (mutation fails it). |
+
+Note: a replay of a hold that has since been refunded/paid returns that terminal state; the adapter rejects it as not open (fail closed).
