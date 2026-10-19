@@ -49,6 +49,11 @@ _WITHDRAWAL_HOLD_STEM = "__withdrawal_hold__"
 _WITHDRAWAL_HOLD_PREFIX = f"{_WITHDRAWAL_HOLD_STEM}:"
 _SPEND_HOLD_STEM = "__spend_hold__"
 _SPEND_HOLD_PREFIX = f"{_SPEND_HOLD_STEM}:"
+# Task escrow accounts deliberately do NOT live under the spend-hold stem: a ledger running the
+# pre-M2 code treats any unbacked __spend_hold__ account as a startup collision and refuses to
+# open, which would make rolling back after a single task hold impossible.
+_TASK_HOLD_STEM = "__task_hold__"
+_TASK_HOLD_PREFIX = f"{_TASK_HOLD_STEM}:"
 
 SPEND_EXECUTION_S = 15 * 60
 SPEND_SETTLEMENT_GRACE_S = 24 * 60 * 60
@@ -162,6 +167,7 @@ def is_reserved(account: object) -> bool:
         account == TREASURY_ACCOUNT
         or account.startswith(_WITHDRAWAL_HOLD_STEM)
         or account.startswith(_SPEND_HOLD_STEM)
+        or account.startswith(_TASK_HOLD_STEM)
     )
 
 
@@ -746,6 +752,20 @@ class LedgerStore:
                 "a spend or task hold; rename or remap this legacy "
                 "account before reopening the ledger"
             )
+        task_collision = self._db.execute(
+            "SELECT a.id, a.balance FROM accounts AS a "
+            "LEFT JOIN task_holds AS t ON t.escrow_account=a.id "
+            "WHERE substr(a.id, 1, ?)=? AND t.hold_id IS NULL "
+            "ORDER BY a.id LIMIT 1",
+            (len(_TASK_HOLD_STEM), _TASK_HOLD_STEM),
+        ).fetchone()
+        if task_collision is not None:
+            raise LedgerError(
+                f"reserved task account {task_collision['id']!r} (balance "
+                f"{int(task_collision['balance'])}) is not backed by "
+                "a task hold; rename or remap this legacy "
+                "account before reopening the ledger"
+            )
 
         spend_hold_columns = {
             str(row[1]) for row in self._db.execute("PRAGMA table_info(spend_holds)")
@@ -1194,7 +1214,7 @@ class LedgerStore:
 
     @staticmethod
     def _task_hold_account(hold_id: str) -> str:
-        return f"{_SPEND_HOLD_PREFIX}task:{hold_id}"
+        return f"{_TASK_HOLD_PREFIX}{hold_id}"
 
     @staticmethod
     def _task_status_in(
@@ -2979,6 +2999,15 @@ class LedgerStore:
         if limit is None:
             return None
         return max(0, balance - restricted + limit)
+
+    def has_task_hold_nonce(self, payer_keyid: str, client_nonce: str) -> bool:
+        """Whether (payer_keyid, client_nonce) already authorized a task hold (replay probe)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM task_holds WHERE payer_keyid=? AND client_nonce=?",
+                (payer_keyid, client_nonce),
+            ).fetchone()
+        return row is not None
 
     def authorize_task_hold(
         self,

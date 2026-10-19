@@ -122,7 +122,7 @@ def test_pay_refund_replays_conflicts_conserve_and_earnings_mature(tmp_path):
         assert all(
             balance == 0
             for balance, in store._db.execute(
-                "SELECT balance FROM accounts WHERE id LIKE '__spend_hold__:task:%'"
+                "SELECT balance FROM accounts WHERE id LIKE '__task_hold__:%'"
             )
         )
 
@@ -442,5 +442,88 @@ def test_service_rejects_unknown_worker_self_pay_and_body_bounds(tmp_path, ident
                 service.authorize_task_hold(
                     _task_body(identities, clock[0], **changes), payer, roster
                 )
+    finally:
+        service.close()
+
+
+def test_task_accounts_use_their_own_reserved_stem_and_unbacked_ones_refuse_startup(tmp_path):
+    from core.ledger_store import is_reserved
+
+    assert is_reserved("__task_hold__:abc") and is_reserved("__spend_hold__:abc")
+    clock = [1_000_000]
+    database = tmp_path / "ledger.db"
+    with LedgerStore(database, clock=lambda: clock[0]) as store:
+        store.deposit("funding", "payer", 1_000, 1)
+        hold = _authorize(store, clock, nonce="n", task_hash="5" * 64)
+        assert store._db.execute(
+            "SELECT escrow_account FROM task_holds WHERE hold_id=?", (hold["hold_id"],)
+        ).fetchone()[0] == f"__task_hold__:{hold['hold_id']}"
+        store._db.execute(
+            "INSERT INTO accounts(id, balance) VALUES ('__task_hold__:ghost', 0)"
+        )
+        store._db.commit()
+    with pytest.raises(Exception, match="not backed by a task hold"):
+        LedgerStore(database, clock=lambda: clock[0])
+
+
+def test_forgejo_main_code_still_opens_a_store_with_paid_and_open_task_holds(tmp_path):
+    clock = [1_000_000]
+    database = tmp_path / "ledger.db"
+    with LedgerStore(database, clock=lambda: clock[0]) as store:
+        store.deposit("funding", "payer", 1_000, 1)
+        paid = _authorize(store, clock, nonce="p", task_hash="6" * 64)
+        store.pay_task_hold(paid["hold_id"], "payer-key")
+        _authorize(store, clock, nonce="o", task_hash="7" * 64, amount=50)   # left open
+        new_total = _total(store)
+        new_balances = {
+            row["id"]: int(row["balance"])
+            for row in store._db.execute("SELECT id, balance FROM accounts WHERE balance != 0")
+        }
+    assert "payer" in new_balances and any(k.startswith("__task_hold__:") for k in new_balances)
+    base_module = tmp_path / "base_ledger_store.py"
+    base_module.write_text(
+        subprocess.check_output(["git", "show", "forgejo/main:python/core/ledger_store.py"],
+                                text=True, cwd=os.path.dirname(__file__)),
+        encoding="utf-8",
+    )
+    driver = """
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('base_ledger_store', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+with module.LedgerStore(sys.argv[2], clock=lambda: 1000000) as store:
+    rows = store._db.execute('SELECT id, balance FROM accounts WHERE balance != 0').fetchall()
+    total = store._db.execute('SELECT COALESCE(SUM(balance), 0) FROM accounts').fetchone()[0]
+    print(json.dumps({'total': total, 'balances': {r[0]: r[1] for r in rows}}))
+"""
+    out = subprocess.run(
+        [sys.executable, "-c", driver, str(base_module), str(database)],
+        check=True, capture_output=True, text=True,
+    )
+    opened = json.loads(out.stdout.strip().splitlines()[-1])
+    assert opened["total"] == new_total == 0
+    assert opened["balances"] == new_balances
+
+
+def test_identical_authorize_replay_near_the_deadline_returns_the_same_hold(tmp_path, identities):
+    clock = [7_000_000]
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite", identities["roster"],
+        clock=lambda: clock[0], start_sweeper=False,
+    )
+    try:
+        roster = service.rosters.snapshot()
+        payer = identities["payer"]["public"]
+        service.store.deposit("funding", "payer", 1_000, 1)
+        body = _task_body(identities, clock[0], deadline=clock[0] + 120)
+        first = service.authorize_task_hold(body, payer, roster)
+        clock[0] += 100                                   # now only 20 s remain: inside the 60 s floor
+        assert service.authorize_task_hold(dict(body), payer, roster)["hold_id"] == first["hold_id"]
+        with pytest.raises(SpendConflict):                # a changed field is still a conflict
+            service.authorize_task_hold(dict(body, amount=101), payer, roster)
+        with pytest.raises(LedgerValueError):             # a NEW hold still needs the window
+            service.authorize_task_hold(
+                dict(body, client_nonce="other", task_hash="b" * 64), payer, roster)
     finally:
         service.close()
