@@ -50,6 +50,9 @@ from core.ledger_store import (  # noqa: E402
     ReceiptStateError,
     SPEND_EXPIRY_BATCH_SIZE,
     SPEND_USAGE_FIELDS,
+    TASK_DEADLINE_MAX_S,
+    TASK_DEADLINE_MIN_S,
+    TASK_MAX_AMOUNT,
     SpendConflict,
     SpendExpired,
     SpendNotFound,
@@ -85,10 +88,13 @@ _SPEND_POST_PATHS = frozenset(
         "/spend/settle",
         "/spend/abandon",
         "/spend/release",
+        "/spend/task/authorize",
+        "/spend/task/pay",
+        "/spend/task/refund",
     }
 )
 _SPEND_GET_PATHS = frozenset(
-    {"/spend/status", "/spend/ready"}
+    {"/spend/status", "/spend/ready", "/spend/task/status"}
 )
 _SPEND_PATHS = _SPEND_POST_PATHS | _SPEND_GET_PATHS
 
@@ -752,6 +758,114 @@ class V2LedgerService:
         status = self.store.request_spend_release(hold_id, keyid)
         return self._status_response(status)
 
+    @staticmethod
+    def _task_hold_response(
+        status: Mapping[str, object], *, replayed: bool | None = None
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "v": 1,
+            "hold_id": status["hold_id"],
+            "task_hash": status["task_hash"],
+            "worker_keyid": status["worker_keyid"],
+            "amount": int(status["amount"]),
+            "deadline": int(status["deadline"]),
+            "state": status["state"],
+        }
+        if replayed is not None:
+            result["replayed"] = replayed
+        return result
+
+    def authorize_task_hold(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        request = _strict_fields(
+            body,
+            {"client_nonce", "task_hash", "worker_keyid", "amount", "deadline"},
+            name="task authorize",
+        )
+        payer_account, payer_tier = _row_identity(keyid, roster)
+        client_nonce = _bounded_text(
+            request["client_nonce"], "client_nonce", maximum=128
+        )
+        task_hash = request["task_hash"]
+        if not isinstance(task_hash, str) or re.fullmatch(r"[0-9a-f]{64}", task_hash) is None:
+            raise LedgerValueError("task_hash must be 64 lowercase hex")
+        worker_keyid = _ed25519_keyid(request["worker_keyid"], "worker_keyid")
+        worker_account, _worker_tier = _row_identity(worker_keyid, roster)
+        if worker_account == payer_account:
+            raise LedgerValueError("task hold cannot pay the payer's own account")
+        amount = _bounded_integer(
+            request["amount"], "amount", low=1, high=TASK_MAX_AMOUNT
+        )
+        now = self.store._now()
+        deadline = _bounded_integer(
+            request["deadline"],
+            "deadline",
+            low=now + TASK_DEADLINE_MIN_S,
+            high=now + TASK_DEADLINE_MAX_S,
+        )
+        status = self.store.authorize_task_hold(
+            payer_keyid=keyid,
+            payer_account=payer_account,
+            tier=payer_tier,
+            client_nonce=client_nonce,
+            task_hash=task_hash,
+            worker_keyid=worker_keyid,
+            worker_account=worker_account,
+            amount=amount,
+            deadline=deadline,
+        )
+        return self._task_hold_response(status)
+
+    def pay_task_hold(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _row_identity(keyid, roster)
+        request = _strict_fields(body, {"hold_id"}, name="task pay")
+        hold_id = _bounded_text(request["hold_id"], "hold_id")
+        status = self.store.pay_task_hold(hold_id, keyid)
+        return self._task_hold_response(status, replayed=bool(status["replayed"]))
+
+    def refund_task_hold(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _row_identity(keyid, roster)
+        request = _strict_fields(body, {"hold_id", "reason"}, name="task refund")
+        hold_id = _bounded_text(request["hold_id"], "hold_id")
+        reason = _bounded_text(request["reason"], "reason", maximum=64)
+        status = self.store.refund_task_hold(hold_id, keyid, reason)
+        return self._task_hold_response(status, replayed=bool(status["replayed"]))
+
+    def task_hold_status(
+        self,
+        hold_id: str,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _row_identity(keyid, roster)
+        hold_id = _bounded_text(hold_id, "hold_id")
+        status = self.store.task_hold_status_scoped(hold_id, keyid)
+        return {
+            "v": 1,
+            "hold_id": status["hold_id"],
+            "task_hash": status["task_hash"],
+            "payer_account": status["payer_account"],
+            "worker_keyid": status["worker_keyid"],
+            "amount": int(status["amount"]),
+            "deadline": int(status["deadline"]),
+            "state": status["state"],
+            "server_time": self.store._now(),
+        }
+
     def spend_status(
         self,
         hold_id: str,
@@ -1032,6 +1146,9 @@ def _make_v2_handler(svc: V2LedgerService):
                 elif target.path == "/spend/status":
                     query = _exact_query(target, {"hold_id"})
                     result = svc.spend_status(query["hold_id"], keyid, roster)
+                elif target.path == "/spend/task/status":
+                    query = _exact_query(target, {"hold_id"})
+                    result = svc.task_hold_status(query["hold_id"], keyid, roster)
                 elif target.path == "/spend/ready":
                     _exact_query(target, set())
                     result = svc.spend_ready(keyid, roster)
@@ -1109,8 +1226,14 @@ def _make_v2_handler(svc: V2LedgerService):
                     result = svc.settle_spend(body, keyid, roster)
                 elif target.path == "/spend/abandon":
                     result = svc.abandon_spend(body, keyid, roster)
-                else:
+                elif target.path == "/spend/release":
                     result = svc.release_spend(body, keyid, roster)
+                elif target.path == "/spend/task/authorize":
+                    result = svc.authorize_task_hold(body, keyid, roster)
+                elif target.path == "/spend/task/pay":
+                    result = svc.pay_task_hold(body, keyid, roster)
+                else:
+                    result = svc.refund_task_hold(body, keyid, roster)
                 self._send(200, result)
             except CreditLimitError as exc:
                 self._send(422 if target.path == "/withdraw" else 402,

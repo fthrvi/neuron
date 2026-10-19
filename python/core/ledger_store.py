@@ -31,6 +31,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 # Per-operation bound in TEST units: large enough for any real settle, small enough that a
 # malformed or hostile amount can never approach integer overflow in balances.
 MAX_UNITS = 10 ** 12
+TASK_MAX_AMOUNT = MAX_UNITS
 
 # Permanent conversion between the ledger's token-layer credits and the SPL
 # token's smallest unit. Price changes belong in the model multiplier, not
@@ -53,6 +54,9 @@ SPEND_EXECUTION_S = 15 * 60
 SPEND_SETTLEMENT_GRACE_S = 24 * 60 * 60
 SPEND_EXPIRY_BATCH_SIZE = 200
 SPEND_RECEIPT_DOMAIN = b"nakshatra-spend-usage-receipt-v2\0"
+TASK_DEADLINE_MIN_S = 60
+TASK_DEADLINE_MAX_S = 30 * 24 * 60 * 60
+TASK_REFUND_GRACE_S = 24 * 60 * 60
 
 SPEND_USAGE_FIELDS = frozenset(
     {
@@ -548,6 +552,47 @@ class LedgerStore:
                       OR matures_at = hold_terminal_at + {HOLD_S})
             );
 
+            CREATE TABLE IF NOT EXISTS task_holds (
+                hold_id TEXT PRIMARY KEY,
+                payer_keyid TEXT NOT NULL,
+                payer_account TEXT NOT NULL,
+                payer_tier TEXT NOT NULL,
+                client_nonce TEXT NOT NULL,
+                task_hash TEXT NOT NULL
+                    CHECK(length(task_hash) = 64 AND task_hash = lower(task_hash)),
+                worker_keyid TEXT NOT NULL,
+                worker_account TEXT NOT NULL,
+                amount INTEGER NOT NULL
+                    CHECK(typeof(amount) = 'integer'
+                          AND amount BETWEEN 1 AND {TASK_MAX_AMOUNT}),
+                deadline INTEGER NOT NULL CHECK(typeof(deadline) = 'integer'),
+                request_digest TEXT NOT NULL,
+                escrow_account TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK(state IN ('open','paid','refunded')),
+                refund_reason TEXT,
+                authorized_at INTEGER NOT NULL CHECK(typeof(authorized_at) = 'integer'),
+                terminal_at INTEGER,
+                updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer'),
+                UNIQUE(payer_keyid, client_nonce),
+                CHECK(deadline >= authorized_at + {TASK_DEADLINE_MIN_S}),
+                CHECK(deadline <= authorized_at + {TASK_DEADLINE_MAX_S}),
+                CHECK((state = 'open') = (terminal_at IS NULL)),
+                CHECK((state = 'refunded') OR refund_reason IS NULL)
+            );
+
+            CREATE TABLE IF NOT EXISTS task_earnings (
+                hold_id TEXT PRIMARY KEY,
+                earned_at INTEGER NOT NULL CHECK(typeof(earned_at) = 'integer'),
+                matures_at INTEGER NOT NULL
+                    CHECK(typeof(matures_at) = 'integer'
+                          AND matures_at = earned_at + {HOLD_S}),
+                debit_journal_seq INTEGER NOT NULL UNIQUE,
+                credit_journal_seq INTEGER NOT NULL UNIQUE,
+                FOREIGN KEY(hold_id) REFERENCES task_holds(hold_id),
+                FOREIGN KEY(debit_journal_seq) REFERENCES journal(seq),
+                FOREIGN KEY(credit_journal_seq) REFERENCES journal(seq)
+            );
+
             CREATE TABLE IF NOT EXISTS legacy_funding_projection (
                 receipt_id TEXT PRIMARY KEY,
                 funded INTEGER NOT NULL CHECK(funded IN (0, 1)),
@@ -565,6 +610,12 @@ class LedgerStore:
 
             CREATE INDEX IF NOT EXISTS spend_workers_account
             ON spend_hold_workers(worker_account_at_authorize, hold_id);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS task_holds_open_task
+            ON task_holds(payer_account, task_hash) WHERE state='open';
+
+            CREATE INDEX IF NOT EXISTS task_holds_due
+            ON task_holds(state, deadline, authorized_at);
 
             CREATE TRIGGER IF NOT EXISTS journal_no_update
             BEFORE UPDATE ON journal
@@ -638,6 +689,33 @@ class LedgerStore:
                 SELECT RAISE(ABORT, 'spend economic receipt core is immutable');
             END;
 
+            CREATE TRIGGER IF NOT EXISTS task_holds_snapshots_immutable
+            BEFORE UPDATE OF payer_keyid, payer_account, payer_tier, client_nonce,
+                task_hash, worker_keyid, worker_account, amount, deadline,
+                request_digest, escrow_account, authorized_at
+            ON task_holds
+            BEGIN
+                SELECT RAISE(ABORT, 'task hold snapshot is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_holds_no_delete
+            BEFORE DELETE ON task_holds
+            BEGIN
+                SELECT RAISE(ABORT, 'task holds are permanent');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_earnings_no_update
+            BEFORE UPDATE ON task_earnings
+            BEGIN
+                SELECT RAISE(ABORT, 'task earnings are immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_earnings_no_delete
+            BEFORE DELETE ON task_earnings
+            BEGIN
+                SELECT RAISE(ABORT, 'task earnings are permanent');
+            END;
+
             CREATE TRIGGER IF NOT EXISTS legacy_funding_projection_no_update
             BEFORE UPDATE ON legacy_funding_projection
             BEGIN
@@ -655,7 +733,9 @@ class LedgerStore:
         collision = self._db.execute(
             "SELECT a.id, a.balance FROM accounts AS a "
             "LEFT JOIN spend_holds AS h ON h.escrow_account=a.id "
+            "LEFT JOIN task_holds AS t ON t.escrow_account=a.id "
             "WHERE substr(a.id, 1, ?)=? AND h.hold_id IS NULL "
+            "AND t.hold_id IS NULL "
             "ORDER BY a.id LIMIT 1",
             (len(_SPEND_HOLD_STEM), _SPEND_HOLD_STEM),
         ).fetchone()
@@ -663,7 +743,7 @@ class LedgerStore:
             raise LedgerError(
                 f"reserved spend account {collision['id']!r} (balance "
                 f"{int(collision['balance'])}) is not backed by "
-                "spend_holds.escrow_account; rename or remap this legacy "
+                "a spend or task hold; rename or remap this legacy "
                 "account before reopening the ledger"
             )
 
@@ -824,7 +904,30 @@ class LedgerStore:
                  AND c.ts=u.accepted_at
                  AND (SELECT COUNT(*) FROM journal AS x
                       WHERE x.receipt_id=u.receipt_id)=2)
-              );
+              )
+            UNION ALL
+            SELECT 'task:' || t.hold_id, 'task', 'task-pay:' || t.hold_id,
+                t.hold_id, t.payer_account, t.worker_account, t.amount, 1,
+                e.earned_at, e.earned_at, e.matures_at, e.matures_at + 1,
+                'none', e.debit_journal_seq, e.credit_journal_seq
+            FROM task_holds AS t
+            JOIN task_earnings AS e ON e.hold_id=t.hold_id
+            JOIN journal AS d ON d.seq=e.debit_journal_seq
+            JOIN journal AS c ON c.seq=e.credit_journal_seq
+            WHERE t.state='paid' AND t.terminal_at=e.earned_at
+              AND e.matures_at=e.earned_at + {HOLD_S}
+              AND d.kind='task_pay_debit'
+              AND d.receipt_id='task-pay:' || t.hold_id
+              AND d.account=t.escrow_account
+              AND d.counterparty=t.worker_account AND d.amount=-t.amount
+              AND d.ts=e.earned_at
+              AND c.kind='task_earn'
+              AND c.receipt_id='task-pay:' || t.hold_id
+              AND c.account=t.worker_account
+              AND c.counterparty=t.escrow_account AND c.amount=t.amount
+              AND c.ts=e.earned_at
+              AND (SELECT COUNT(*) FROM journal AS x
+                   WHERE x.receipt_id='task-pay:' || t.hold_id)=2;
 
             CREATE TRIGGER IF NOT EXISTS spend_terminal_at_immutable
             BEFORE UPDATE OF terminal_at ON spend_holds
@@ -1088,6 +1191,72 @@ class LedgerStore:
     @staticmethod
     def _spend_hold_account(hold_id: str) -> str:
         return f"{_SPEND_HOLD_PREFIX}{hold_id}"
+
+    @staticmethod
+    def _task_hold_account(hold_id: str) -> str:
+        return f"{_SPEND_HOLD_PREFIX}task:{hold_id}"
+
+    @staticmethod
+    def _task_status_in(
+        db: sqlite3.Connection, hold_id: str
+    ) -> dict[str, Any]:
+        row = db.execute(
+            "SELECT * FROM task_holds WHERE hold_id=?", (hold_id,)
+        ).fetchone()
+        if row is None:
+            raise SpendNotFound("spend hold not found")
+        return dict(row)
+
+    @classmethod
+    def _assert_task_hold_in(
+        cls, db: sqlite3.Connection, hold_id: str
+    ) -> None:
+        hold = db.execute(
+            "SELECT amount, escrow_account, state FROM task_holds WHERE hold_id=?",
+            (hold_id,),
+        ).fetchone()
+        if hold is None:
+            raise SpendNotFound("spend hold not found")
+        expected = int(hold["amount"]) if hold["state"] == "open" else 0
+        actual = cls._balance_in(db, str(hold["escrow_account"]))
+        if actual != expected:
+            raise LedgerError(
+                f"task hold {hold_id!r} balance is {actual}, expected {expected}"
+            )
+
+    @classmethod
+    def _advance_task_hold_in(
+        cls, db: sqlite3.Connection, hold_id: str, now: int
+    ) -> bool:
+        hold = db.execute(
+            "SELECT payer_account, amount, deadline, escrow_account, state "
+            "FROM task_holds WHERE hold_id=?",
+            (hold_id,),
+        ).fetchone()
+        if hold is None:
+            raise SpendNotFound("spend hold not found")
+        if hold["state"] != "open" or now < int(hold["deadline"]) + TASK_REFUND_GRACE_S:
+            return False
+        updated = db.execute(
+            "UPDATE task_holds SET state='refunded', refund_reason='expired', "
+            "terminal_at=?, updated_at=? WHERE hold_id=? AND state='open'",
+            (now, now, hold_id),
+        )
+        if updated.rowcount != 1:
+            return False
+        cls._move_spend_value(
+            db,
+            source=str(hold["escrow_account"]),
+            destination=str(hold["payer_account"]),
+            amount=int(hold["amount"]),
+            timestamp=now,
+            debit_kind="task_refund_debit",
+            credit_kind="task_refund_credit",
+            event_id=f"task-refund:{hold_id}",
+            detail={"hold_id": hold_id, "reason": "expired"},
+        )
+        cls._assert_task_hold_in(db, hold_id)
+        return True
 
     @staticmethod
     def _restricted_unproven_balance_in(
@@ -1399,6 +1568,59 @@ class LedgerStore:
         return total
 
     @staticmethod
+    def _verified_task_matured_earnings_in(
+        db: sqlite3.Connection, operator: str, now: int
+    ) -> int:
+        """Sum mature task earnings only when their hold and journals agree."""
+        total = 0
+        rows = db.execute(
+            "SELECT t.*, e.earned_at, e.matures_at, e.debit_journal_seq, "
+            "e.credit_journal_seq FROM task_holds AS t "
+            "JOIN task_earnings AS e ON e.hold_id=t.hold_id "
+            "WHERE t.worker_account=? AND t.state='paid' AND ?>e.matures_at",
+            (operator, now),
+        ).fetchall()
+        for row in rows:
+            event_id = f"task-pay:{row['hold_id']}"
+            debit = db.execute(
+                "SELECT * FROM journal WHERE seq=?", (row["debit_journal_seq"],)
+            ).fetchone()
+            credit = db.execute(
+                "SELECT * FROM journal WHERE seq=?", (row["credit_journal_seq"],)
+            ).fetchone()
+            detail = json.dumps(
+                {"hold_id": row["hold_id"]}, sort_keys=True, separators=(",", ":")
+            )
+            if (
+                row["terminal_at"] == row["earned_at"]
+                and int(row["matures_at"]) == int(row["earned_at"]) + HOLD_S
+                and LedgerStore._balance_in(db, str(row["escrow_account"])) == 0
+                and debit is not None
+                and credit is not None
+                and debit["kind"] == "task_pay_debit"
+                and debit["receipt_id"] == event_id
+                and debit["account"] == row["escrow_account"]
+                and debit["counterparty"] == row["worker_account"]
+                and int(debit["amount"]) == -int(row["amount"])
+                and int(debit["ts"]) == int(row["earned_at"])
+                and debit["detail"] == detail
+                and credit["kind"] == "task_earn"
+                and credit["receipt_id"] == event_id
+                and credit["account"] == row["worker_account"]
+                and credit["counterparty"] == row["escrow_account"]
+                and int(credit["amount"]) == int(row["amount"])
+                and int(credit["ts"]) == int(row["earned_at"])
+                and credit["detail"] == detail
+                and int(
+                    db.execute(
+                        "SELECT COUNT(*) FROM journal WHERE receipt_id=?", (event_id,)
+                    ).fetchone()[0]
+                ) == 2
+            ):
+                total += int(row["amount"])
+        return total
+
+    @staticmethod
     def _proven_eligible_balance_in(
         db: sqlite3.Connection,
         operator: str,
@@ -1441,13 +1663,17 @@ class LedgerStore:
         matured_legacy_earnings = int(
             db.execute(
                 "SELECT COALESCE(SUM(amount), 0) FROM economic_receipts "
-                "WHERE namespace!='v2' AND worker_account=? AND amount>0 AND funded=1 "
+                "WHERE namespace IN ('v1','legacy_import') "
+                "AND worker_account=? AND amount>0 AND funded=1 "
                 "AND dispute_state='none' AND eligible_at IS NOT NULL "
                 f"AND {legacy_maturity_predicate}",
                 (operator, now),
             ).fetchone()[0]
         )
         matured_v2_earnings = LedgerStore._verified_v2_matured_earnings_in(
+            db, operator, now
+        )
+        matured_task_earnings = LedgerStore._verified_task_matured_earnings_in(
             db, operator, now
         )
 
@@ -1457,6 +1683,7 @@ class LedgerStore:
             - held
             + matured_legacy_earnings
             + matured_v2_earnings
+            + matured_task_earnings
         )
         return max(0, min(balance, entitlement))
 
@@ -2753,6 +2980,267 @@ class LedgerStore:
             return None
         return max(0, balance - restricted + limit)
 
+    def authorize_task_hold(
+        self,
+        *,
+        payer_keyid: str,
+        payer_account: str,
+        tier: str,
+        client_nonce: str,
+        task_hash: str,
+        worker_keyid: str,
+        worker_account: str,
+        amount: int,
+        deadline: int,
+        hold_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Reserve a fixed task reward in a dedicated spend hold."""
+        payer_keyid = _identifier(payer_keyid, "payer_keyid")
+        client_nonce = _identifier(client_nonce, "client_nonce")
+        worker_keyid = _identifier(worker_keyid, "worker_keyid")
+        if not isinstance(task_hash, str) or re.fullmatch(r"[0-9a-f]{64}", task_hash) is None:
+            raise LedgerValueError("task_hash must be 64 lowercase hex")
+        amount = _amount(amount)
+        if amount > TASK_MAX_AMOUNT:
+            raise LedgerValueError(
+                f"amount must be between 1 and {TASK_MAX_AMOUNT}"
+            )
+        if isinstance(deadline, bool) or not isinstance(deadline, int):
+            raise LedgerValueError("deadline must be an integer")
+        if hold_id is not None:
+            hold_id = _identifier(hold_id, "hold_id")
+        proposed_hold_id = hold_id or uuid.uuid4().hex
+        request_digest = "sha256:" + hashlib.sha256(
+            json.dumps(
+                {
+                    "payer_keyid": payer_keyid,
+                    "client_nonce": client_nonce,
+                    "task_hash": task_hash,
+                    "worker_keyid": worker_keyid,
+                    "amount": amount,
+                    "deadline": deadline,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            existing = db.execute(
+                "SELECT hold_id, request_digest FROM task_holds "
+                "WHERE payer_keyid=? AND client_nonce=?",
+                (payer_keyid, client_nonce),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["request_digest"] != request_digest
+                    or (hold_id is not None and existing["hold_id"] != hold_id)
+                ):
+                    raise SpendConflict(
+                        "client_nonce already authorizes a different task hold"
+                    )
+                existing_id = str(existing["hold_id"])
+                self._advance_task_hold_in(db, existing_id, self._now())
+                self._assert_task_hold_in(db, existing_id)
+                return self._task_status_in(db, existing_id)
+
+            resolved_payer = _identifier(payer_account, "payer_account")
+            resolved_worker = _identifier(worker_account, "worker_account")
+            if is_reserved(resolved_payer) or is_reserved(resolved_worker):
+                raise LedgerValueError("task hold party account is reserved")
+            if resolved_payer == resolved_worker:
+                raise LedgerValueError("task hold cannot pay the payer's own account")
+            resolved_tier = _tier(tier)
+            now = self._now()
+            if deadline < now + TASK_DEADLINE_MIN_S or deadline > now + TASK_DEADLINE_MAX_S:
+                raise LedgerValueError(
+                    f"deadline must be between now+{TASK_DEADLINE_MIN_S} "
+                    f"and now+{TASK_DEADLINE_MAX_S}"
+                )
+            if db.execute(
+                "SELECT 1 FROM task_holds WHERE payer_account=? AND task_hash=? "
+                "AND state='open'",
+                (resolved_payer, task_hash),
+            ).fetchone() is not None:
+                raise SpendConflict("task already has an open hold")
+            if db.execute(
+                "SELECT 1 FROM task_holds WHERE hold_id=?", (proposed_hold_id,)
+            ).fetchone() is not None:
+                raise SpendConflict("hold_id already exists")
+
+            balance = self._balance_in(db, resolved_payer)
+            restricted = self._restricted_unproven_balance_in(db, resolved_payer, now)
+            limit = TIER_LIMITS[resolved_tier]
+            if limit is not None and amount > balance - restricted + limit:
+                raise CreditLimitError(
+                    f"authorization exceeds eligible capacity "
+                    f"{max(0, balance - restricted + limit)}: {amount}"
+                )
+            escrow_account = self._task_hold_account(proposed_hold_id)
+            self._checked_balance(balance - amount, resolved_payer)
+            self._checked_balance(
+                self._balance_in(db, escrow_account) + amount, escrow_account
+            )
+            db.execute(
+                "INSERT INTO task_holds(hold_id, payer_keyid, payer_account, "
+                "payer_tier, client_nonce, task_hash, worker_keyid, worker_account, "
+                "amount, deadline, request_digest, escrow_account, state, "
+                "authorized_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, 'open', ?, ?)",
+                (
+                    proposed_hold_id, payer_keyid, resolved_payer, resolved_tier,
+                    client_nonce, task_hash, worker_keyid, resolved_worker, amount,
+                    deadline, request_digest, escrow_account, now, now,
+                ),
+            )
+            self._ensure_account(db, resolved_payer, resolved_tier)
+            self._ensure_account(db, escrow_account, "self")
+            self._move_spend_value(
+                db,
+                source=resolved_payer,
+                destination=escrow_account,
+                amount=amount,
+                timestamp=now,
+                debit_kind="task_authorize_debit",
+                credit_kind="task_authorize_credit",
+                event_id=f"task-authorize:{proposed_hold_id}",
+                detail={"hold_id": proposed_hold_id},
+            )
+            db.execute(
+                "UPDATE accounts SET tier=? WHERE id=?", (resolved_tier, resolved_payer)
+            )
+            db.execute(
+                "UPDATE accounts SET tier='self' WHERE id=?", (escrow_account,)
+            )
+            self._assert_task_hold_in(db, proposed_hold_id)
+            return self._task_status_in(db, proposed_hold_id)
+
+        return self._tx(operation)
+
+    def pay_task_hold(self, hold_id: str, payer_keyid: str) -> dict[str, Any]:
+        """Atomically move one open fixed reward to its named worker."""
+        hold_id = _identifier(hold_id, "hold_id")
+        payer_keyid = _identifier(payer_keyid, "payer_keyid")
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            scoped = db.execute(
+                "SELECT * FROM task_holds WHERE hold_id=? AND payer_keyid=?",
+                (hold_id, payer_keyid),
+            ).fetchone()
+            if scoped is None:
+                raise SpendNotFound("spend hold not found")
+            now = self._now()
+            self._advance_task_hold_in(db, hold_id, now)
+            hold = db.execute(
+                "SELECT * FROM task_holds WHERE hold_id=?", (hold_id,)
+            ).fetchone()
+            if hold["state"] == "paid":
+                result = dict(hold)
+                result["replayed"] = True
+                return result
+            if hold["state"] != "open":
+                raise SpendStateError(f"task hold is {hold['state']}")
+            updated = db.execute(
+                "UPDATE task_holds SET state='paid', terminal_at=?, updated_at=? "
+                "WHERE hold_id=? AND state='open'",
+                (now, now, hold_id),
+            )
+            if updated.rowcount != 1:
+                raise SpendStateError("task hold is not open")
+            debit, credit = self._move_spend_value(
+                db,
+                source=str(hold["escrow_account"]),
+                destination=str(hold["worker_account"]),
+                amount=int(hold["amount"]),
+                timestamp=now,
+                debit_kind="task_pay_debit",
+                credit_kind="task_earn",
+                event_id=f"task-pay:{hold_id}",
+                detail={"hold_id": hold_id},
+            )
+            db.execute(
+                "INSERT INTO task_earnings(hold_id, earned_at, matures_at, "
+                "debit_journal_seq, credit_journal_seq) VALUES (?, ?, ?, ?, ?)",
+                (hold_id, now, now + HOLD_S, debit, credit),
+            )
+            self._assert_task_hold_in(db, hold_id)
+            result = self._task_status_in(db, hold_id)
+            result["replayed"] = False
+            return result
+
+        return self._tx(operation)
+
+    def refund_task_hold(
+        self, hold_id: str, payer_keyid: str, reason: str
+    ) -> dict[str, Any]:
+        """Atomically return one open fixed reward to its payer."""
+        hold_id = _identifier(hold_id, "hold_id")
+        payer_keyid = _identifier(payer_keyid, "payer_keyid")
+        reason = _identifier(reason, "reason")
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            hold = db.execute(
+                "SELECT * FROM task_holds WHERE hold_id=? AND payer_keyid=?",
+                (hold_id, payer_keyid),
+            ).fetchone()
+            if hold is None:
+                raise SpendNotFound("spend hold not found")
+            if hold["state"] == "refunded":
+                result = dict(hold)
+                result["replayed"] = True
+                return result
+            if hold["state"] != "open":
+                raise SpendStateError(f"task hold is {hold['state']}")
+            now = self._now()
+            updated = db.execute(
+                "UPDATE task_holds SET state='refunded', refund_reason=?, "
+                "terminal_at=?, updated_at=? WHERE hold_id=? AND state='open'",
+                (reason, now, now, hold_id),
+            )
+            if updated.rowcount != 1:
+                raise SpendStateError("task hold is not open")
+            self._move_spend_value(
+                db,
+                source=str(hold["escrow_account"]),
+                destination=str(hold["payer_account"]),
+                amount=int(hold["amount"]),
+                timestamp=now,
+                debit_kind="task_refund_debit",
+                credit_kind="task_refund_credit",
+                event_id=f"task-refund:{hold_id}",
+                detail={"hold_id": hold_id, "reason": reason},
+            )
+            self._assert_task_hold_in(db, hold_id)
+            result = self._task_status_in(db, hold_id)
+            result["replayed"] = False
+            return result
+
+        return self._tx(operation)
+
+    def task_hold_status(self, hold_id: str) -> dict[str, Any]:
+        hold_id = _identifier(hold_id, "hold_id")
+        with self._lock:
+            return self._task_status_in(self._db, hold_id)
+
+    def task_hold_status_scoped(
+        self, hold_id: str, caller_keyid: str
+    ) -> dict[str, Any]:
+        hold_id = _identifier(hold_id, "hold_id")
+        caller_keyid = _identifier(caller_keyid, "caller_keyid")
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            scoped = db.execute(
+                "SELECT 1 FROM task_holds WHERE hold_id=? "
+                "AND (payer_keyid=? OR worker_keyid=?)",
+                (hold_id, caller_keyid, caller_keyid),
+            ).fetchone()
+            if scoped is None:
+                raise SpendNotFound("spend hold not found")
+            self._advance_task_hold_in(db, hold_id, self._now())
+            return self._task_status_in(db, hold_id)
+
+        return self._tx(operation)
+
     def authorize_spend(
         self,
         *,
@@ -3625,17 +4113,34 @@ class LedgerStore:
         def operation(db: sqlite3.Connection) -> SpendExpiryBatch:
             sweep_cutoff = self._now() if cutoff is None else cutoff
             rows = db.execute(
-                "SELECT hold_id FROM spend_holds "
+                "SELECT hold_id, hold_kind FROM ("
+                "SELECT hold_id, 'spend' AS hold_kind, authorized_at, "
+                "CASE state WHEN 'open' THEN execution_deadline "
+                "ELSE settlement_deadline END AS due_at FROM spend_holds "
                 "WHERE (state='open' AND execution_deadline<=?) "
                 "OR (state='closing' AND settlement_deadline<=?) "
-                "ORDER BY CASE state WHEN 'open' THEN execution_deadline "
-                "ELSE settlement_deadline END, authorized_at, hold_id LIMIT ?",
-                (sweep_cutoff, sweep_cutoff, batch_size + 1),
+                "UNION ALL "
+                "SELECT hold_id, 'task', authorized_at, deadline + ? "
+                "FROM task_holds WHERE state='open' AND deadline + ?<=?"
+                ") ORDER BY due_at, authorized_at, hold_id LIMIT ?",
+                (
+                    sweep_cutoff,
+                    sweep_cutoff,
+                    TASK_REFUND_GRACE_S,
+                    TASK_REFUND_GRACE_S,
+                    sweep_cutoff,
+                    batch_size + 1,
+                ),
             ).fetchall()
             affected: list[str] = []
             for hold in rows[:batch_size]:
                 hold_id = str(hold["hold_id"])
-                if self._advance_spend_hold_in(db, hold_id, sweep_cutoff):
+                advanced = (
+                    self._advance_task_hold_in(db, hold_id, sweep_cutoff)
+                    if hold["hold_kind"] == "task"
+                    else self._advance_spend_hold_in(db, hold_id, sweep_cutoff)
+                )
+                if advanced:
                     affected.append(hold_id)
             return SpendExpiryBatch(
                 affected=tuple(affected),
