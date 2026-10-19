@@ -32,3 +32,7 @@ Review: rv-m2.md. Suites: `python3 -m pytest -q python/tests/test_task_holds.py 
 | 7 Authorize replay near deadline | `ledger_server.authorize_task_hold` probes `LedgerStore.has_task_hold_nonce(payer, nonce)`; on a replay the +60 s floor is skipped and the store answers (same hold, or 409 if any field differs). New holds still need the window. | `test_identical_authorize_replay_near_the_deadline_returns_the_same_hold` (mutation fails it). |
 
 Note: a replay of a hold that has since been refunded/paid returns that terminal state; the adapter rejects it as not open (fail closed).
+
+## Fix round 2
+
+Review: rv2-m2.md. No ledger behaviour change was required in round 2 (all blocking/nit work is on the Nakshatra side). Only change: `has_task_hold_nonce` docstring now records the invariant it relies on (task_holds rows are never deleted; a trigger forbids it; if that ever changed the probe would return False and the full deadline window would apply, i.e. fail closed). The round-1 replay-near-deadline fix is what lets the poster's recovery re-run the identical authorize and get the same hold (`test_identical_authorize_replay_near_the_deadline_returns_the_same_hold`). Suite: 165 passed before and after.

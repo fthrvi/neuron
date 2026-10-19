@@ -3001,7 +3001,10 @@ class LedgerStore:
         return max(0, balance - restricted + limit)
 
     def has_task_hold_nonce(self, payer_keyid: str, client_nonce: str) -> bool:
-        """Whether (payer_keyid, client_nonce) already authorized a task hold (replay probe)."""
+        """Whether (payer_keyid, client_nonce) already authorized a task hold (replay probe).
+
+        Relies on task_holds rows never being deleted (a trigger forbids it); a pruned nonce would
+        simply report False and fall back to the full deadline window, i.e. fail closed."""
         with self._lock:
             row = self._db.execute(
                 "SELECT 1 FROM task_holds WHERE payer_keyid=? AND client_nonce=?",
