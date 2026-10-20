@@ -896,6 +896,9 @@ class V2LedgerService:
             "state": status["state"],
             "submitted_at": int(status["submitted_at"]),
             "result_hash": status["result_hash"],
+            "refund_after_submit": (
+                status["state"] == "refunded" and int(status["submitted_at"]) > 0
+            ),
             "server_time": self.store._now(),
         }
 

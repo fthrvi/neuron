@@ -149,11 +149,11 @@ class SpendNotFound(SpendStateError):
 
 
 class TaskHoldNotOpen(SpendStateError):
-    """A task submission named an existing hold in a terminal state."""
+    """A task submission cannot update the existing hold in its current state."""
 
-    def __init__(self, state: str):
+    def __init__(self, state: str, reason: str | None = None):
         self.state = state
-        super().__init__(f"task hold is {state}")
+        super().__init__(reason or f"task hold is {state}")
 
 
 class SpendExpired(SpendStateError):
@@ -1726,9 +1726,18 @@ class LedgerStore:
             credit = db.execute(
                 "SELECT * FROM journal WHERE seq=?", (row["credit_journal_seq"],)
             ).fetchone()
-            detail = json.dumps(
-                {"hold_id": row["hold_id"]}, sort_keys=True, separators=(",", ":")
-            )
+            valid_details = {
+                json.dumps(
+                    {"hold_id": row["hold_id"]},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {"hold_id": row["hold_id"], "paid_by_silence": True},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
             if (
                 row["terminal_at"] == row["earned_at"]
                 and int(row["matures_at"]) == int(row["earned_at"]) + HOLD_S
@@ -1741,14 +1750,14 @@ class LedgerStore:
                 and debit["counterparty"] == row["worker_account"]
                 and int(debit["amount"]) == -int(row["amount"])
                 and int(debit["ts"]) == int(row["earned_at"])
-                and debit["detail"] == detail
+                and debit["detail"] in valid_details
                 and credit["kind"] == "task_earn"
                 and credit["receipt_id"] == event_id
                 and credit["account"] == row["worker_account"]
                 and credit["counterparty"] == row["escrow_account"]
                 and int(credit["amount"]) == int(row["amount"])
                 and int(credit["ts"]) == int(row["earned_at"])
-                and credit["detail"] == detail
+                and credit["detail"] == debit["detail"]
                 and int(
                     db.execute(
                         "SELECT COUNT(*) FROM journal WHERE receipt_id=?", (event_id,)
@@ -3314,14 +3323,15 @@ class LedgerStore:
             if hold is None:
                 raise SpendNotFound("spend hold not found")
             now = self._now()
-            self._advance_task_hold_in(db, hold_id, now)
-            hold = db.execute(
-                "SELECT * FROM task_holds WHERE hold_id=?", (hold_id,)
-            ).fetchone()
             if hold["state"] != "open":
                 result = dict(hold)
                 result["not_open_state"] = str(hold["state"])
                 return result
+            # The task deadline is inclusive: a mark at the deadline is valid,
+            # while the first instant after it is too late.  Submission is not
+            # itself a sweep trigger, so a rejected late request writes nothing.
+            if now > int(hold["deadline"]):
+                raise TaskHoldNotOpen("open", "deadline passed")
             if int(hold["submitted_at"]) > 0:
                 if hold["result_hash"] != result_hash:
                     raise SpendConflict(

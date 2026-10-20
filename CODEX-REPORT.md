@@ -59,3 +59,18 @@ Mutation check (all killed):
 1. Replacing the submit scope from `worker_keyid` to `payer_keyid` failed `test_worker_submit_is_idempotent_hash_bound_and_terminal_aware`.
 2. Disabling the submitted branch in the expiry sweep failed `test_expiry_sweep_pays_submitted_and_refunds_unsubmitted` (`refunded` instead of `paid`).
 3. Disabling post-submit refund detection failed `test_refund_after_submit_is_distinct_in_the_journal` (ordinary refund kinds instead of `refund_after_submit`).
+
+## Fix round 1 (M2.1)
+
+Review: `rv-verdict.md` (B1, B2, N7).
+
+- B1: the matured-task earnings proof now accepts exactly the two canonical journal details emitted by ordinary pay and silence pay: `{"hold_id":...}` and `{"hold_id":...,"paid_by_silence":true}`. Both journal legs must still agree and every other provenance check remains unchanged. The sweep test proves the silence-paid amount becomes withdrawable after maturity and that adding an extra detail field makes it unproven again.
+- B2: task submission no longer advances the hold as a side effect. A mark at the task deadline is accepted (the deadline is inclusive); the first instant after it returns HTTP 409 with `state: "open"` and `error: "deadline passed"`, leaving the hold, journal, and balances unchanged. The ordinary bounded sweep remains responsible for the later `deadline + 24h` transition.
+- N7: `GET /spend/task/status` now exposes `refund_after_submit` as a boolean derived from the immutable submission mark and refunded terminal state, including to the scoped worker.
+
+Verification:
+
+- Focused task-hold suite: **14 passed**.
+- Broad required suite from `python/`, excluding only `test_chain_payout_validator.py`, `test_chain_reconcile_validator.py`, and `test_payout.py` because the optional `solders` package is unavailable: **261 passed**.
+- Explicit reverse-compatibility rollback test (`test_forgejo_main_code_still_opens_a_store_with_paid_and_open_task_holds`): **1 passed**.
+- All test runs used a temporary `HOME`; no live ledger, deployment, or push was performed.

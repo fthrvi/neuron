@@ -192,9 +192,15 @@ def test_worker_submit_is_idempotent_hash_bound_and_terminal_aware(tmp_path):
             store, clock, nonce="expired", task_hash="f" * 64,
         )
         clock[0] = expired["deadline"] + TASK_REFUND_GRACE_S
-        with pytest.raises(TaskHoldNotOpen) as exc:
+        with pytest.raises(TaskHoldNotOpen, match="deadline passed") as exc:
             store.submit_task_hold(expired["hold_id"], "worker-key", "f" * 64)
-        assert exc.value.state == "refunded"
+        assert exc.value.state == "open"
+        expired_status = store.task_hold_status(expired["hold_id"])
+        assert expired_status["state"] == "open"
+        assert (expired_status["submitted_at"], expired_status["result_hash"]) == (0, "")
+        assert store.expire_spend_holds_batch(cutoff=clock[0]).affected == (
+            expired["hold_id"],
+        )
         assert store.task_hold_status(expired["hold_id"])["state"] == "refunded"
         assert _total(store) == 0
 
@@ -307,6 +313,35 @@ def test_expiry_sweep_pays_submitted_and_refunds_unsubmitted(tmp_path):
         assert store.balance("worker") == 100
         assert store.balance("payer") == 100
         assert _total(store) == 0
+
+        clock[0] = cutoff + HOLD_S + 1
+        assert store.withdrawable("worker") == 100
+        silence_detail = json.dumps(
+            {"hold_id": submitted["hold_id"], "paid_by_silence": True},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        rows = store._db.execute(
+            "SELECT detail FROM journal WHERE receipt_id=? ORDER BY seq",
+            (f"task-pay:{submitted['hold_id']}",),
+        ).fetchall()
+        assert [row["detail"] for row in rows] == [silence_detail, silence_detail]
+
+        tampered_detail = json.dumps(
+            {
+                "hold_id": submitted["hold_id"],
+                "paid_by_silence": True,
+                "tampered": True,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        store._db.execute("DROP TRIGGER journal_no_update")
+        store._db.execute(
+            "UPDATE journal SET detail=? WHERE receipt_id=?",
+            (tampered_detail, f"task-pay:{submitted['hold_id']}"),
+        )
+        assert store.withdrawable("worker") == 0
 
 
 def test_refund_after_submit_is_distinct_in_the_journal(tmp_path):
@@ -480,9 +515,10 @@ def test_signed_http_routes_gating_strict_shapes_scopes_and_codes(
             assert set(status) == {
                 "v", "hold_id", "task_hash", "payer_account", "worker_keyid",
                 "amount", "deadline", "state", "submitted_at", "result_hash",
-                "server_time",
+                "refund_after_submit", "server_time",
             }
             assert (status["submitted_at"], status["result_hash"]) == (0, "")
+            assert status["refund_after_submit"] is False
             submit_body = {"hold_id": hold_id, "result_hash": "b" * 64}
             for caller in (identities["payer"], identities["outsider"]):
                 assert _request(
@@ -568,6 +604,77 @@ def test_signed_http_routes_gating_strict_shapes_scopes_and_codes(
                 base, "POST", "/spend/task/authorize", identities["payer"],
                 insufficient,
             )[0] == 402
+    finally:
+        service.close()
+
+
+def test_submit_deadline_is_inclusive_late_submit_writes_nothing_and_status_flags_refund(
+    tmp_path, identities, monkeypatch
+):
+    clock = [6_500_000]
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite", identities["roster"],
+        clock=lambda: clock[0], start_sweeper=False,
+    )
+    try:
+        service.store.deposit("funding", "payer", 200, 1)
+        monkeypatch.setenv("NAK_SPEND_ROUTES", "on")
+        deadline = clock[0] + 60
+        with _running(service) as base:
+            exact = _request(
+                base, "POST", "/spend/task/authorize", identities["payer"],
+                _task_body(identities, clock[0], deadline=deadline),
+            )[1]
+            late = _request(
+                base, "POST", "/spend/task/authorize", identities["payer"],
+                _task_body(
+                    identities, clock[0], client_nonce="late", task_hash="f" * 64,
+                    deadline=deadline,
+                ),
+            )[1]
+
+            clock[0] = deadline
+            exact_submit = {"hold_id": exact["hold_id"], "result_hash": "1" * 64}
+            assert _request(
+                base, "POST", "/spend/task/submit", identities["worker"], exact_submit
+            )[0] == 200
+
+            clock[0] = deadline + 1
+            before = service.store.task_hold_status(late["hold_id"])
+            journal_count = service.store._db.execute(
+                "SELECT COUNT(*) FROM journal"
+            ).fetchone()[0]
+            balances = service.store._db.execute(
+                "SELECT id, balance FROM accounts ORDER BY id"
+            ).fetchall()
+            late_submit = {"hold_id": late["hold_id"], "result_hash": "2" * 64}
+            assert _request(
+                base, "POST", "/spend/task/submit", identities["worker"], late_submit
+            ) == (409, {"error": "deadline passed", "state": "open"})
+            after = service.store.task_hold_status(late["hold_id"])
+            assert (before["submitted_at"], before["result_hash"]) == (0, "")
+            assert after == before
+            assert service.store._db.execute(
+                "SELECT COUNT(*) FROM journal"
+            ).fetchone()[0] == journal_count
+            assert service.store._db.execute(
+                "SELECT id, balance FROM accounts ORDER BY id"
+            ).fetchall() == balances
+
+            assert _request(
+                base, "POST", "/spend/task/refund", identities["payer"],
+                {"hold_id": exact["hold_id"], "reason": "rejected"},
+            )[0] == 200
+            exact_path = f"/spend/task/status?hold_id={exact['hold_id']}"
+            late_path = f"/spend/task/status?hold_id={late['hold_id']}"
+            exact_status = _request(
+                base, "GET", exact_path, identities["worker"]
+            )[1]
+            late_status = _request(
+                base, "GET", late_path, identities["worker"]
+            )[1]
+            assert exact_status["refund_after_submit"] is True
+            assert late_status["refund_after_submit"] is False
     finally:
         service.close()
 
