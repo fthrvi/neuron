@@ -32,6 +32,7 @@ from core.ledger_store import (  # noqa: E402
     SpendConflict,
     SpendNotFound,
     SpendStateError,
+    TaskHoldNotOpen,
 )
 from ledger_auth import canonical_string  # noqa: E402
 from ledger_server import V2LedgerService, _make_v2_handler  # noqa: E402
@@ -146,6 +147,58 @@ def test_party_scope_hides_holds_and_worker_is_read_only(tmp_path):
             store.task_hold_status_scoped("missing", "worker-key")
 
 
+def test_worker_submit_is_idempotent_hash_bound_and_terminal_aware(tmp_path):
+    clock = [2_500_000]
+    result_hash = "b" * 64
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("funding", "payer", 300, 1)
+        hold = _authorize(store, clock)
+        assert _total(store) == 0
+        for caller in ("payer-key", "outsider-key"):
+            with pytest.raises(SpendNotFound, match="not found"):
+                store.submit_task_hold(hold["hold_id"], caller, result_hash)
+        with pytest.raises(LedgerValueError, match="result_hash"):
+            store.submit_task_hold(hold["hold_id"], "worker-key", "B" * 64)
+
+        submitted = store.submit_task_hold(
+            hold["hold_id"], "worker-key", result_hash
+        )
+        assert submitted["submitted_at"] == clock[0]
+        assert submitted["result_hash"] == result_hash
+        assert submitted["replayed"] is False
+        assert _total(store) == 0
+        assert store.submit_task_hold(
+            hold["hold_id"], "worker-key", result_hash
+        )["replayed"] is True
+        with pytest.raises(SpendConflict, match="different result_hash"):
+            store.submit_task_hold(hold["hold_id"], "worker-key", "c" * 64)
+
+        store.pay_task_hold(hold["hold_id"], "payer-key")
+        assert _total(store) == 0
+        with pytest.raises(TaskHoldNotOpen) as exc:
+            store.submit_task_hold(hold["hold_id"], "worker-key", result_hash)
+        assert exc.value.state == "paid"
+
+        refunded = _authorize(
+            store, clock, nonce="refunded", task_hash="d" * 64,
+        )
+        store.refund_task_hold(refunded["hold_id"], "payer-key", "rejected")
+        assert _total(store) == 0
+        with pytest.raises(TaskHoldNotOpen) as exc:
+            store.submit_task_hold(refunded["hold_id"], "worker-key", "e" * 64)
+        assert exc.value.state == "refunded"
+
+        expired = _authorize(
+            store, clock, nonce="expired", task_hash="f" * 64,
+        )
+        clock[0] = expired["deadline"] + TASK_REFUND_GRACE_S
+        with pytest.raises(TaskHoldNotOpen) as exc:
+            store.submit_task_hold(expired["hold_id"], "worker-key", "f" * 64)
+        assert exc.value.state == "refunded"
+        assert store.task_hold_status(expired["hold_id"])["state"] == "refunded"
+        assert _total(store) == 0
+
+
 def test_authorize_validation_capacity_nonce_and_open_task_uniqueness(tmp_path):
     clock = [3_000_000]
     with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
@@ -176,21 +229,32 @@ def test_authorize_validation_capacity_nonce_and_open_task_uniqueness(tmp_path):
             _authorize(store, clock, nonce="other")
 
 
-def test_concurrent_pay_vs_expiry_has_one_terminal_outcome(tmp_path):
+def test_concurrent_pay_refund_and_sweep_never_double_settle(tmp_path):
     for iteration in range(12):
         clock = [4_000_000 + iteration * 100_000]
         path = tmp_path / f"race-{iteration}.db"
         with LedgerStore(path, clock=lambda: clock[0]) as store:
             store.deposit(f"funding-{iteration}", "payer", 100, 1)
             hold = _authorize(store, clock, nonce=str(iteration))
+            store.submit_task_hold(hold["hold_id"], "worker-key", "f" * 64)
+            assert _total(store) == 0
             cutoff = hold["deadline"] + TASK_REFUND_GRACE_S
-            clock[0] = cutoff - 1
-            barrier = threading.Barrier(2)
+            clock[0] = cutoff
+            barrier = threading.Barrier(3)
 
             def pay():
                 barrier.wait()
                 try:
                     return store.pay_task_hold(hold["hold_id"], "payer-key")["state"]
+                except SpendStateError:
+                    return "lost"
+
+            def refund():
+                barrier.wait()
+                try:
+                    return store.refund_task_hold(
+                        hold["hold_id"], "payer-key", "rejected"
+                    )["state"]
                 except SpendStateError:
                     return "lost"
 
@@ -200,37 +264,73 @@ def test_concurrent_pay_vs_expiry_has_one_terminal_outcome(tmp_path):
                     cutoff=cutoff
                 ).affected
 
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=3) as pool:
                 pay_result = pool.submit(pay)
+                refund_result = pool.submit(refund)
                 sweep_result = pool.submit(sweep)
-                paid = pay_result.result(timeout=5) == "paid"
-                swept = sweep_result.result(timeout=5)
+                pay_result.result(timeout=5)
+                refund_result.result(timeout=5)
+                sweep_result.result(timeout=5)
             status = store.task_hold_status(hold["hold_id"])
-            assert (paid, swept) in {(True, False), (False, True)}
-            assert status["state"] == ("paid" if paid else "refunded")
+            paid = status["state"] == "paid"
+            assert status["state"] in {"paid", "refunded"}
             assert store.balance("worker") == (100 if paid else 0)
             assert store.balance("payer") == (0 if paid else 100)
+            assert store._db.execute(
+                "SELECT COUNT(*) FROM journal WHERE receipt_id IN (?, ?)",
+                (f"task-pay:{hold['hold_id']}", f"task-refund:{hold['hold_id']}"),
+            ).fetchone()[0] == 2
+            assert store._db.execute(
+                "SELECT COUNT(*) FROM task_earnings WHERE hold_id=?",
+                (hold["hold_id"],),
+            ).fetchone()[0] == int(paid)
             assert _total(store) == 0
 
 
-def test_expiry_sweep_refunds_only_after_deadline_grace(tmp_path):
+def test_expiry_sweep_pays_submitted_and_refunds_unsubmitted(tmp_path):
     clock = [5_000_000]
     with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
-        store.deposit("funding", "payer", 100, 1)
-        hold = _authorize(store, clock)
-        cutoff = hold["deadline"] + TASK_REFUND_GRACE_S
-        assert store.expire_spend_holds_batch(cutoff=cutoff - 1).affected == ()
-        assert store.expire_spend_holds_batch(cutoff=cutoff).affected == (
-            hold["hold_id"],
+        store.deposit("funding", "payer", 200, 1)
+        submitted = _authorize(store, clock, nonce="submitted")
+        unsubmitted = _authorize(
+            store, clock, nonce="unsubmitted", task_hash="b" * 64,
         )
-        assert store.task_hold_status(hold["hold_id"])["state"] == "refunded"
+        store.submit_task_hold(submitted["hold_id"], "worker-key", "a" * 64)
+        assert _total(store) == 0
+        cutoff = submitted["deadline"] + TASK_REFUND_GRACE_S
+        assert store.expire_spend_holds_batch(cutoff=cutoff - 1).affected == ()
+        assert set(store.expire_spend_holds_batch(cutoff=cutoff).affected) == {
+            submitted["hold_id"], unsubmitted["hold_id"],
+        }
+        assert store.task_hold_status(submitted["hold_id"])["state"] == "paid"
+        assert store.task_hold_status(unsubmitted["hold_id"])["state"] == "refunded"
+        assert store.balance("worker") == 100
         assert store.balance("payer") == 100
         assert _total(store) == 0
 
 
+def test_refund_after_submit_is_distinct_in_the_journal(tmp_path):
+    clock = [5_500_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("funding", "payer", 100, 1)
+        hold = _authorize(store, clock)
+        store.submit_task_hold(hold["hold_id"], "worker-key", "a" * 64)
+        assert _total(store) == 0
+        store.refund_task_hold(hold["hold_id"], "payer-key", "rejected")
+        assert _total(store) == 0
+        rows = store._db.execute(
+            "SELECT kind, detail FROM journal WHERE receipt_id=? ORDER BY seq",
+            (f"task-refund:{hold['hold_id']}",),
+        ).fetchall()
+        assert [row["kind"] for row in rows] == [
+            "task_refund_after_submit_debit", "refund_after_submit",
+        ]
+        assert all(json.loads(row["detail"])["refund_after_submit"] for row in rows)
+
+
 def test_migrates_real_forgejo_main_database_idempotently(tmp_path):
     base_source = subprocess.check_output(
-        ["git", "show", "forgejo/main:python/core/ledger_store.py"], text=True
+        ["git", "show", "4ee5314:python/core/ledger_store.py"], text=True
     )
     base_module = tmp_path / "base_ledger_store.py"
     base_module.write_text(base_source, encoding="utf-8")
@@ -251,15 +351,21 @@ with module.LedgerStore(sys.argv[2], clock=lambda: 1000000) as store:
             'worker_keyid': 'worker-key', 'worker_account': 'worker',
             'layer_start': 0, 'layer_end': 4, 'price_multiplier': 2,
         }], hold_id='base-hold')
+    store.authorize_task_hold(
+        payer_keyid='payer-key', payer_account='payer', tier='stranger',
+        client_nonce='base-task-nonce', task_hash='9' * 64,
+        worker_keyid='worker-key', worker_account='worker', amount=50,
+        deadline=1000060, hold_id='base-task-hold')
 """
     subprocess.run(
         [sys.executable, "-c", driver, str(base_module), str(database)], check=True
     )
 
     expected_balances = {
-        "payer": 920,
+        "payer": 870,
         "treasury": -1_000,
         "__spend_hold__:base-hold": 80,
+        "__task_hold__:base-task-hold": 50,
     }
     for _ in range(2):
         with LedgerStore(database, clock=lambda: 1_000_000) as store:
@@ -272,7 +378,9 @@ with module.LedgerStore(sys.argv[2], clock=lambda: 1000000) as store:
             } == expected_balances
             assert store._db.execute(
                 "SELECT COUNT(*) FROM task_holds"
-            ).fetchone()[0] == 0
+            ).fetchone()[0] == 1
+            task = store.task_hold_status("base-task-hold")
+            assert (task["submitted_at"], task["result_hash"]) == (0, "")
             assert _total(store) == 0
 
 
@@ -344,6 +452,7 @@ def test_signed_http_routes_gating_strict_shapes_scopes_and_codes(
             monkeypatch.delenv("NAK_SPEND_ROUTES", raising=False)
             for method, path, obj in (
                 ("POST", "/spend/task/authorize", body),
+                ("POST", "/spend/task/submit", {"hold_id": "x", "result_hash": "a" * 64}),
                 ("POST", "/spend/task/pay", {"hold_id": "x"}),
                 ("POST", "/spend/task/refund", {"hold_id": "x", "reason": "x"}),
                 ("GET", "/spend/task/status?hold_id=x", None),
@@ -370,8 +479,15 @@ def test_signed_http_routes_gating_strict_shapes_scopes_and_codes(
             assert code == 200
             assert set(status) == {
                 "v", "hold_id", "task_hash", "payer_account", "worker_keyid",
-                "amount", "deadline", "state", "server_time",
+                "amount", "deadline", "state", "submitted_at", "result_hash",
+                "server_time",
             }
+            assert (status["submitted_at"], status["result_hash"]) == (0, "")
+            submit_body = {"hold_id": hold_id, "result_hash": "b" * 64}
+            for caller in (identities["payer"], identities["outsider"]):
+                assert _request(
+                    base, "POST", "/spend/task/submit", caller, submit_body
+                ) == (404, {"error": "spend hold not found"})
             for caller in (identities["worker"], identities["outsider"]):
                 assert _request(
                     base, "POST", "/spend/task/pay", caller, {"hold_id": hold_id}
@@ -382,6 +498,30 @@ def test_signed_http_routes_gating_strict_shapes_scopes_and_codes(
                 ) == (404, {"error": "spend hold not found"})
             assert _request(base, "GET", path, identities["outsider"]) == (
                 404, {"error": "spend hold not found"}
+            )
+            assert _request(
+                base, "POST", "/spend/task/submit", identities["worker"],
+                {**submit_body, "unknown": True},
+            )[0] == 422
+            code, submitted = _request(
+                base, "POST", "/spend/task/submit", identities["worker"], submit_body
+            )
+            assert (code, submitted["state"], submitted["replayed"]) == (
+                200, "open", False,
+            )
+            assert submitted["submitted_at"] == clock[0]
+            assert submitted["result_hash"] == "b" * 64
+            assert _request(
+                base, "POST", "/spend/task/submit", identities["worker"], submit_body
+            )[1]["replayed"] is True
+            assert _request(
+                base, "POST", "/spend/task/submit", identities["worker"],
+                {**submit_body, "result_hash": "c" * 64},
+            )[0] == 409
+            code, status = _request(base, "GET", path, identities["worker"])
+            assert code == 200
+            assert (status["submitted_at"], status["result_hash"]) == (
+                clock[0], "b" * 64,
             )
             code, paid = _request(
                 base, "POST", "/spend/task/pay", identities["payer"],
@@ -396,6 +536,29 @@ def test_signed_http_routes_gating_strict_shapes_scopes_and_codes(
                 base, "POST", "/spend/task/refund", identities["payer"],
                 {"hold_id": hold_id, "reason": "late"},
             )[0] == 409
+            assert _request(
+                base, "POST", "/spend/task/submit", identities["worker"], submit_body
+            ) == (409, {"error": "task hold is paid", "state": "paid"})
+
+            refund_body = _task_body(
+                identities, clock[0], client_nonce="refund-terminal",
+                task_hash="d" * 64,
+            )
+            code, authorization = _request(
+                base, "POST", "/spend/task/authorize", identities["payer"],
+                refund_body,
+            )
+            assert code == 200
+            refunded_id = authorization["hold_id"]
+            assert _request(
+                base, "POST", "/spend/task/refund", identities["payer"],
+                {"hold_id": refunded_id, "reason": "rejected"},
+            )[0] == 200
+            assert _request(
+                base, "POST", "/spend/task/submit", identities["worker"],
+                {"hold_id": refunded_id, "result_hash": "e" * 64},
+            ) == (409, {"error": "task hold is refunded", "state": "refunded"})
+            assert _total(service.store) == 0
 
             insufficient = _task_body(
                 identities, clock[0], client_nonce="large", task_hash="b" * 64,
@@ -473,7 +636,10 @@ def test_forgejo_main_code_still_opens_a_store_with_paid_and_open_task_holds(tmp
         store.deposit("funding", "payer", 1_000, 1)
         paid = _authorize(store, clock, nonce="p", task_hash="6" * 64)
         store.pay_task_hold(paid["hold_id"], "payer-key")
-        _authorize(store, clock, nonce="o", task_hash="7" * 64, amount=50)   # left open
+        opened = _authorize(
+            store, clock, nonce="o", task_hash="7" * 64, amount=50
+        )
+        store.submit_task_hold(opened["hold_id"], "worker-key", "8" * 64)
         new_total = _total(store)
         new_balances = {
             row["id"]: int(row["balance"])
@@ -482,7 +648,7 @@ def test_forgejo_main_code_still_opens_a_store_with_paid_and_open_task_holds(tmp
     assert "payer" in new_balances and any(k.startswith("__task_hold__:") for k in new_balances)
     base_module = tmp_path / "base_ledger_store.py"
     base_module.write_text(
-        subprocess.check_output(["git", "show", "forgejo/main:python/core/ledger_store.py"],
+        subprocess.check_output(["git", "show", "4ee5314:python/core/ledger_store.py"],
                                 text=True, cwd=os.path.dirname(__file__)),
         encoding="utf-8",
     )

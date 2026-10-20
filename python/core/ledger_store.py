@@ -148,6 +148,14 @@ class SpendNotFound(SpendStateError):
     """A spend hold is absent or outside the authenticated caller's scope."""
 
 
+class TaskHoldNotOpen(SpendStateError):
+    """A task submission named an existing hold in a terminal state."""
+
+    def __init__(self, state: str):
+        self.state = state
+        super().__init__(f"task hold is {state}")
+
+
 class SpendExpired(SpendStateError):
     """A spend lifecycle request arrived after its applicable deadline."""
 
@@ -575,6 +583,9 @@ class LedgerStore:
                 request_digest TEXT NOT NULL,
                 escrow_account TEXT NOT NULL UNIQUE,
                 state TEXT NOT NULL CHECK(state IN ('open','paid','refunded')),
+                submitted_at INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(submitted_at) = 'integer' AND submitted_at >= 0),
+                result_hash TEXT NOT NULL DEFAULT '',
                 refund_reason TEXT,
                 authorized_at INTEGER NOT NULL CHECK(typeof(authorized_at) = 'integer'),
                 terminal_at INTEGER,
@@ -785,6 +796,17 @@ class LedgerStore:
                 self._db.execute(
                     f"ALTER TABLE spend_hold_workers ADD COLUMN {name} {definition}"
                 )
+        task_hold_columns = {
+            str(row[1]) for row in self._db.execute("PRAGMA table_info(task_holds)")
+        }
+        for name, definition in (
+            ("submitted_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("result_hash", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in task_hold_columns:
+                self._db.execute(
+                    f"ALTER TABLE task_holds ADD COLUMN {name} {definition}"
+                )
         missing_request_digests = self._db.execute(
             "SELECT payer_keyid, client_nonce, session_id, model_id, billing_mode, "
             "max_prompt_tokens, max_output_tokens, hold_id FROM spend_holds "
@@ -839,6 +861,33 @@ class LedgerStore:
             WHEN NEW.request_digest IS NULL
             BEGIN
                 SELECT RAISE(ABORT, 'spend hold request digest is required');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_holds_submission_valid_insert
+            BEFORE INSERT ON task_holds
+            WHEN NOT (
+                (NEW.submitted_at = 0 AND NEW.result_hash = '')
+                OR (NEW.submitted_at > 0
+                    AND length(NEW.result_hash) = 64
+                    AND NEW.result_hash NOT GLOB '*[^0-9a-f]*')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid task submission mark');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_holds_submission_transition
+            BEFORE UPDATE OF submitted_at, result_hash ON task_holds
+            WHEN NOT (
+                (NEW.submitted_at = OLD.submitted_at
+                    AND NEW.result_hash = OLD.result_hash)
+                OR (OLD.state = 'open' AND NEW.state = 'open'
+                    AND OLD.submitted_at = 0 AND OLD.result_hash = ''
+                    AND NEW.submitted_at > 0
+                    AND length(NEW.result_hash) = 64
+                    AND NEW.result_hash NOT GLOB '*[^0-9a-f]*')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'task submission mark is immutable');
             END;
             """
         )
@@ -1245,11 +1294,93 @@ class LedgerStore:
             )
 
     @classmethod
+    def _pay_task_hold_in(
+        cls,
+        db: sqlite3.Connection,
+        hold: Mapping[str, Any],
+        now: int,
+        *,
+        paid_by_silence: bool = False,
+    ) -> bool:
+        hold_id = str(hold["hold_id"])
+        updated = db.execute(
+            "UPDATE task_holds SET state='paid', terminal_at=?, updated_at=? "
+            "WHERE hold_id=? AND state='open'",
+            (now, now, hold_id),
+        )
+        if updated.rowcount != 1:
+            return False
+        detail: dict[str, Any] = {"hold_id": hold_id}
+        if paid_by_silence:
+            detail["paid_by_silence"] = True
+        debit, credit = cls._move_spend_value(
+            db,
+            source=str(hold["escrow_account"]),
+            destination=str(hold["worker_account"]),
+            amount=int(hold["amount"]),
+            timestamp=now,
+            debit_kind="task_pay_debit",
+            credit_kind="task_earn",
+            event_id=f"task-pay:{hold_id}",
+            detail=detail,
+        )
+        db.execute(
+            "INSERT INTO task_earnings(hold_id, earned_at, matures_at, "
+            "debit_journal_seq, credit_journal_seq) VALUES (?, ?, ?, ?, ?)",
+            (hold_id, now, now + HOLD_S, debit, credit),
+        )
+        cls._assert_task_hold_in(db, hold_id)
+        return True
+
+    @classmethod
+    def _refund_task_hold_in(
+        cls,
+        db: sqlite3.Connection,
+        hold: Mapping[str, Any],
+        now: int,
+        reason: str,
+    ) -> bool:
+        hold_id = str(hold["hold_id"])
+        updated = db.execute(
+            "UPDATE task_holds SET state='refunded', refund_reason=?, "
+            "terminal_at=?, updated_at=? WHERE hold_id=? AND state='open'",
+            (reason, now, now, hold_id),
+        )
+        if updated.rowcount != 1:
+            return False
+        refund_after_submit = int(hold["submitted_at"]) > 0
+        cls._move_spend_value(
+            db,
+            source=str(hold["escrow_account"]),
+            destination=str(hold["payer_account"]),
+            amount=int(hold["amount"]),
+            timestamp=now,
+            debit_kind=(
+                "task_refund_after_submit_debit"
+                if refund_after_submit
+                else "task_refund_debit"
+            ),
+            credit_kind=(
+                "refund_after_submit"
+                if refund_after_submit
+                else "task_refund_credit"
+            ),
+            event_id=f"task-refund:{hold_id}",
+            detail={
+                "hold_id": hold_id,
+                "reason": reason,
+                "refund_after_submit": refund_after_submit,
+            },
+        )
+        cls._assert_task_hold_in(db, hold_id)
+        return True
+
+    @classmethod
     def _advance_task_hold_in(
         cls, db: sqlite3.Connection, hold_id: str, now: int
     ) -> bool:
         hold = db.execute(
-            "SELECT payer_account, amount, deadline, escrow_account, state "
+            "SELECT * "
             "FROM task_holds WHERE hold_id=?",
             (hold_id,),
         ).fetchone()
@@ -1257,26 +1388,13 @@ class LedgerStore:
             raise SpendNotFound("spend hold not found")
         if hold["state"] != "open" or now < int(hold["deadline"]) + TASK_REFUND_GRACE_S:
             return False
-        updated = db.execute(
-            "UPDATE task_holds SET state='refunded', refund_reason='expired', "
-            "terminal_at=?, updated_at=? WHERE hold_id=? AND state='open'",
-            (now, now, hold_id),
+        return (
+            cls._pay_task_hold_in(
+                db, hold, now, paid_by_silence=True
+            )
+            if int(hold["submitted_at"]) > 0
+            else cls._refund_task_hold_in(db, hold, now, "expired")
         )
-        if updated.rowcount != 1:
-            return False
-        cls._move_spend_value(
-            db,
-            source=str(hold["escrow_account"]),
-            destination=str(hold["payer_account"]),
-            amount=int(hold["amount"]),
-            timestamp=now,
-            debit_kind="task_refund_debit",
-            credit_kind="task_refund_credit",
-            event_id=f"task-refund:{hold_id}",
-            detail={"hold_id": hold_id, "reason": "expired"},
-        )
-        cls._assert_task_hold_in(db, hold_id)
-        return True
 
     @staticmethod
     def _restricted_unproven_balance_in(
@@ -3162,45 +3280,75 @@ class LedgerStore:
             if scoped is None:
                 raise SpendNotFound("spend hold not found")
             now = self._now()
-            self._advance_task_hold_in(db, hold_id, now)
+            advanced = self._advance_task_hold_in(db, hold_id, now)
             hold = db.execute(
                 "SELECT * FROM task_holds WHERE hold_id=?", (hold_id,)
             ).fetchone()
             if hold["state"] == "paid":
                 result = dict(hold)
-                result["replayed"] = True
+                result["replayed"] = not advanced
                 return result
             if hold["state"] != "open":
                 raise SpendStateError(f"task hold is {hold['state']}")
-            updated = db.execute(
-                "UPDATE task_holds SET state='paid', terminal_at=?, updated_at=? "
-                "WHERE hold_id=? AND state='open'",
-                (now, now, hold_id),
-            )
-            if updated.rowcount != 1:
+            if not self._pay_task_hold_in(db, hold, now):
                 raise SpendStateError("task hold is not open")
-            debit, credit = self._move_spend_value(
-                db,
-                source=str(hold["escrow_account"]),
-                destination=str(hold["worker_account"]),
-                amount=int(hold["amount"]),
-                timestamp=now,
-                debit_kind="task_pay_debit",
-                credit_kind="task_earn",
-                event_id=f"task-pay:{hold_id}",
-                detail={"hold_id": hold_id},
-            )
-            db.execute(
-                "INSERT INTO task_earnings(hold_id, earned_at, matures_at, "
-                "debit_journal_seq, credit_journal_seq) VALUES (?, ?, ?, ?, ?)",
-                (hold_id, now, now + HOLD_S, debit, credit),
-            )
-            self._assert_task_hold_in(db, hold_id)
             result = self._task_status_in(db, hold_id)
             result["replayed"] = False
             return result
 
         return self._tx(operation)
+
+    def submit_task_hold(
+        self, hold_id: str, worker_keyid: str, result_hash: str
+    ) -> dict[str, Any]:
+        """Durably mark an open task hold as submitted by its named worker."""
+        hold_id = _identifier(hold_id, "hold_id")
+        worker_keyid = _identifier(worker_keyid, "worker_keyid")
+        result_hash = self._strict_sha256(result_hash, "result_hash")
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            hold = db.execute(
+                "SELECT * FROM task_holds WHERE hold_id=? AND worker_keyid=?",
+                (hold_id, worker_keyid),
+            ).fetchone()
+            if hold is None:
+                raise SpendNotFound("spend hold not found")
+            now = self._now()
+            self._advance_task_hold_in(db, hold_id, now)
+            hold = db.execute(
+                "SELECT * FROM task_holds WHERE hold_id=?", (hold_id,)
+            ).fetchone()
+            if hold["state"] != "open":
+                result = dict(hold)
+                result["not_open_state"] = str(hold["state"])
+                return result
+            if int(hold["submitted_at"]) > 0:
+                if hold["result_hash"] != result_hash:
+                    raise SpendConflict(
+                        "task hold was already submitted with a different result_hash"
+                    )
+                result = dict(hold)
+                result["replayed"] = True
+                return result
+            updated = db.execute(
+                "UPDATE task_holds SET submitted_at=?, result_hash=?, updated_at=? "
+                "WHERE hold_id=? AND state='open' AND submitted_at=0",
+                (now, result_hash, now, hold_id),
+            )
+            if updated.rowcount != 1:
+                current = self._task_status_in(db, hold_id)
+                if current["state"] != "open":
+                    raise TaskHoldNotOpen(str(current["state"]))
+                raise SpendConflict("task hold submission raced with another result")
+            self._assert_task_hold_in(db, hold_id)
+            result = self._task_status_in(db, hold_id)
+            result["replayed"] = False
+            return result
+
+        result = self._tx(operation)
+        if "not_open_state" in result:
+            raise TaskHoldNotOpen(str(result["not_open_state"]))
+        return result
 
     def refund_task_hold(
         self, hold_id: str, payer_keyid: str, reason: str
@@ -3224,25 +3372,8 @@ class LedgerStore:
             if hold["state"] != "open":
                 raise SpendStateError(f"task hold is {hold['state']}")
             now = self._now()
-            updated = db.execute(
-                "UPDATE task_holds SET state='refunded', refund_reason=?, "
-                "terminal_at=?, updated_at=? WHERE hold_id=? AND state='open'",
-                (reason, now, now, hold_id),
-            )
-            if updated.rowcount != 1:
+            if not self._refund_task_hold_in(db, hold, now, reason):
                 raise SpendStateError("task hold is not open")
-            self._move_spend_value(
-                db,
-                source=str(hold["escrow_account"]),
-                destination=str(hold["payer_account"]),
-                amount=int(hold["amount"]),
-                timestamp=now,
-                debit_kind="task_refund_debit",
-                credit_kind="task_refund_credit",
-                event_id=f"task-refund:{hold_id}",
-                detail={"hold_id": hold_id, "reason": reason},
-            )
-            self._assert_task_hold_in(db, hold_id)
             result = self._task_status_in(db, hold_id)
             result["replayed"] = False
             return result

@@ -57,6 +57,7 @@ from core.ledger_store import (  # noqa: E402
     SpendExpired,
     SpendNotFound,
     SpendStateError,
+    TaskHoldNotOpen,
     WithdrawalRateLimitError,
     WithdrawalTierError,
     is_reserved,
@@ -89,6 +90,7 @@ _SPEND_POST_PATHS = frozenset(
         "/spend/abandon",
         "/spend/release",
         "/spend/task/authorize",
+        "/spend/task/submit",
         "/spend/task/pay",
         "/spend/task/refund",
     }
@@ -836,6 +838,31 @@ class V2LedgerService:
         status = self.store.pay_task_hold(hold_id, keyid)
         return self._task_hold_response(status, replayed=bool(status["replayed"]))
 
+    def submit_task_hold(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _row_identity(keyid, roster)
+        request = _strict_fields(
+            body, {"hold_id", "result_hash"}, name="task submit"
+        )
+        hold_id = _bounded_text(request["hold_id"], "hold_id")
+        result_hash = request["result_hash"]
+        if (
+            not isinstance(result_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", result_hash) is None
+        ):
+            raise LedgerValueError("result_hash must be 64 lowercase hex")
+        status = self.store.submit_task_hold(hold_id, keyid, result_hash)
+        result = self._task_hold_response(
+            status, replayed=bool(status["replayed"])
+        )
+        result["submitted_at"] = int(status["submitted_at"])
+        result["result_hash"] = status["result_hash"]
+        return result
+
     def refund_task_hold(
         self,
         body: object,
@@ -867,6 +894,8 @@ class V2LedgerService:
             "amount": int(status["amount"]),
             "deadline": int(status["deadline"]),
             "state": status["state"],
+            "submitted_at": int(status["submitted_at"]),
+            "result_hash": status["result_hash"],
             "server_time": self.store._now(),
         }
 
@@ -1234,10 +1263,15 @@ def _make_v2_handler(svc: V2LedgerService):
                     result = svc.release_spend(body, keyid, roster)
                 elif target.path == "/spend/task/authorize":
                     result = svc.authorize_task_hold(body, keyid, roster)
+                elif target.path == "/spend/task/submit":
+                    result = svc.submit_task_hold(body, keyid, roster)
                 elif target.path == "/spend/task/pay":
                     result = svc.pay_task_hold(body, keyid, roster)
-                else:
+                elif target.path == "/spend/task/refund":
                     result = svc.refund_task_hold(body, keyid, roster)
+                else:
+                    self._send(404, {"error": "not found"})
+                    return
                 self._send(200, result)
             except CreditLimitError as exc:
                 self._send(422 if target.path == "/withdraw" else 402,
@@ -1259,7 +1293,10 @@ def _make_v2_handler(svc: V2LedgerService):
                 self._send(404, {"error": "spend hold not found"})
             except SpendStateError as exc:
                 code = 404 if "does not exist" in str(exc) else 409
-                self._send(code, {"error": str(exc)})
+                payload: dict[str, object] = {"error": str(exc)}
+                if isinstance(exc, TaskHoldNotOpen):
+                    payload["state"] = exc.state
+                self._send(code, payload)
             except ReceiptStateError as exc:
                 self._send(409, {"error": str(exc)})
             except PermissionError as exc:
