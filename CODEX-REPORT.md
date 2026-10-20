@@ -74,3 +74,25 @@ Verification:
 - Broad required suite from `python/`, excluding only `test_chain_payout_validator.py`, `test_chain_reconcile_validator.py`, and `test_payout.py` because the optional `solders` package is unavailable: **261 passed**.
 - Explicit reverse-compatibility rollback test (`test_forgejo_main_code_still_opens_a_store_with_paid_and_open_task_holds`): **1 passed**.
 - All test runs used a temporary `HOME`; no live ledger, deployment, or push was performed.
+
+## Fix round 2 (delivery receipt)
+
+Implemented the ledger delivery receipt from the shared contract:
+
+- Added the signed, loopback-only, `NAK_SPEND_ROUTES`-gated `POST /spend/task/received` route. Only the named payer can acknowledge a result; worker/stranger calls are hidden as 404, identical replay is idempotent, a different replay hash is 409, and terminal holds return the existing state-bearing 409.
+- Added rollback-safe `received_at` and `received_hash` task-hold columns, status fields, and fail-closed insert/transition triggers. A receipt requires an existing submission whose mark is at or before the task deadline, while the receipt itself may arrive after the deadline.
+- Replaced the sweep condition with the exact receipt rule: silence-pay occurs only for an on-time submission plus a receipt with the same hash. Submitted-only, received-only/partial, and unequal-hash holds refund. Explicit payer pay/refund behavior and the strict two-shape B1 earnings proof are unchanged.
+- Extended tests for receipt scope, strict bodies and route gating, no/late submission refusal, after-deadline acceptance, idempotency/conflicts, terminal behavior, status exposure, the four-case sweep matrix, zero-sum accounting, strict maturity provenance, and a four-way pay/refund/received/sweep race.
+- Forward migration defaults were verified from a database made by the real `4ee5314` store. Reverse rollback was verified by opening a new-schema database containing an open hold with both submission and receipt marks using that exact old store source; balances and zero-sum accounting were unchanged.
+
+Verification (every run used a temporary `HOME`):
+
+- Focused task-hold suite: **15 passed**.
+- Required ledger regression command (`test_task_holds`, spend API/escrow/receipts, ledger store/server): **169 passed**.
+- Broad runnable Python suite, excluding only the three modules requiring unavailable optional `solders`: **262 passed**.
+- The exact unfiltered `python3 -m pytest -q tests/` command still stops during collection on the same three pre-existing `ModuleNotFoundError: solders` errors in `test_chain_payout_validator.py`, `test_chain_reconcile_validator.py`, and `test_payout.py`.
+
+Mutation check (both killed):
+
+1. Reverting the sweep predicate to submitted-only failed `test_expiry_sweep_pays_only_matching_submitted_and_received_matrix` (`submitted only` paid instead of refunded).
+2. Changing receipt ownership from `payer_keyid` to `worker_keyid` failed `test_payer_received_is_scoped_idempotent_hash_bound_and_accepts_late_delivery` (the worker could reach the mutation while the payer was hidden).

@@ -586,6 +586,9 @@ class LedgerStore:
                 submitted_at INTEGER NOT NULL DEFAULT 0
                     CHECK(typeof(submitted_at) = 'integer' AND submitted_at >= 0),
                 result_hash TEXT NOT NULL DEFAULT '',
+                received_at INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(received_at) = 'integer' AND received_at >= 0),
+                received_hash TEXT NOT NULL DEFAULT '',
                 refund_reason TEXT,
                 authorized_at INTEGER NOT NULL CHECK(typeof(authorized_at) = 'integer'),
                 terminal_at INTEGER,
@@ -802,6 +805,8 @@ class LedgerStore:
         for name, definition in (
             ("submitted_at", "INTEGER NOT NULL DEFAULT 0"),
             ("result_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("received_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("received_hash", "TEXT NOT NULL DEFAULT ''"),
         ):
             if name not in task_hold_columns:
                 self._db.execute(
@@ -888,6 +893,37 @@ class LedgerStore:
             )
             BEGIN
                 SELECT RAISE(ABORT, 'task submission mark is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_holds_receipt_valid_insert
+            BEFORE INSERT ON task_holds
+            WHEN NOT (
+                (NEW.received_at = 0 AND NEW.received_hash = '')
+                OR (NEW.received_at > 0
+                    AND NEW.submitted_at > 0
+                    AND NEW.submitted_at <= NEW.deadline
+                    AND length(NEW.received_hash) = 64
+                    AND NEW.received_hash NOT GLOB '*[^0-9a-f]*')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid task delivery receipt');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_holds_receipt_transition
+            BEFORE UPDATE OF received_at, received_hash ON task_holds
+            WHEN NOT (
+                (NEW.received_at = OLD.received_at
+                    AND NEW.received_hash = OLD.received_hash)
+                OR (OLD.state = 'open' AND NEW.state = 'open'
+                    AND OLD.received_at = 0 AND OLD.received_hash = ''
+                    AND OLD.submitted_at > 0
+                    AND OLD.submitted_at <= OLD.deadline
+                    AND NEW.received_at > 0
+                    AND length(NEW.received_hash) = 64
+                    AND NEW.received_hash NOT GLOB '*[^0-9a-f]*')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'task delivery receipt is immutable');
             END;
             """
         )
@@ -1388,11 +1424,15 @@ class LedgerStore:
             raise SpendNotFound("spend hold not found")
         if hold["state"] != "open" or now < int(hold["deadline"]) + TASK_REFUND_GRACE_S:
             return False
+        silence_pay = (
+            int(hold["submitted_at"]) > 0
+            and int(hold["submitted_at"]) <= int(hold["deadline"])
+            and int(hold["received_at"]) > 0
+            and hold["result_hash"] == hold["received_hash"]
+        )
         return (
-            cls._pay_task_hold_in(
-                db, hold, now, paid_by_silence=True
-            )
-            if int(hold["submitted_at"]) > 0
+            cls._pay_task_hold_in(db, hold, now, paid_by_silence=True)
+            if silence_pay
             else cls._refund_task_hold_in(db, hold, now, "expired")
         )
 
@@ -3350,6 +3390,61 @@ class LedgerStore:
                 if current["state"] != "open":
                     raise TaskHoldNotOpen(str(current["state"]))
                 raise SpendConflict("task hold submission raced with another result")
+            self._assert_task_hold_in(db, hold_id)
+            result = self._task_status_in(db, hold_id)
+            result["replayed"] = False
+            return result
+
+        result = self._tx(operation)
+        if "not_open_state" in result:
+            raise TaskHoldNotOpen(str(result["not_open_state"]))
+        return result
+
+    def receive_task_hold(
+        self, hold_id: str, payer_keyid: str, result_hash: str
+    ) -> dict[str, Any]:
+        """Record the payer's durable acknowledgement of a submitted result."""
+        hold_id = _identifier(hold_id, "hold_id")
+        payer_keyid = _identifier(payer_keyid, "payer_keyid")
+        result_hash = self._strict_sha256(result_hash, "result_hash")
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            hold = db.execute(
+                "SELECT * FROM task_holds WHERE hold_id=? AND payer_keyid=?",
+                (hold_id, payer_keyid),
+            ).fetchone()
+            if hold is None:
+                raise SpendNotFound("spend hold not found")
+            if hold["state"] != "open":
+                result = dict(hold)
+                result["not_open_state"] = str(hold["state"])
+                return result
+            if (
+                int(hold["submitted_at"]) == 0
+                or int(hold["submitted_at"]) > int(hold["deadline"])
+            ):
+                raise SpendConflict(
+                    "task hold has no pre-deadline submission to acknowledge"
+                )
+            if int(hold["received_at"]) > 0:
+                if hold["received_hash"] != result_hash:
+                    raise SpendConflict(
+                        "task hold was already received with a different result_hash"
+                    )
+                result = dict(hold)
+                result["replayed"] = True
+                return result
+            now = self._now()
+            updated = db.execute(
+                "UPDATE task_holds SET received_at=?, received_hash=?, updated_at=? "
+                "WHERE hold_id=? AND state='open' AND received_at=0",
+                (now, result_hash, now, hold_id),
+            )
+            if updated.rowcount != 1:
+                current = self._task_status_in(db, hold_id)
+                if current["state"] != "open":
+                    raise TaskHoldNotOpen(str(current["state"]))
+                raise SpendConflict("task hold receipt raced with another result")
             self._assert_task_hold_in(db, hold_id)
             result = self._task_status_in(db, hold_id)
             result["replayed"] = False
