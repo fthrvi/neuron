@@ -36,3 +36,26 @@ Note: a replay of a hold that has since been refunded/paid returns that terminal
 ## Fix round 2
 
 Review: rv2-m2.md. No ledger behaviour change was required in round 2 (all blocking/nit work is on the Nakshatra side). Only change: `has_task_hold_nonce` docstring now records the invariant it relies on (task_holds rows are never deleted; a trigger forbids it; if that ever changed the probe would return False and the full deadline window would apply, i.e. fail closed). The round-1 replay-near-deadline fix is what lets the poster's recovery re-run the identical authorize and get the same hold (`test_identical_authorize_replay_near_the_deadline_returns_the_same_hold`). Suite: 165 passed before and after.
+
+## M2.1 ledger: submitted mark and silence-pays sweep (2026-10-20)
+
+Built:
+
+- Added the signed, loopback-only, `NAK_SPEND_ROUTES`-gated `POST /spend/task/submit` route. Only the named worker can mark an open hold; the 64-lowercase-hex result hash is immutable, identical replay is idempotent, a different hash conflicts, and terminal conflicts return the hold state.
+- Added rollback-safe `submitted_at` and `result_hash` columns with defaults and transition-validating triggers. Task status now returns both fields, using `0` and `""` before submission.
+- Changed the existing deadline+24h sweep so a submitted open hold pays the named worker (including the normal task-earnings maturity record) while an unsubmitted hold retains the M2 refund behavior. Pay/refund/sweep still serialize through the same transaction and zero-sum check.
+- Kept payer refund available after submission and made it auditable with the `refund_after_submit` journal kind plus the same boolean in both journal details. Sweep payments carry `paid_by_silence` in their journal details.
+
+Compatibility and tests:
+
+- The ledger-focused regression command recorded in the prior report now passes **167 tests**, versus **165** at `4ee5314`; the two added tests cover submission policy/state and post-submit refund marking. All runs used temporary HOME/database/roster paths.
+- The broad runnable Python suite passes **260 tests** when excluding the same three validator/payout files whose optional `solders` dependency is unavailable.
+- The exact required `python -m pytest -q tests/` command was run before and after. It still stops at collection with the same three `ModuleNotFoundError: solders` errors in `test_chain_payout_validator.py`, `test_chain_reconcile_validator.py`, and `test_payout.py`; no test body runs under that unfiltered command.
+- Forward migration was exercised from a database created by `git show 4ee5314:python/core/ledger_store.py` with existing inference and task holds. Reverse rollback was exercised by opening a new-schema database containing paid and submitted-open task holds with that exact old store source; balances and the zero sum were unchanged.
+- The threaded three-way pay/refund/sweep race ran 12 times and always produced one terminal accounting event (exactly two balanced journal legs), never duplicate earnings, and a zero total.
+
+Mutation check (all killed):
+
+1. Replacing the submit scope from `worker_keyid` to `payer_keyid` failed `test_worker_submit_is_idempotent_hash_bound_and_terminal_aware`.
+2. Disabling the submitted branch in the expiry sweep failed `test_expiry_sweep_pays_submitted_and_refunds_unsubmitted` (`refunded` instead of `paid`).
+3. Disabling post-submit refund detection failed `test_refund_after_submit_is_distinct_in_the_journal` (ordinary refund kinds instead of `refund_after_submit`).
