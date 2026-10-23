@@ -42,6 +42,7 @@ from core.ledger_store import (  # noqa: E402
     MAX_UNITS,
     MIN_WITHDRAW_CREDITS,
     RATE,
+    STARTER_MAX,
     TIER_LIMITS,
     CreditLimitError,
     LedgerStore,
@@ -94,10 +95,11 @@ _SPEND_POST_PATHS = frozenset(
         "/spend/task/received",
         "/spend/task/pay",
         "/spend/task/refund",
+        "/spend/starter",
     }
 )
 _SPEND_GET_PATHS = frozenset(
-    {"/spend/status", "/spend/ready", "/spend/task/status"}
+    {"/spend/status", "/spend/ready", "/spend/task/status", "/spend/starter/status"}
 )
 _SPEND_PATHS = _SPEND_POST_PATHS | _SPEND_GET_PATHS
 
@@ -930,6 +932,94 @@ class V2LedgerService:
             "server_time": self.store._now(),
         }
 
+    @staticmethod
+    def _starter_response(
+        grant: Mapping[str, object], *, include_replayed: bool
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "v": 1,
+            "invite_id": grant["invite_id"],
+            "from_account": grant["src_account"],
+            "to_account": grant["dst_account"],
+            "to_keyid": grant["to_keyid"],
+            "amount": int(grant["amount"]),
+            "ts": int(grant["ts"]),
+        }
+        if include_replayed:
+            result["replayed"] = bool(grant["replayed"])
+        return result
+
+    @staticmethod
+    def _starter_row_identity(
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+        *,
+        recipient: bool = False,
+    ) -> tuple[str, str]:
+        row = roster.get(keyid)
+        if recipient and not isinstance(row, Mapping):
+            raise LookupError("recipient not in roster")
+        if isinstance(row, Mapping) and is_reserved(row.get("operator")):
+            raise LedgerValueError("starter grant account is reserved")
+        return _row_identity(keyid, roster)
+
+    def grant_starter(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        request = _strict_fields(
+            body, {"invite_id", "to_keyid", "amount"}, name="starter grant"
+        )
+        src, src_tier = self._starter_row_identity(keyid, roster)
+        invite_id = request["invite_id"]
+        if (
+            not isinstance(invite_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", invite_id) is None
+        ):
+            raise LedgerValueError(
+                "invite_id must be 1..64 characters from A-Za-z0-9_-"
+            )
+        to_keyid = request["to_keyid"]
+        if (
+            not isinstance(to_keyid, str)
+            or re.fullmatch(r"[0-9a-f]{64}", to_keyid) is None
+        ):
+            raise LedgerValueError("to_keyid must be 64 lowercase hex")
+        dst, dst_tier = self._starter_row_identity(
+            to_keyid, roster, recipient=True
+        )
+        amount = _bounded_integer(
+            request["amount"], "amount", low=1, high=STARTER_MAX
+        )
+        grant = self.store.grant_starter(
+            invite_id,
+            src,
+            dst,
+            to_keyid,
+            amount,
+            src_tier,
+            dst_tier,
+        )
+        return self._starter_response(grant, include_replayed=True)
+
+    def starter_status(
+        self,
+        invite_id: str,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        src, _src_tier = self._starter_row_identity(keyid, roster)
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", invite_id) is None:
+            raise LedgerValueError(
+                "invite_id must be 1..64 characters from A-Za-z0-9_-"
+            )
+        grant = self.store.starter_grant(src, invite_id)
+        if grant is None:
+            raise LookupError("starter grant not found")
+        return self._starter_response(grant, include_replayed=False)
+
     def spend_status(
         self,
         hold_id: str,
@@ -1213,6 +1303,9 @@ def _make_v2_handler(svc: V2LedgerService):
                 elif target.path == "/spend/task/status":
                     query = _exact_query(target, {"hold_id"})
                     result = svc.task_hold_status(query["hold_id"], keyid, roster)
+                elif target.path == "/spend/starter/status":
+                    query = _exact_query(target, {"invite_id"})
+                    result = svc.starter_status(query["invite_id"], keyid, roster)
                 elif target.path == "/spend/ready":
                     _exact_query(target, set())
                     result = svc.spend_ready(keyid, roster)
@@ -1231,6 +1324,8 @@ def _make_v2_handler(svc: V2LedgerService):
             except SpendStateError as exc:
                 code = 404 if "does not exist" in str(exc) else 409
                 self._send(code, {"error": str(exc)})
+            except LookupError as exc:
+                self._send(404, {"error": str(exc)})
             except LedgerValueError as exc:
                 self._send(422, {"error": str(exc)})
 
@@ -1302,6 +1397,8 @@ def _make_v2_handler(svc: V2LedgerService):
                     result = svc.pay_task_hold(body, keyid, roster)
                 elif target.path == "/spend/task/refund":
                     result = svc.refund_task_hold(body, keyid, roster)
+                elif target.path == "/spend/starter":
+                    result = svc.grant_starter(body, keyid, roster)
                 else:
                     self._send(404, {"error": "not found"})
                     return

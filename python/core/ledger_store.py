@@ -32,6 +32,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 # malformed or hostile amount can never approach integer overflow in balances.
 MAX_UNITS = 10 ** 12
 TASK_MAX_AMOUNT = MAX_UNITS
+STARTER_MAX = 100_000_000
 
 # Permanent conversion between the ledger's token-layer credits and the SPL
 # token's smallest unit. Price changes belong in the model multiplier, not
@@ -611,6 +612,19 @@ class LedgerStore:
                 FOREIGN KEY(hold_id) REFERENCES task_holds(hold_id),
                 FOREIGN KEY(debit_journal_seq) REFERENCES journal(seq),
                 FOREIGN KEY(credit_journal_seq) REFERENCES journal(seq)
+            );
+
+            CREATE TABLE IF NOT EXISTS starter_grants (
+                invite_id TEXT NOT NULL,
+                src_account TEXT NOT NULL,
+                dst_account TEXT NOT NULL,
+                to_keyid TEXT NOT NULL,
+                amount INTEGER NOT NULL
+                    CHECK(typeof(amount) = 'integer'
+                          AND amount BETWEEN 1 AND {STARTER_MAX}),
+                ts INTEGER NOT NULL CHECK(typeof(ts) = 'integer'),
+                PRIMARY KEY(src_account, invite_id),
+                UNIQUE(dst_account)
             );
 
             CREATE TABLE IF NOT EXISTS legacy_funding_projection (
@@ -4476,6 +4490,107 @@ class LedgerStore:
 
         return self._tx(operation)
 
+    def grant_starter(
+        self,
+        invite_id: str,
+        src: str,
+        dst: str,
+        to_keyid: str,
+        amount: int,
+        src_tier: str,
+        dst_tier: str,
+    ) -> dict[str, Any]:
+        """Atomically issue one spend-only starter grant to an account."""
+        invite_id = _identifier(invite_id, "invite_id")
+        src = _identifier(src, "src")
+        dst = _identifier(dst, "dst")
+        to_keyid = _identifier(to_keyid, "to_keyid")
+        if is_reserved(src) or is_reserved(dst):
+            raise LedgerValueError("cannot grant starter credit to or from a reserved account")
+        if src == dst:
+            raise LedgerValueError("cannot grant starter credit to the same account")
+        amount = _amount(amount)
+        if amount > STARTER_MAX:
+            raise LedgerValueError(f"amount must be between 1 and {STARTER_MAX}")
+        src_tier = _tier(src_tier)
+        dst_tier = _tier(dst_tier)
+        now = self._now()
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            existing = db.execute(
+                "SELECT invite_id, src_account, dst_account, to_keyid, amount, ts "
+                "FROM starter_grants WHERE src_account=? AND invite_id=?",
+                (src, invite_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["to_keyid"] != to_keyid or int(existing["amount"]) != amount:
+                    raise SpendConflict("starter invite conflicts with existing grant")
+                return {**dict(existing), "replayed": True}
+
+            if db.execute(
+                "SELECT 1 FROM starter_grants WHERE dst_account=?", (dst,)
+            ).fetchone() is not None:
+                raise SpendConflict("recipient already has a starter grant")
+
+            src_old = self._balance_in(db, src)
+            dst_old = self._balance_in(db, dst)
+            if not _may_debit(src_old, amount, src_tier):
+                limit = TIER_LIMITS[src_tier]
+                raise CreditLimitError(
+                    f"starter grant would exceed {src_tier} credit limit {limit}: "
+                    f"{src_old} - {amount}"
+                )
+            src_new = self._checked_balance(src_old - amount, src)
+            dst_new = self._checked_balance(dst_old + amount, dst)
+            self._ensure_account(db, src, src_tier)
+            self._ensure_account(db, dst, dst_tier)
+            db.execute("UPDATE accounts SET tier=? WHERE id=?", (src_tier, src))
+            db.execute("UPDATE accounts SET tier=? WHERE id=?", (dst_tier, dst))
+            self._set_balance(db, src, src_new)
+            self._set_balance(db, dst, dst_new)
+            detail = json.dumps(
+                {"invite_id": invite_id, "spend_only": True},
+                separators=(",", ":"),
+            )
+            db.execute(
+                "INSERT INTO journal(ts, kind, account, counterparty, amount, detail) "
+                "VALUES (?, 'starter_send', ?, ?, ?, ?)",
+                (now, src, dst, -amount, detail),
+            )
+            db.execute(
+                "INSERT INTO journal(ts, kind, account, counterparty, amount, detail) "
+                "VALUES (?, 'starter_receive', ?, ?, ?, ?)",
+                (now, dst, src, amount, detail),
+            )
+            db.execute(
+                "INSERT INTO starter_grants(invite_id, src_account, dst_account, "
+                "to_keyid, amount, ts) VALUES (?, ?, ?, ?, ?, ?)",
+                (invite_id, src, dst, to_keyid, amount, now),
+            )
+            return {
+                "invite_id": invite_id,
+                "src_account": src,
+                "dst_account": dst,
+                "to_keyid": to_keyid,
+                "amount": amount,
+                "ts": now,
+                "replayed": False,
+            }
+
+        return self._tx(operation)
+
+    def starter_grant(self, src: str, invite_id: str) -> dict[str, Any] | None:
+        """Return a starter grant only within its source-account scope."""
+        src = _identifier(src, "src")
+        invite_id = _identifier(invite_id, "invite_id")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT invite_id, src_account, dst_account, to_keyid, amount, ts "
+                "FROM starter_grants WHERE src_account=? AND invite_id=?",
+                (src, invite_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def dispute(self, receipt_id: str) -> bool:
         """Reverse a receipt once while retaining its permanent receipt row."""
         receipt_id = _identifier(receipt_id, "receipt_id")
@@ -4750,6 +4865,7 @@ def import_legacy_snapshot(snapshot: dict[str, Any], store: LedgerStore) -> None
 
 __all__ = [
     "MAX_UNITS",
+    "STARTER_MAX",
     "RATE",
     "HOLD_S",
     "SPEND_EXECUTION_S",
