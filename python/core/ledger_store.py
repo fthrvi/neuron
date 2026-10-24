@@ -1207,27 +1207,32 @@ class LedgerStore:
         be disabled before starting the rebuild transaction; changing the
         pragma inside a transaction is a documented no-op.
         """
-        row = self._db.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_holds'"
-        ).fetchone()
-        columns = {
-            str(info[1]) for info in self._db.execute("PRAGMA table_info(task_holds)")
-        }
         dispute_columns = {
             "dispute_reason", "dispute_note", "disputed_at",
             "resolved_outcome", "resolution_reason",
         }
-        if (
-            row is not None
-            and "'disputed'" in str(row[0])
-            and dispute_columns.issubset(columns)
-        ):
-            return
 
         foreign_keys = int(self._db.execute("PRAGMA foreign_keys").fetchone()[0])
         self._db.execute("PRAGMA foreign_keys=OFF")
         try:
             self._db.execute("BEGIN IMMEDIATE")
+            # Checked under the write lock so a concurrent opener that already
+            # migrated is not rebuilt twice.
+            row = self._db.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='task_holds'"
+            ).fetchone()
+            columns = {
+                str(info[1])
+                for info in self._db.execute("PRAGMA table_info(task_holds)")
+            }
+            if (
+                row is not None
+                and "'disputed'" in str(row[0])
+                and dispute_columns.issubset(columns)
+            ):
+                self._db.execute("ROLLBACK")
+                return
             self._db.execute("DROP VIEW IF EXISTS economic_receipts")
             self._db.execute(
                 f"""
@@ -3851,6 +3856,15 @@ class LedgerStore:
             ).fetchone()
             if hold is None:
                 raise SpendNotFound("spend hold not found")
+            now = self._now()
+            if hold["disputed_at"] is None and hold["state"] == "open":
+                # A dispute must not outrun the sweep: settle anything already
+                # due (silence-pay / expiry) first.  The settlement has to
+                # commit, so signal the refusal after the transaction.
+                if self._advance_task_hold_in(db, hold_id, now):
+                    return None
+                if now >= int(hold["deadline"]) + TASK_REFUND_GRACE_S:
+                    raise SpendStateError("task hold is not open")
             if hold["disputed_at"] is not None:
                 if hold["dispute_reason"] != reason or hold["dispute_note"] != note:
                     raise SpendConflict(
@@ -3863,7 +3877,6 @@ class LedgerStore:
                 raise SpendStateError(f"task hold is {hold['state']}")
             if int(hold["submitted_at"]) == 0:
                 raise SpendStateError("task hold has not been submitted")
-            now = self._now()
             updated = db.execute(
                 "UPDATE task_holds SET state='disputed', dispute_reason=?, "
                 "dispute_note=?, disputed_at=?, updated_at=? "
@@ -3877,7 +3890,10 @@ class LedgerStore:
             result["replayed"] = False
             return result
 
-        return self._tx(operation)
+        outcome = self._tx(operation)
+        if outcome is None:
+            raise SpendStateError("task hold is not open")
+        return outcome
 
     def resolve_task_hold(
         self, hold_id: str, outcome: str, reason: str
@@ -3947,6 +3963,16 @@ class LedgerStore:
         hold_id = _identifier(hold_id, "hold_id")
         with self._lock:
             return self._task_status_in(self._db, hold_id)
+
+    def task_hold_parties(self, hold_id: str) -> tuple[str, str] | None:
+        """(payer_keyid, worker_keyid) of a hold, or None if it does not exist."""
+        hold_id = _identifier(hold_id, "hold_id")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT payer_keyid, worker_keyid FROM task_holds WHERE hold_id=?",
+                (hold_id,),
+            ).fetchone()
+        return None if row is None else (str(row[0]), str(row[1]))
 
     def task_hold_status_scoped(
         self, hold_id: str, caller_keyid: str

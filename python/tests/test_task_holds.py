@@ -60,6 +60,7 @@ def identities(tmp_path):
         ("worker", "worker", "known"),
         ("outsider", "outsider", "known"),
         ("operator", "ledger-operator", "self"),
+        ("selfpayer", "selfpayer", "self"),
     ):
         result[label] = _identity(label)
         rows.append(
@@ -1140,5 +1141,58 @@ def test_identical_authorize_replay_near_the_deadline_returns_the_same_hold(tmp_
         with pytest.raises(LedgerValueError):             # a NEW hold still needs the window
             service.authorize_task_hold(
                 dict(body, client_nonce="other", task_hash="b" * 64), payer, roster)
+    finally:
+        service.close()
+
+
+def test_late_dispute_cannot_evade_silence_pay_or_expiry(tmp_path):
+    clock = [5_900_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("funding", "payer", 300, 1)
+        silent = _authorize(store, clock, nonce="late-pay", task_hash="7" * 64)
+        store.submit_task_hold(silent["hold_id"], "worker-key", "7" * 64)
+        store.receive_task_hold(silent["hold_id"], "payer-key", "7" * 64)
+        expired = _authorize(store, clock, nonce="late-exp", task_hash="8" * 64)
+        store.submit_task_hold(expired["hold_id"], "worker-key", "8" * 64)
+        clock[0] = max(silent["deadline"], expired["deadline"]) + TASK_REFUND_GRACE_S
+        # Sweep has not run; the dispute must settle the hold, not escape it.
+        for hold in (silent, expired):
+            with pytest.raises(SpendStateError, match="not open"):
+                store.dispute_task_hold(hold["hold_id"], "payer-key", "late", "x")
+        assert store.task_hold_status(silent["hold_id"])["state"] == "paid"
+        assert store.task_hold_status(expired["hold_id"])["state"] == "refunded"
+        assert store.balance("worker") == 100
+
+
+def test_resolver_may_not_be_a_party_to_its_own_dispute(
+    tmp_path, identities, monkeypatch
+):
+    clock = [6_900_000]
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite", identities["roster"],
+        clock=lambda: clock[0], start_sweeper=False,
+    )
+    try:
+        service.store.deposit("funding", "selfpayer", 100, 1)
+        monkeypatch.setenv("NAK_SPEND_ROUTES", "on")
+        with _running(service) as base:
+            hold_id = _request(
+                base, "POST", "/spend/task/authorize", identities["selfpayer"],
+                _task_body(identities, clock[0], task_hash="9" * 64),
+            )[1]["hold_id"]
+            _request(
+                base, "POST", "/spend/task/submit", identities["worker"],
+                {"hold_id": hold_id, "result_hash": "9" * 64},
+            )
+            assert _request(
+                base, "POST", "/spend/task/dispute", identities["selfpayer"],
+                {"hold_id": hold_id, "reason": "quality", "note": "mine"},
+            )[0] == 200
+            code, _body = _request(
+                base, "POST", "/spend/task/resolve", identities["selfpayer"],
+                {"hold_id": hold_id, "outcome": "refund", "reason": "mine"},
+            )
+            assert code == 403
+            assert service.store.task_hold_status(hold_id)["state"] == "disputed"
     finally:
         service.close()

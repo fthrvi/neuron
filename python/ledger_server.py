@@ -952,6 +952,10 @@ class V2LedgerService:
         hold_id = _bounded_text(request["hold_id"], "hold_id")
         outcome = _bounded_text(request["outcome"], "outcome", maximum=6)
         reason = _bounded_text(request["reason"], "reason", maximum=64)
+        # The resolver must not be a party to the dispute it adjudicates.
+        party = self.store.task_hold_parties(hold_id)
+        if party is not None and keyid in party:
+            raise PermissionError("a party to the dispute may not resolve it")
         status = self.store.resolve_task_hold(hold_id, outcome, reason)
         return self._task_hold_response(status, replayed=bool(status["replayed"]))
 
