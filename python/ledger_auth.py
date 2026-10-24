@@ -328,6 +328,7 @@ def _valid_participation(
     output_sha256: str,
     stages: set[tuple[str, int, int]],
     roster: Mapping[str, Mapping[str, object]],
+    frozen_operators: set[str],
 ) -> tuple[str, str, int, int] | None:
     if not isinstance(entry, dict):
         return None
@@ -381,6 +382,8 @@ def _valid_participation(
     operator = row.get("operator")
     if not isinstance(operator, str) or not operator:
         return None
+    if operator in frozen_operators:
+        raise SettlementFrozen()
     return matched, operator, start, end
 
 
@@ -425,6 +428,13 @@ def verify_receipt(
     credited: dict[str, int] = {}
     credited_stages: set[tuple[str, int, int]] = set()
     stages = set(chain)
+    frozen_operators = {
+        str(row["operator"])
+        for row in roster.values()
+        if isinstance(row, Mapping)
+        and isinstance(row.get("operator"), str)
+        and is_suspended_tier(row.get("tier"))
+    }
     for entry in receipt.get("worker_signatures") or []:
         try:
             valid = _valid_participation(
@@ -433,6 +443,7 @@ def verify_receipt(
                 output_sha256=output_hash,
                 stages=stages,
                 roster=roster,
+                frozen_operators=frozen_operators,
             )
         except SettlementFrozen as exc:
             exc.receipt_id = receipt_id

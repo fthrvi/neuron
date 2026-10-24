@@ -3985,26 +3985,36 @@ class LedgerStore:
         if len(reason) > 64:
             raise LedgerValueError("reason must be at most 64 characters")
 
-        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+        def operation(db: sqlite3.Connection) -> dict[str, Any] | None:
             hold = db.execute(
                 "SELECT * FROM task_holds WHERE hold_id=?", (hold_id,)
             ).fetchone()
             if hold is None:
                 raise SpendNotFound("spend hold not found")
-            if hold["resolved_outcome"] is not None:
-                if (
-                    hold["resolved_outcome"] != outcome
-                    or hold["resolution_reason"] != reason
-                ):
-                    raise SpendConflict(
-                        "task dispute was already resolved with a different outcome"
-                    )
-                result = self._task_status_in(db, hold_id)
-                result["replayed"] = True
-                return result
-            if hold["state"] != "disputed":
-                raise SpendStateError(f"task hold is {hold['state']}")
             now = self._now()
+            if self._advance_task_hold_in(
+                db, hold_id, now, is_frozen=is_frozen
+            ):
+                # Commit the due backstop transition before reporting that the
+                # hold is no longer available for operator adjudication.
+                return None
+            hold = db.execute(
+                "SELECT * FROM task_holds WHERE hold_id=?", (hold_id,)
+            ).fetchone()
+            if hold["state"] != "disputed":
+                raise SpendStateError("task hold is not disputed")
+            delivered = (
+                int(hold["submitted_at"]) > 0
+                and int(hold["submitted_at"]) <= int(hold["deadline"])
+                and int(hold["received_at"]) > 0
+                and hold["result_hash"] == hold["received_hash"]
+            )
+            if (
+                now >= int(hold["deadline"]) + TASK_DISPUTE_BACKSTOP_S
+                and delivered
+                and is_frozen(str(hold["worker_keyid"]))
+            ):
+                raise SpendConflict("backstop due; waiting for unsuspension")
             detail = {
                 "resolved_by": "operator",
                 "dispute_reason": str(hold["dispute_reason"]),
@@ -4037,7 +4047,10 @@ class LedgerStore:
             result["replayed"] = False
             return result
 
-        return self._tx(operation)
+        result = self._tx(operation)
+        if result is None:
+            raise SpendStateError("task hold is not disputed")
+        return result
 
     def task_hold_status(self, hold_id: str) -> dict[str, Any]:
         hold_id = _identifier(hold_id, "hold_id")
@@ -4045,11 +4058,11 @@ class LedgerStore:
             return self._task_status_in(self._db, hold_id)
 
     def task_hold_parties(self, hold_id: str) -> tuple[str, str] | None:
-        """(payer_keyid, worker_keyid) of a hold, or None if it does not exist."""
+        """(payer_account, worker_account) of a hold, or None if absent."""
         hold_id = _identifier(hold_id, "hold_id")
         with self._lock:
             row = self._db.execute(
-                "SELECT payer_keyid, worker_keyid FROM task_holds WHERE hold_id=?",
+                "SELECT payer_account, worker_account FROM task_holds WHERE hold_id=?",
                 (hold_id,),
             ).fetchone()
         return None if row is None else (str(row[0]), str(row[1]))

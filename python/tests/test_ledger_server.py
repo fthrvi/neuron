@@ -499,7 +499,7 @@ def test_operator_tiers_uses_highest_roster_tier():
         "key-4": {"operator": "suspended-only", "tier": "suspended"},
         "key-5": {"operator": "worker", "tier": "suspended"},
     }
-    assert _operator_tiers(roster) == {"worker": "trusted", "other": "stranger"}
+    assert _operator_tiers(roster) == {"other": "stranger"}
 
 
 def test_v2_new_run_id_for_same_work_does_not_double_credit(
@@ -594,6 +594,32 @@ def test_v2_transfer_to_suspended_operator_is_frozen(
     ) == (409, {"error": "recipient is suspended; transfers are frozen"})
     assert service.store.balance("alice") == 0
     assert service.store.balance("bob") == 0
+
+
+def test_active_sibling_key_cannot_transfer_from_frozen_operator(
+    tmp_path, v2_identities
+):
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite", v2_identities["roster"], start_sweeper=False
+    )
+    try:
+        roster = service.rosters.snapshot()
+        alice = v2_identities["alice"]["public"]
+        roster["a" * 64] = {
+            "pubkey": "a" * 64,
+            "name": "alice-suspended",
+            "operator": "alice",
+            "tier": "suspended",
+            "tenant": "test",
+            "coord": None,
+        }
+
+        with pytest.raises(PermissionError, match="signing key is suspended"):
+            service.transfer({"to": "bob", "amount": 1}, alice, roster)
+        assert service.store.balance("alice") == 0
+        assert service.store.balance("bob") == 0
+    finally:
+        service.close()
 
 
 def test_v2_dispute_by_stranger_is_refused(v2_server, v2_identities, timestamps):

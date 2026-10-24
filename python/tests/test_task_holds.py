@@ -61,6 +61,7 @@ def identities(tmp_path):
         ("outsider", "outsider", "known"),
         ("operator", "ledger-operator", "self"),
         ("selfpayer", "selfpayer", "self"),
+        ("selfpayer2", "selfpayer", "self"),
     ):
         result[label] = _identity(label)
         rows.append(
@@ -190,14 +191,23 @@ def test_sweeper_uses_last_successful_roster_when_refresh_fails(
         )
         service.store.submit_task_hold(payable["hold_id"], worker_keyid, "a" * 64)
         service.store.receive_task_hold(payable["hold_id"], "payer-key", "a" * 64)
+        refundable = _authorize(
+            service.store,
+            clock,
+            nonce="cached-refund",
+            task_hash="b" * 64,
+            worker_keyid=worker_keyid,
+        )
         clock[0] = payable["deadline"] + TASK_REFUND_GRACE_S
         service.rosters.refresh_seconds = 0
         identities["roster"].unlink()
 
         service._sweep_spend_holds_once()
 
-        assert service.store.task_hold_status(payable["hold_id"])["state"] == "paid"
-        assert service.store.balance("worker") == 100
+        assert service.store.task_hold_status(payable["hold_id"])["state"] == "open"
+        assert service.store.task_hold_status(refundable["hold_id"])["state"] == "refunded"
+        assert service.store.balance("worker") == 0
+        assert service.store.balance("payer") == 100
         assert service._sweep_error == "FileNotFoundError"
     finally:
         service.close()
@@ -331,6 +341,41 @@ def test_operator_task_resolve_service_enforces_suspension(tmp_path, identities)
         service.close()
 
 
+def test_suspended_sibling_key_freezes_task_earnings(tmp_path, identities):
+    clock = [1_950_000]
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite",
+        identities["roster"],
+        clock=lambda: clock[0],
+        start_sweeper=False,
+    )
+    try:
+        service.store.deposit("funding", "payer", 100, 1)
+        roster = service.rosters.snapshot()
+        payer = identities["payer"]["public"]
+        hold = service.authorize_task_hold(
+            _task_body(identities, clock[0]), payer, roster
+        )
+        frozen = {key: dict(row) for key, row in roster.items()}
+        frozen["b" * 64] = {
+            "pubkey": "b" * 64,
+            "name": "worker-suspended",
+            "operator": "worker",
+            "tier": "suspended",
+            "tenant": "test",
+            "coord": None,
+        }
+
+        with pytest.raises(
+            SpendConflict, match="worker is suspended; settlement is frozen"
+        ):
+            service.pay_task_hold({"hold_id": hold["hold_id"]}, payer, frozen)
+        assert service.store.task_hold_status(hold["hold_id"])["state"] == "open"
+        assert service.store.balance("worker") == 0
+    finally:
+        service.close()
+
+
 def test_backstop_pay_to_suspended_worker_defers_then_pays_after_unsuspend(tmp_path):
     clock = [1_800_000]
     frozen = [True]
@@ -358,6 +403,36 @@ def test_backstop_pay_to_suspended_worker_defers_then_pays_after_unsuspend(tmp_p
         assert store.expire_spend_holds(is_frozen=is_frozen) == [delivered["hold_id"]]
         assert store.task_hold_status(delivered["hold_id"])["state"] == "paid"
         assert (store.balance("worker"), _total(store)) == (100, total)
+
+
+def test_resolve_runs_due_backstop_and_cannot_refund_frozen_delivery(tmp_path):
+    clock = [1_825_000]
+    frozen = [True]
+    is_frozen = lambda keyid: frozen[0] and keyid == "worker-key"
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("funding", "payer", 100, 1)
+        delivered = _submitted(store, clock, "resolve-due", "e" * 64)
+        store.dispute_task_hold(
+            delivered["hold_id"], "payer-key", "review", "x",
+            is_frozen=is_frozen,
+        )
+        clock[0] = delivered["deadline"] + TASK_DISPUTE_BACKSTOP_S
+
+        with pytest.raises(
+            SpendConflict, match="backstop due; waiting for unsuspension"
+        ):
+            store.resolve_task_hold(
+                delivered["hold_id"], "refund", "override", is_frozen=is_frozen
+            )
+        assert store.task_hold_status(delivered["hold_id"])["state"] == "disputed"
+
+        frozen[0] = False
+        with pytest.raises(SpendStateError, match="not disputed"):
+            store.resolve_task_hold(
+                delivered["hold_id"], "refund", "override", is_frozen=is_frozen
+            )
+        assert store.task_hold_status(delivered["hold_id"])["state"] == "paid"
+        assert store.balance("worker") == 100
 
 
 def test_silence_pay_of_submitted_open_hold_defers_for_suspended_worker(tmp_path):
@@ -785,10 +860,9 @@ def test_dispute_is_scoped_idempotent_sweep_proof_and_operator_resolves(tmp_path
         assert store.task_hold_status(pay["hold_id"])["state"] == "disputed"
         resolved = store.resolve_task_hold(pay["hold_id"], "pay", "evidence_valid")
         assert (resolved["state"], resolved["replayed"]) == ("paid", False)
-        assert store.resolve_task_hold(
-            pay["hold_id"], "pay", "evidence_valid"
-        )["replayed"] is True
-        with pytest.raises(SpendConflict, match="different outcome"):
+        with pytest.raises(SpendStateError, match="not disputed"):
+            store.resolve_task_hold(pay["hold_id"], "pay", "evidence_valid")
+        with pytest.raises(SpendStateError, match="not disputed"):
             store.resolve_task_hold(pay["hold_id"], "refund", "evidence_valid")
 
         refund = _authorize(
@@ -1298,7 +1372,7 @@ def test_signed_dispute_and_operator_resolve_routes(tmp_path, identities, monkey
             assert (code, result["state"], result["replayed"]) == (200, "paid", False)
             assert _request(
                 base, "POST", "/spend/task/resolve", identities["operator"], resolution,
-            )[1]["replayed"] is True
+            ) == (409, {"error": "task hold is not disputed"})
 
             refund_hold = _request(
                 base, "POST", "/spend/task/authorize", identities["payer"],
@@ -1495,7 +1569,7 @@ def test_resolver_may_not_be_a_party_to_its_own_dispute(
                 {"hold_id": hold_id, "reason": "quality", "note": "mine"},
             )[0] == 200
             code, _body = _request(
-                base, "POST", "/spend/task/resolve", identities["selfpayer"],
+                base, "POST", "/spend/task/resolve", identities["selfpayer2"],
                 {"hold_id": hold_id, "outcome": "refund", "reason": "mine"},
             )
             assert code == 403

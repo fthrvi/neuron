@@ -806,7 +806,9 @@ class PayoutEngine:
             return changed
 
         changed += self._create_deposit_accounts()
-        for row in self.store.withdrawals("sent"):
+        for row in self.store.withdrawals(
+            "sent", exclude_operators=frozen_operators
+        ):
             changed += self._advance_sent(
                 row, frozen=str(row["operator"]) in frozen_operators
             )

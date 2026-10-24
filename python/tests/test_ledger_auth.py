@@ -353,6 +353,23 @@ def test_suspended_worker_freezes_other_valid_worker_shares_too(identities):
         verify_receipt(receipt, requester_pub, roster)
 
 
+def test_suspended_sibling_key_freezes_operator_receipt_share(identities):
+    _, requester_pub = identities["requester"]
+    a_private, a_pub = identities["worker_a"]
+    _, sibling_pub = _keypair()
+    roster = {k: dict(v) for k, v in identities["roster"].items()}
+    roster[sibling_pub] = _row(
+        sibling_pub, "worker-a-suspended", "bob", "suspended"
+    )
+    receipt = _receipt()
+    receipt["worker_signatures"] = [
+        _participation(a_private, a_pub, receipt, "worker-a", 0, 8)
+    ]
+
+    with pytest.raises(SettlementFrozen):
+        verify_receipt(receipt, requester_pub, roster)
+
+
 def test_roster_loader_skips_short_row_so_key_is_not_admitted(tmp_path):
     # Documents current behaviour: <5 fields => row dropped, key unrostered.
     _, pub = _keypair()

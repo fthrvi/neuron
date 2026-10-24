@@ -286,6 +286,8 @@ def _row_identity(
         raise PermissionError("signing key has no roster operator")
     if is_reserved(operator):
         raise PermissionError("signing key maps to a reserved operator")
+    if operator in _frozen_operators(roster):
+        raise PermissionError("signing key is suspended")
     return operator, tier if isinstance(tier, str) else "stranger"
 
 
@@ -293,11 +295,12 @@ def _operator_tiers(
     roster: Mapping[str, Mapping[str, object]],
 ) -> dict[str, str]:
     tiers: dict[str, str] = {}
+    frozen = _frozen_operators(roster)
     for row in roster.values():
         if not isinstance(row, Mapping):
             continue
         operator = row.get("operator")
-        if not isinstance(operator, str) or not operator:
+        if not isinstance(operator, str) or not operator or operator in frozen:
             continue
         tier = row.get("tier")
         if tier == "suspended":
@@ -311,9 +314,17 @@ def _operator_tiers(
 def _frozen_predicate(
     roster: Mapping[str, Mapping[str, object]],
 ) -> Callable[[str], bool]:
+    frozen = _frozen_operators(roster)
+
     def is_frozen(keyid: str) -> bool:
         row = roster.get(keyid)
-        return isinstance(row, Mapping) and is_suspended_tier(row.get("tier"))
+        if not isinstance(row, Mapping):
+            return False
+        operator = row.get("operator")
+        return (
+            is_suspended_tier(row.get("tier"))
+            or isinstance(operator, str) and operator in frozen
+        )
 
     return is_frozen
 
@@ -539,7 +550,7 @@ class V2LedgerService:
             roster = self.rosters.last_successful_snapshot()
         is_frozen = (
             (lambda _keyid: True)
-            if roster is None
+            if roster is None or roster_error is not None
             else _frozen_predicate(roster)
         )
         try:
@@ -1009,7 +1020,7 @@ class V2LedgerService:
         keyid: str,
         roster: Mapping[str, Mapping[str, object]],
     ) -> dict[str, object]:
-        _operator, tier = _row_identity(keyid, roster)
+        operator, tier = _row_identity(keyid, roster)
         if tier != "self":
             raise PermissionError("only the ledger operator may resolve task disputes")
         request = _strict_fields(
@@ -1020,7 +1031,7 @@ class V2LedgerService:
         reason = _bounded_text(request["reason"], "reason", maximum=64)
         # The resolver must not be a party to the dispute it adjudicates.
         party = self.store.task_hold_parties(hold_id)
-        if party is not None and keyid in party:
+        if party is not None and operator in party:
             raise PermissionError("a party to the dispute may not resolve it")
         status = self.store.resolve_task_hold(
             hold_id, outcome, reason, is_frozen=_frozen_predicate(roster)

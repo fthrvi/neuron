@@ -17,6 +17,7 @@ except ImportError:
         sys.modules.setdefault(_name, mock.MagicMock())
 
 from chain.payout import PayoutEngine  # noqa: E402
+from core.ledger_store import LedgerStore  # noqa: E402
 
 
 class _RPC:
@@ -67,3 +68,33 @@ def test_frozen_sent_row_still_finalizes_and_expires():
     assert PayoutEngine._advance_sent(eng, ROW, frozen=True) == 1
     store.withdraw_mark_expired.assert_called_once_with("w1")
     assert rpc.sent == []
+
+
+def test_frozen_sent_page_cannot_starve_unfrozen_row(tmp_path):
+    advanced = []
+    with LedgerStore(tmp_path / "ledger.sqlite") as store:
+        store._db.executemany(
+            "INSERT INTO withdrawals(id, operator, amount, address, state, "
+            "created_ts, updated_ts) VALUES (?, ?, 1, 'addr', 'sent', ?, ?)",
+            [
+                (f"frozen-{index:03d}", "frozen", index, index)
+                for index in range(101)
+            ]
+            + [("zz-normal", "normal", 999, 999)],
+        )
+        engine = SimpleNamespace(
+            config=SimpleNamespace(
+                kill_file=tmp_path / "payout.off", enabled=True
+            ),
+            store=store,
+            _frozen_operators=lambda: {"frozen"},
+            _approve_pending=lambda _frozen: 0,
+            _create_deposit_accounts=lambda: 0,
+            _advance_sent=lambda row, *, frozen: advanced.append(
+                (row["id"], frozen)
+            ) or 0,
+            _build_and_send=lambda _row: 0,
+        )
+
+        assert PayoutEngine.poll_once(engine) == 0
+        assert advanced == [("zz-normal", False)]
