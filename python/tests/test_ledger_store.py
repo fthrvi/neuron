@@ -391,6 +391,25 @@ def test_money_schema_and_constants(tmp_path):
             )
 
 
+def test_withdrawal_query_excludes_frozen_operators_before_limit(tmp_path):
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        store._db.executemany(
+            "INSERT INTO withdrawals(id, operator, amount, address, state, "
+            "created_ts, updated_ts) VALUES (?, ?, 1, 'addr', 'pending', ?, ?)",
+            [
+                (f"frozen-{index:03d}", "frozen", index, index)
+                for index in range(101)
+            ]
+            + [("zz-normal", "normal", 999, 999)],
+        )
+
+        rows = store.withdrawals(
+            "pending", limit=100, exclude_operators={"frozen"}
+        )
+
+        assert [entry["id"] for entry in rows] == ["zz-normal"]
+
+
 def test_deposit_is_idempotent_by_ref_and_preserves_zero_sum(tmp_path):
     with LedgerStore(tmp_path / "ledger.db") as store:
         assert store.deposit("sig:0", "alice", 12_300, 42) == 12_300

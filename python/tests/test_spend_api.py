@@ -290,6 +290,45 @@ def test_execution_and_settlement_deadlines_and_24h_fault_clock(
         service.close()
 
 
+def test_payer_relay_cannot_credit_suspended_worker_and_hold_stays_open(
+    tmp_path, identities
+):
+    clock = [2_500_000]
+    service = _service(tmp_path, identities, clock)
+    try:
+        roster = service.rosters.snapshot()
+        payer = identities["payer"]["public"]
+        worker = identities["worker"]["public"]
+        authorization = service.authorize_spend(
+            _authorize_body(identities), payer, roster
+        )
+        claim = service.claim_spend(
+            {"claim_token": authorization["claim_token"], "claim_instance": "claim"},
+            worker,
+            roster,
+        )
+        signed = _usage(service, claim, identities["worker"]["private"])
+        suspended = {key: dict(row) for key, row in roster.items()}
+        suspended[worker]["tier"] = "suspended"
+
+        with pytest.raises(
+            SpendConflict, match="worker is suspended; settlement is frozen"
+        ):
+            service.settle_spend(signed, payer, suspended)
+
+        status = service.store.spend_status(authorization["hold_id"])
+        assert status["state"] == "open"
+        assert status["workers"][0]["state"] == "claimed"
+        assert status["escrow_balance"] == status["max_cost"]
+        assert service.store.balance("worker") == 0
+
+        paid = service.settle_spend(signed, payer, roster)
+        assert paid["accepted_delta"] == 12
+        assert service.store.balance("worker") == 12
+    finally:
+        service.close()
+
+
 def test_all_spend_request_schemas_are_strict_and_bounded(tmp_path, identities):
     clock = [3_000_000]
     service = _service(tmp_path, identities, clock)

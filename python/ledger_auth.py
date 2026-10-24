@@ -161,6 +161,19 @@ def verify_envelope(
     return keyid
 
 
+def is_suspended_tier(tier: object) -> bool:
+    """True for any case/whitespace variant of ``suspended`` (fail closed)."""
+    return isinstance(tier, str) and tier.strip().lower() == "suspended"
+
+
+def _roster_tier(tier: str) -> str:
+    # Only "suspended" is normalised (so a typo'd case cannot fail open); every other tier
+    # must match exactly, so "SELF" / "Trusted" stay stranger rather than widening privilege.
+    if is_suspended_tier(tier):
+        return "suspended"
+    return tier if tier in TIER_RANK else "stranger"
+
+
 def load_roster(path: str | Path) -> dict[str, dict[str, str | None]]:
     """Load a Trisul admission TSV as ``pubkey -> roster row``.
 
@@ -188,7 +201,7 @@ def load_roster(path: str | Path) -> dict[str, dict[str, str | None]]:
             "pubkey": pubkey,
             "name": name,
             "operator": operator,
-            "tier": tier if tier in TIER_RANK else "stranger",
+            "tier": _roster_tier(tier),
             "tenant": tenant,
             "coord": fields[5] if len(fields) >= 6 else None,
         }
@@ -197,6 +210,14 @@ def load_roster(path: str | Path) -> dict[str, dict[str, str | None]]:
 
 class ReceiptError(ValueError):
     """A receipt is structurally invalid or fails its content-integrity checks."""
+
+
+class SettlementFrozen(ReceiptError):
+    """A valid receipt participant is suspended, so settlement must wait."""
+
+    def __init__(self, receipt_id: str | None = None):
+        super().__init__("a participant is suspended; settlement is frozen")
+        self.receipt_id = receipt_id
 
 
 def _strict_int(value: object, field: str) -> int:
@@ -352,6 +373,11 @@ def _valid_participation(
         ed25519.Ed25519PublicKey.from_public_bytes(public_bytes).verify(signature, message)
     except (InvalidSignature, TypeError, ValueError):
         return None
+    # A valid suspended participant freezes the whole receipt.  Dropping only this share and
+    # then storing the reduced receipt would make the omitted value impossible to recover after
+    # unsuspension.
+    if is_suspended_tier(row.get("tier")):
+        raise SettlementFrozen()
     operator = row.get("operator")
     if not isinstance(operator, str) or not operator:
         return None
@@ -400,13 +426,17 @@ def verify_receipt(
     credited_stages: set[tuple[str, int, int]] = set()
     stages = set(chain)
     for entry in receipt.get("worker_signatures") or []:
-        valid = _valid_participation(
-            entry,
-            run_id=run_id,
-            output_sha256=output_hash,
-            stages=stages,
-            roster=roster,
-        )
+        try:
+            valid = _valid_participation(
+                entry,
+                run_id=run_id,
+                output_sha256=output_hash,
+                stages=stages,
+                roster=roster,
+            )
+        except SettlementFrozen as exc:
+            exc.receipt_id = receipt_id
+            raise
         if valid is None:
             continue
         node_id, operator, start, end = valid

@@ -56,6 +56,7 @@ else:
     from .solana_rpc import RPCError, SolanaRPC, decode_base58, validate_pubkey
 
 from core.ledger_store import RATE, LedgerStore, WithdrawalStateError
+from ledger_auth import is_suspended_tier, load_roster
 
 
 LOG = logging.getLogger("nak-treasury")
@@ -64,6 +65,7 @@ WRITE_GATE_DIR = Path("/home/prithvi/trisul/infra/pillar-agent")
 DEFAULT_STORE = "~/.neuron/credits/ledger.sqlite"
 DEFAULT_KILL_FILE = "~/.neuron/credits/payout.off"
 DEFAULT_LOCK_FILE = "~/.neuron/credits/payout.lock"
+DEFAULT_ROSTER = "~/.nakshatra/admission-peers.tsv"
 MICRO_USDC = 10 ** USDC_DECIMALS
 AUTO_CAP_USDC = Decimal("5")
 DAY_CAP_USDC = Decimal("50")
@@ -475,6 +477,7 @@ class PayoutConfig:
     devnet_genesis: str = DEVNET_GENESIS_HASH
     presence_wait_s: int = 120
     require_live_funds_env: bool = False
+    roster_path: Path = Path(DEFAULT_ROSTER).expanduser()
 
     def __post_init__(self) -> None:
         # Reuse S3's complete cluster/RPC/pubkey validation.
@@ -523,6 +526,11 @@ class PayoutConfig:
             ),
             presence_wait_s=int(os.environ.get("NAK_PAYOUT_PRESENCE_WAIT", "120")),
             require_live_funds_env=True,
+            roster_path=Path(
+                os.path.expanduser(
+                    os.environ.get("NAK_ADMISSION_ROSTER", DEFAULT_ROSTER)
+                )
+            ),
         )
 
 
@@ -623,9 +631,21 @@ class PayoutEngine:
             time.sleep(0.2)
         raise PayoutError(f"created account {address} did not finalize")
 
-    def _approve_pending(self) -> int:
+    def _frozen_operators(self) -> set[str]:
+        roster = load_roster(self.config.roster_path)
+        return {
+            str(row["operator"])
+            for row in roster.values()
+            if isinstance(row, dict)
+            and isinstance(row.get("operator"), str)
+            and is_suspended_tier(row.get("tier"))
+        }
+
+    def _approve_pending(self, frozen_operators: set[str]) -> int:
         changed = 0
-        for row in self.store.withdrawals("pending"):
+        for row in self.store.withdrawals(
+            "pending", exclude_operators=frozen_operators
+        ):
             today = self.store.approved_withdrawal_total_since(self._midnight_utc())
             automatic = (
                 int(row["amount"]) <= self.config.auto_cap
@@ -706,7 +726,7 @@ class PayoutEngine:
             LOG.warning("broadcast ambiguous for %s: %s", row["id"], exc)
         return 1
 
-    def _advance_sent(self, row: dict[str, Any]) -> int:
+    def _advance_sent(self, row: dict[str, Any], frozen: bool = False) -> int:
         status = self.rpc.get_signature_status(row["tx_sig"])
         if status is not None:
             if status.get("err") is not None:
@@ -741,6 +761,13 @@ class PayoutEngine:
                 self.store.withdraw_finalize(row["id"])
                 return 1
             return 0
+        if frozen:
+            # Status tracking above still runs; only a (re)broadcast moves value out.
+            LOG.info(
+                "withdrawal %s rebroadcast skipped because its roster key is suspended",
+                row["id"],
+            )
+            return 0
         # A crash may have happened after the durable mark and before broadcast.
         try:
             self._may_act()
@@ -756,9 +783,23 @@ class PayoutEngine:
             LOG.warning("payout kill file present: %s", self.config.kill_file)
             return 0
 
-        changed = self._approve_pending()
+        frozen_operators = self._frozen_operators()
+        frozen_withdrawals = {
+            str(row["id"])
+            for row in self.store.withdrawals("pending", "approved", "expired")
+            if str(row["operator"]) in frozen_operators
+        }
+        for withdrawal_id in sorted(frozen_withdrawals):
+            LOG.info(
+                "withdrawal %s is frozen because its roster key is suspended",
+                withdrawal_id,
+            )
+
+        changed = self._approve_pending(frozen_operators)
         if not self.config.enabled:
-            for row in self.store.withdrawals("approved", "expired"):
+            for row in self.store.withdrawals(
+                "approved", "expired", exclude_operators=frozen_operators
+            ):
                 LOG.info("DRY-RUN would send withdrawal %s", row["id"])
             for row in self.store.pending_deposit_accounts():
                 LOG.info("DRY-RUN would create deposit account for %s", row["operator"])
@@ -766,14 +807,20 @@ class PayoutEngine:
 
         changed += self._create_deposit_accounts()
         for row in self.store.withdrawals("sent"):
-            changed += self._advance_sent(row)
-        for row in self.store.withdrawals("expired"):
+            changed += self._advance_sent(
+                row, frozen=str(row["operator"]) in frozen_operators
+            )
+        for row in self.store.withdrawals(
+            "expired", exclude_operators=frozen_operators
+        ):
             if int(row["expiry_count"]) >= MAX_EXPIRIES:
                 self.store.withdraw_release(row["id"])
                 changed += 1
             else:
                 changed += self._build_and_send(row)
-        for row in self.store.withdrawals("approved"):
+        for row in self.store.withdrawals(
+            "approved", exclude_operators=frozen_operators
+        ):
             changed += self._build_and_send(row)
         return changed
 

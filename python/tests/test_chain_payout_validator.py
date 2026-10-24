@@ -225,7 +225,9 @@ def test_real_deposit_hold_send_finalize_is_zero_sum(tmp_path):
             vault_account=vault_account,
             enabled=True,
             kill_file=tmp_path / "payout.off",
+            roster_path=tmp_path / "roster.tsv",
         )
+        config.roster_path.write_text("", encoding="utf-8")
         secret = treasury.read_text()
         backend = SoldersTreasuryBackend(
             rpc,

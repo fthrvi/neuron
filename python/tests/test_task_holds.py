@@ -132,6 +132,312 @@ def test_pay_refund_replays_conflicts_conserve_and_earnings_mature(tmp_path):
         )
 
 
+def test_suspended_task_worker_freezes_pay_and_silence_pay_but_not_refund(tmp_path):
+    clock = [1_500_000]
+    frozen = [True]
+    is_frozen = lambda keyid: frozen[0] and keyid == "worker-key"
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("funding", "payer", 500, 1)
+        direct = _authorize(store, clock, nonce="direct", task_hash="3" * 64)
+        with pytest.raises(
+            SpendConflict, match="worker is suspended; settlement is frozen"
+        ):
+            store.pay_task_hold(
+                direct["hold_id"], "payer-key", is_frozen=is_frozen
+            )
+        assert store.task_hold_status(direct["hold_id"])["state"] == "open"
+        assert store.balance("worker") == 0
+
+        submitted = _authorize(
+            store, clock, nonce="silence", task_hash="4" * 64
+        )
+        store.submit_task_hold(submitted["hold_id"], "worker-key", "a" * 64)
+        store.receive_task_hold(submitted["hold_id"], "payer-key", "a" * 64)
+        refundable = _authorize(
+            store, clock, nonce="refund-frozen", task_hash="5" * 64
+        )
+        clock[0] = submitted["deadline"] + TASK_REFUND_GRACE_S
+
+        store.expire_spend_holds(is_frozen=is_frozen)
+        assert store.task_hold_status(submitted["hold_id"])["state"] == "open"
+        assert store.task_hold_status(refundable["hold_id"])["state"] == "refunded"
+        assert store.balance("worker") == 0
+
+        frozen[0] = False
+        assert store.expire_spend_holds(is_frozen=is_frozen) == [submitted["hold_id"]]
+        assert store.task_hold_status(submitted["hold_id"])["state"] == "paid"
+        assert store.balance("worker") == 100
+
+
+def test_sweeper_uses_last_successful_roster_when_refresh_fails(
+    tmp_path, identities
+):
+    clock = [1_600_000]
+    service = V2LedgerService(
+        tmp_path / "cached.sqlite",
+        identities["roster"],
+        clock=lambda: clock[0],
+        start_sweeper=False,
+    )
+    try:
+        service.store.deposit("funding", "payer", 200, 1)
+        worker_keyid = identities["worker"]["public"]
+        payable = _authorize(
+            service.store,
+            clock,
+            nonce="cached-pay",
+            worker_keyid=worker_keyid,
+        )
+        service.store.submit_task_hold(payable["hold_id"], worker_keyid, "a" * 64)
+        service.store.receive_task_hold(payable["hold_id"], "payer-key", "a" * 64)
+        clock[0] = payable["deadline"] + TASK_REFUND_GRACE_S
+        service.rosters.refresh_seconds = 0
+        identities["roster"].unlink()
+
+        service._sweep_spend_holds_once()
+
+        assert service.store.task_hold_status(payable["hold_id"])["state"] == "paid"
+        assert service.store.balance("worker") == 100
+        assert service._sweep_error == "FileNotFoundError"
+    finally:
+        service.close()
+
+
+def test_sweeper_without_any_roster_snapshot_refunds_but_defers_pay(tmp_path):
+    clock = [1_700_000]
+    service = V2LedgerService(
+        tmp_path / "no-roster.sqlite",
+        tmp_path / "missing-roster.tsv",
+        clock=lambda: clock[0],
+        start_sweeper=False,
+    )
+    try:
+        service.store.deposit("funding", "payer", 300, 1)
+        payable = _authorize(
+            service.store,
+            clock,
+            nonce="no-roster-pay",
+            task_hash="b" * 64,
+        )
+        service.store.submit_task_hold(
+            payable["hold_id"], "worker-key", "c" * 64
+        )
+        service.store.receive_task_hold(
+            payable["hold_id"], "payer-key", "c" * 64
+        )
+        refundable = _authorize(
+            service.store,
+            clock,
+            nonce="no-roster-refund",
+            task_hash="d" * 64,
+        )
+        clock[0] = payable["deadline"] + TASK_REFUND_GRACE_S
+
+        service._sweep_spend_holds_once()
+
+        assert service.store.task_hold_status(payable["hold_id"])["state"] == "open"
+        assert service.store.task_hold_status(refundable["hold_id"])["state"] == "refunded"
+        assert service.store.balance("worker") == 0
+        assert service._sweep_error == "FileNotFoundError"
+    finally:
+        service.close()
+
+
+def _submitted(store, clock, nonce, task_hash, *, received=True):
+    hold = _authorize(store, clock, nonce=nonce, task_hash=task_hash)
+    store.submit_task_hold(hold["hold_id"], "worker-key", task_hash)
+    if received:
+        store.receive_task_hold(hold["hold_id"], "payer-key", task_hash)
+    return hold
+
+
+def test_operator_resolve_pay_refused_frozen_but_refund_allowed(tmp_path):
+    clock = [1_750_000]
+    frozen = lambda keyid: keyid == "worker-key"
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("funding", "payer", 300, 1)
+        total = _total(store)
+        pay = _submitted(store, clock, "resolve-pay", "6" * 64)
+        refund = _submitted(store, clock, "resolve-refund", "7" * 64)
+        for hold in (pay, refund):
+            store.dispute_task_hold(
+                hold["hold_id"], "payer-key", "quality", "n", is_frozen=frozen
+            )
+        with pytest.raises(
+            SpendConflict, match="worker is suspended; settlement is frozen"
+        ):
+            store.resolve_task_hold(pay["hold_id"], "pay", "ok", is_frozen=frozen)
+        assert store.task_hold_status(pay["hold_id"])["state"] == "disputed"
+        assert store.balance("worker") == 0
+        resolved = store.resolve_task_hold(
+            refund["hold_id"], "refund", "fraud", is_frozen=frozen
+        )
+        assert resolved["state"] == "refunded"
+        assert store.balance("payer") == 200
+        # Unsuspended, the same disputed hold can be paid.
+        assert store.resolve_task_hold(pay["hold_id"], "pay", "ok")["state"] == "paid"
+        assert _total(store) == total
+
+
+def test_operator_task_resolve_service_enforces_suspension(tmp_path, identities):
+    clock = [1_900_000]
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite",
+        identities["roster"],
+        clock=lambda: clock[0],
+        start_sweeper=False,
+    )
+    try:
+        service.store.deposit("funding", "payer", 300, 1)
+        roster = service.rosters.snapshot()
+        payer = identities["payer"]["public"]
+        worker = identities["worker"]["public"]
+        ids = []
+        for nonce, th in (("operator-pay", "8"), ("operator-refund", "9")):
+            hold = service.authorize_task_hold(
+                _task_body(
+                    identities, clock[0], client_nonce=nonce, task_hash=th * 64,
+                ),
+                payer,
+                roster,
+            )
+            service.submit_task_hold(
+                {"hold_id": hold["hold_id"], "result_hash": th * 64}, worker, roster
+            )
+            service.dispute_task_hold(
+                {"hold_id": hold["hold_id"], "reason": "q", "note": "n"}, payer, roster
+            )
+            ids.append(hold["hold_id"])
+        suspended = {key: dict(row) for key, row in roster.items()}
+        suspended[worker]["tier"] = "suspended"
+        operator = identities["operator"]["public"]
+
+        with pytest.raises(
+            SpendConflict, match="worker is suspended; settlement is frozen"
+        ):
+            service.resolve_task_hold(
+                {"hold_id": ids[0], "outcome": "pay", "reason": "ok"},
+                operator,
+                suspended,
+            )
+        assert service.store.task_hold_status(ids[0])["state"] == "disputed"
+        resolved = service.resolve_task_hold(
+            {"hold_id": ids[1], "outcome": "refund", "reason": "bad"},
+            operator,
+            suspended,
+        )
+        assert resolved["state"] == "refunded"
+    finally:
+        service.close()
+
+
+def test_backstop_pay_to_suspended_worker_defers_then_pays_after_unsuspend(tmp_path):
+    clock = [1_800_000]
+    frozen = [True]
+    is_frozen = lambda keyid: frozen[0] and keyid == "worker-key"
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("funding", "payer", 200, 1)
+        total = _total(store)
+        delivered = _submitted(store, clock, "bk-delivered", "3" * 64)
+        missing = _submitted(store, clock, "bk-missing", "4" * 64, received=False)
+        for hold in (delivered, missing):
+            store.dispute_task_hold(
+                hold["hold_id"], "payer-key", "review", "x", is_frozen=is_frozen
+            )
+        cutoff = delivered["deadline"] + TASK_DISPUTE_BACKSTOP_S
+        clock[0] = cutoff
+        # Delivered: deferred, not refunded.  Undelivered: refund to payer.
+        assert store.expire_spend_holds(is_frozen=is_frozen) == [missing["hold_id"]]
+        assert store.task_hold_status(delivered["hold_id"])["state"] == "disputed"
+        assert store.task_hold_status(missing["hold_id"])["state"] == "refunded"
+        assert store.balance("worker") == 0
+        # Retried on the next sweep, still frozen.
+        assert store.expire_spend_holds(is_frozen=is_frozen) == []
+        assert store.task_hold_status(delivered["hold_id"])["state"] == "disputed"
+        frozen[0] = False
+        assert store.expire_spend_holds(is_frozen=is_frozen) == [delivered["hold_id"]]
+        assert store.task_hold_status(delivered["hold_id"])["state"] == "paid"
+        assert (store.balance("worker"), _total(store)) == (100, total)
+
+
+def test_silence_pay_of_submitted_open_hold_defers_for_suspended_worker(tmp_path):
+    clock = [1_850_000]
+    frozen = [True]
+    is_frozen = lambda keyid: frozen[0] and keyid == "worker-key"
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("funding", "payer", 100, 1)
+        hold = _submitted(store, clock, "silence-frozen", "5" * 64)
+        clock[0] = hold["deadline"] + TASK_REFUND_GRACE_S
+        assert store.expire_spend_holds(is_frozen=is_frozen) == []
+        assert store.task_hold_status(hold["hold_id"])["state"] == "open"
+        assert store.balance("payer") == 0 and store.balance("worker") == 0
+        frozen[0] = False
+        assert store.expire_spend_holds(is_frozen=is_frozen) == [hold["hold_id"]]
+        assert store.task_hold_status(hold["hold_id"])["state"] == "paid"
+
+
+def test_dispute_works_while_worker_suspended_even_after_deferred_silence_pay(
+    tmp_path,
+):
+    clock = [1_870_000]
+    frozen = lambda keyid: keyid == "worker-key"
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("funding", "payer", 200, 1)
+        early = _submitted(store, clock, "dispute-early", "a" * 64)
+        late = _submitted(store, clock, "dispute-late", "b" * 64)
+        d = store.dispute_task_hold(
+            early["hold_id"], "payer-key", "quality", "n", is_frozen=frozen
+        )
+        assert d["state"] == "disputed"
+        clock[0] = late["deadline"] + TASK_REFUND_GRACE_S
+        d = store.dispute_task_hold(
+            late["hold_id"], "payer-key", "quality", "n", is_frozen=frozen
+        )
+        assert d["state"] == "disputed"
+        assert store.balance("worker") == 0
+
+
+def test_suspended_payer_routes_denied_and_its_holds_follow_sweep_rules(
+    tmp_path, identities, monkeypatch
+):
+    clock = [1_880_000]
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite", identities["roster"],
+        clock=lambda: clock[0], start_sweeper=False,
+    )
+    try:
+        service.store.deposit("funding", "payer", 200, 1)
+        roster = service.rosters.snapshot()
+        payer = identities["payer"]["public"]
+        hold = service.authorize_task_hold(
+            _task_body(identities, clock[0], client_nonce="sp", task_hash="c" * 64),
+            payer, roster,
+        )
+        # Suspend the payer's operator rows in the roster file.
+        text = identities["roster"].read_text()
+        identities["roster"].write_text(
+            text.replace("\ttrusted\t", "\tsuspended\t")
+        )
+        service.rosters.refresh_seconds = 0
+        monkeypatch.setenv("NAK_SPEND_ROUTES", "on")
+        with _running(service) as base:
+            for path, body in (
+                ("/spend/task/pay", {"hold_id": hold["hold_id"]}),
+                ("/spend/task/refund", {"hold_id": hold["hold_id"], "reason": "r"}),
+                ("/spend/task/dispute",
+                 {"hold_id": hold["hold_id"], "reason": "r", "note": "n"}),
+            ):
+                code, _ = _request(base, "POST", path, identities["payer"], body)
+                assert code in (401, 403), (path, code)
+        # Unsubmitted hold expires: refund may credit the frozen payer balance.
+        clock[0] = hold["deadline"] + TASK_REFUND_GRACE_S
+        service._sweep_spend_holds_once()
+        assert service.store.task_hold_status(hold["hold_id"])["state"] == "refunded"
+        assert service.store.balance("payer") == 200
+    finally:
+        service.close()
+
+
 def test_party_scope_hides_holds_and_worker_is_read_only(tmp_path):
     clock = [2_000_000]
     with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:

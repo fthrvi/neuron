@@ -20,7 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Collection, Iterable, Mapping
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -64,6 +64,10 @@ TASK_DEADLINE_MIN_S = 60
 TASK_DEADLINE_MAX_S = 30 * 24 * 60 * 60
 TASK_REFUND_GRACE_S = 24 * 60 * 60
 TASK_DISPUTE_BACKSTOP_S = 14 * 24 * 60 * 60
+
+
+def _never_frozen(_keyid: str) -> bool:
+    return False
 
 SPEND_USAGE_FIELDS = frozenset(
     {
@@ -1606,7 +1610,10 @@ class LedgerStore:
         expected_state: str = "open",
         detail_extra: Mapping[str, Any] | None = None,
         resolution_reason: str | None = None,
+        is_frozen: Callable[[str], bool] = _never_frozen,
     ) -> bool:
+        if is_frozen(str(hold["worker_keyid"])):
+            raise SpendConflict("worker is suspended; settlement is frozen")
         hold_id = str(hold["hold_id"])
         if resolution_reason is None:
             updated = db.execute(
@@ -1707,7 +1714,12 @@ class LedgerStore:
 
     @classmethod
     def _advance_task_hold_in(
-        cls, db: sqlite3.Connection, hold_id: str, now: int
+        cls,
+        db: sqlite3.Connection,
+        hold_id: str,
+        now: int,
+        *,
+        is_frozen: Callable[[str], bool] = _never_frozen,
     ) -> bool:
         hold = db.execute(
             "SELECT * "
@@ -1727,11 +1739,14 @@ class LedgerStore:
                 and int(hold["received_at"]) > 0
                 and hold["result_hash"] == hold["received_hash"]
             )
-            return (
-                cls._pay_task_hold_in(db, hold, now, paid_by_silence=True)
-                if silence_pay
-                else cls._refund_task_hold_in(db, hold, now, "expired")
-            )
+            if silence_pay:
+                if is_frozen(str(hold["worker_keyid"])):
+                    # Frozen: deferred until unsuspend (hold stays open).
+                    return False
+                return cls._pay_task_hold_in(
+                    db, hold, now, paid_by_silence=True, is_frozen=is_frozen
+                )
+            return cls._refund_task_hold_in(db, hold, now, "expired")
         if state != "disputed" or now < deadline + TASK_DISPUTE_BACKSTOP_S:
             return False
         delivered = (
@@ -1744,19 +1759,25 @@ class LedgerStore:
             "dispute_backstop": True,
             "dispute_reason": str(hold["dispute_reason"]),
         }
-        return (
-            cls._pay_task_hold_in(
-                db, hold, now, expected_state="disputed", detail_extra=detail
-            )
-            if delivered
-            else cls._refund_task_hold_in(
+        if delivered:
+            if is_frozen(str(hold["worker_keyid"])):
+                # Frozen: stays disputed and is retried on the next sweep.
+                return False
+            return cls._pay_task_hold_in(
                 db,
                 hold,
                 now,
-                "dispute_backstop",
                 expected_state="disputed",
                 detail_extra=detail,
+                is_frozen=is_frozen,
             )
+        return cls._refund_task_hold_in(
+            db,
+            hold,
+            now,
+            "dispute_backstop",
+            expected_state="disputed",
+            detail_extra=detail,
         )
 
     @staticmethod
@@ -2254,7 +2275,8 @@ class LedgerStore:
         tier: str,
         *,
         account_tiers: Mapping[str, str] | None = None,
-    ) -> int:
+        return_stored: bool = False,
+    ) -> int | dict[str, Any]:
         """Apply a verified receipt once and return the requester's delta.
 
         Replaying an already-settled ``receipt_id`` returns its stored delta and
@@ -2292,13 +2314,21 @@ class LedgerStore:
         now = self._now()
         delta = -charged
 
-        def operation(db: sqlite3.Connection) -> int:
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
             existing = db.execute(
-                "SELECT state, delta FROM receipts WHERE receipt_id=?", (receipt_id,)
+                "SELECT state, credited, charged, delta FROM receipts WHERE receipt_id=?",
+                (receipt_id,),
             ).fetchone()
             if existing:
                 if existing["state"] == "settled":
-                    return int(existing["delta"])
+                    stored_credited = json.loads(str(existing["credited"]))
+                    if not isinstance(stored_credited, dict):
+                        raise LedgerError("stored receipt credits are invalid")
+                    return {
+                        "credited": stored_credited,
+                        "charged": int(existing["charged"]),
+                        "delta": int(existing["delta"]),
+                    }
                 raise ReceiptStateError(
                     f"receipt {receipt_id!r} is {existing['state']} and cannot be settled"
                 )
@@ -2361,9 +2391,14 @@ class LedgerStore:
                     "VALUES (?, 'spend', ?, ?, ?, ?)",
                     (now, receipt_id, requester, -charged, json.dumps({"tier": tier})),
                 )
-            return delta
+            return {
+                "credited": clean_credits,
+                "charged": charged,
+                "delta": delta,
+            }
 
-        return self._tx(operation)
+        stored = self._tx(operation)
+        return stored if return_stored else int(stored["delta"])
 
     def deposit(self, ref: str, operator: str, credits: int, slot: int) -> int:
         """Credit one finalized chain deposit exactly once and return its credits."""
@@ -2978,19 +3013,34 @@ class LedgerStore:
 
         return self._tx(operation)
 
-    def withdrawals(self, *states: str, limit: int = 100) -> list[dict[str, Any]]:
+    def withdrawals(
+        self,
+        *states: str,
+        limit: int = 100,
+        exclude_operators: Collection[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Return payout rows for the requested states, oldest first."""
         allowed = {"pending", "approved", "sent", "finalized", "released", "expired"}
         if not states or any(state not in allowed for state in states):
             raise LedgerValueError("one or more valid withdrawal states are required")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise LedgerValueError("limit must be a positive integer")
+        excluded = sorted(
+            {_identifier(operator, "excluded operator") for operator in exclude_operators}
+        ) if exclude_operators else []
         placeholders = ",".join("?" for _ in states)
+        exclusion = ""
+        parameters: list[Any] = list(states)
+        if excluded:
+            exclusion_placeholders = ",".join("?" for _ in excluded)
+            exclusion = f" AND operator NOT IN ({exclusion_placeholders})"
+            parameters.extend(excluded)
+        parameters.append(limit)
         with self._lock:
             rows = self._db.execute(
                 f"SELECT * FROM withdrawals WHERE state IN ({placeholders}) "
-                "ORDER BY created_ts, id LIMIT ?",
-                (*states, limit),
+                f"{exclusion} ORDER BY created_ts, id LIMIT ?",
+                parameters,
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -3540,6 +3590,7 @@ class LedgerStore:
         amount: int,
         deadline: int,
         hold_id: str | None = None,
+        is_frozen: Callable[[str], bool] = _never_frozen,
     ) -> dict[str, Any]:
         """Reserve a fixed task reward in a dedicated spend hold."""
         payer_keyid = _identifier(payer_keyid, "payer_keyid")
@@ -3587,7 +3638,9 @@ class LedgerStore:
                         "client_nonce already authorizes a different task hold"
                     )
                 existing_id = str(existing["hold_id"])
-                self._advance_task_hold_in(db, existing_id, self._now())
+                self._advance_task_hold_in(
+                    db, existing_id, self._now(), is_frozen=is_frozen
+                )
                 self._assert_task_hold_in(db, existing_id)
                 return self._task_status_in(db, existing_id)
 
@@ -3664,7 +3717,13 @@ class LedgerStore:
 
         return self._tx(operation)
 
-    def pay_task_hold(self, hold_id: str, payer_keyid: str) -> dict[str, Any]:
+    def pay_task_hold(
+        self,
+        hold_id: str,
+        payer_keyid: str,
+        *,
+        is_frozen: Callable[[str], bool] = _never_frozen,
+    ) -> dict[str, Any]:
         """Atomically move one open fixed reward to its named worker."""
         hold_id = _identifier(hold_id, "hold_id")
         payer_keyid = _identifier(payer_keyid, "payer_keyid")
@@ -3677,7 +3736,9 @@ class LedgerStore:
             if scoped is None:
                 raise SpendNotFound("spend hold not found")
             now = self._now()
-            advanced = self._advance_task_hold_in(db, hold_id, now)
+            advanced = self._advance_task_hold_in(
+                db, hold_id, now, is_frozen=is_frozen
+            )
             hold = db.execute(
                 "SELECT * FROM task_holds WHERE hold_id=?", (hold_id,)
             ).fetchone()
@@ -3687,7 +3748,7 @@ class LedgerStore:
                 return result
             if hold["state"] != "open":
                 raise SpendStateError(f"task hold is {hold['state']}")
-            if not self._pay_task_hold_in(db, hold, now):
+            if not self._pay_task_hold_in(db, hold, now, is_frozen=is_frozen):
                 raise SpendStateError("task hold is not open")
             result = self._task_status_in(db, hold_id)
             result["replayed"] = False
@@ -3836,7 +3897,13 @@ class LedgerStore:
         return self._tx(operation)
 
     def dispute_task_hold(
-        self, hold_id: str, payer_keyid: str, reason: str, note: str
+        self,
+        hold_id: str,
+        payer_keyid: str,
+        reason: str,
+        note: str,
+        *,
+        is_frozen: Callable[[str], bool] = _never_frozen,
     ) -> dict[str, Any]:
         """Lock a submitted reward for operator adjudication."""
         hold_id = _identifier(hold_id, "hold_id")
@@ -3861,9 +3928,16 @@ class LedgerStore:
                 # A dispute must not outrun the sweep: settle anything already
                 # due (silence-pay / expiry) first.  The settlement has to
                 # commit, so signal the refusal after the transaction.
-                if self._advance_task_hold_in(db, hold_id, now):
+                if self._advance_task_hold_in(
+                    db, hold_id, now, is_frozen=is_frozen
+                ):
                     return None
-                if now >= int(hold["deadline"]) + TASK_REFUND_GRACE_S:
+                if now >= int(hold["deadline"]) + TASK_REFUND_GRACE_S and not (
+                    # A silence-pay deferred by the freeze leaves the hold
+                    # open; the active payer may still dispute it.
+                    is_frozen(str(hold["worker_keyid"]))
+                    and int(hold["submitted_at"]) > 0
+                ):
                     raise SpendStateError("task hold is not open")
             if hold["disputed_at"] is not None:
                 if hold["dispute_reason"] != reason or hold["dispute_note"] != note:
@@ -3896,7 +3970,12 @@ class LedgerStore:
         return outcome
 
     def resolve_task_hold(
-        self, hold_id: str, outcome: str, reason: str
+        self,
+        hold_id: str,
+        outcome: str,
+        reason: str,
+        *,
+        is_frozen: Callable[[str], bool] = _never_frozen,
     ) -> dict[str, Any]:
         """Resolve a disputed reward after service-boundary operator auth."""
         hold_id = _identifier(hold_id, "hold_id")
@@ -3939,6 +4018,7 @@ class LedgerStore:
                     expected_state="disputed",
                     detail_extra=detail,
                     resolution_reason=reason,
+                    is_frozen=is_frozen,
                 )
                 if outcome == "pay"
                 else self._refund_task_hold_in(
@@ -3975,7 +4055,11 @@ class LedgerStore:
         return None if row is None else (str(row[0]), str(row[1]))
 
     def task_hold_status_scoped(
-        self, hold_id: str, caller_keyid: str
+        self,
+        hold_id: str,
+        caller_keyid: str,
+        *,
+        is_frozen: Callable[[str], bool] = _never_frozen,
     ) -> dict[str, Any]:
         hold_id = _identifier(hold_id, "hold_id")
         caller_keyid = _identifier(caller_keyid, "caller_keyid")
@@ -3988,7 +4072,9 @@ class LedgerStore:
             ).fetchone()
             if scoped is None:
                 raise SpendNotFound("spend hold not found")
-            self._advance_task_hold_in(db, hold_id, self._now())
+            self._advance_task_hold_in(
+                db, hold_id, self._now(), is_frozen=is_frozen
+            )
             return self._task_status_in(db, hold_id)
 
         return self._tx(operation)
@@ -4453,6 +4539,7 @@ class LedgerStore:
         signature: str,
         *,
         relayer_keyid: str,
+        is_frozen: Callable[[str], bool] = _never_frozen,
     ) -> dict[str, Any]:
         """Verify and settle exactly one signed, cumulative v2 worker receipt."""
         if not isinstance(receipt, Mapping):
@@ -4642,6 +4729,8 @@ class LedgerStore:
             delta = cost - old_cost
             if delta < 0:
                 raise SpendConflict("cumulative cost regressed")
+            if delta and is_frozen(worker_keyid):
+                raise SpendConflict("worker is suspended; settlement is frozen")
             worker_account = str(entry["worker_account_at_authorize"])
             if delta and self._balance_in(db, str(hold["escrow_account"])) < delta:
                 raise LedgerError("spend hold is undercollateralized")
@@ -4847,6 +4936,7 @@ class LedgerStore:
         batch_size: int = SPEND_EXPIRY_BATCH_SIZE,
         *,
         cutoff: int | None = None,
+        is_frozen: Callable[[str], bool] = _never_frozen,
     ) -> SpendExpiryBatch:
         """Advance one bounded, ordered batch at a fixed cutoff."""
         if (
@@ -4895,7 +4985,9 @@ class LedgerStore:
             for hold in rows[:batch_size]:
                 hold_id = str(hold["hold_id"])
                 advanced = (
-                    self._advance_task_hold_in(db, hold_id, sweep_cutoff)
+                    self._advance_task_hold_in(
+                        db, hold_id, sweep_cutoff, is_frozen=is_frozen
+                    )
                     if hold["hold_kind"] == "task"
                     else self._advance_spend_hold_in(db, hold_id, sweep_cutoff)
                 )
@@ -4910,9 +5002,72 @@ class LedgerStore:
         return self._tx(operation)
 
     def expire_spend_holds(
-        self, batch_size: int = SPEND_EXPIRY_BATCH_SIZE
+        self,
+        batch_size: int = SPEND_EXPIRY_BATCH_SIZE,
+        *,
+        is_frozen: Callable[[str], bool] = _never_frozen,
     ) -> list[str]:
         """Sweep every due hold, committing and yielding between batches."""
+        if is_frozen is not _never_frozen:
+            if (
+                isinstance(batch_size, bool)
+                or not isinstance(batch_size, int)
+                or batch_size < 1
+            ):
+                raise LedgerValueError("batch_size must be a positive integer")
+            if batch_size > SPEND_EXPIRY_BATCH_SIZE:
+                raise LedgerValueError(
+                    f"batch_size must not exceed {SPEND_EXPIRY_BATCH_SIZE}"
+                )
+            cutoff = self._now()
+            # Snapshot identifiers once so frozen rows cannot starve later due
+            # refunds/payments. Each write transaction below remains bounded.
+            with self._lock:
+                due = self._db.execute(
+                    "SELECT hold_id, hold_kind FROM ("
+                    "SELECT hold_id, 'spend' AS hold_kind, authorized_at, "
+                    "CASE state WHEN 'open' THEN execution_deadline "
+                    "ELSE settlement_deadline END AS due_at FROM spend_holds "
+                    "WHERE (state='open' AND execution_deadline<=?) "
+                    "OR (state='closing' AND settlement_deadline<=?) "
+                    "UNION ALL "
+                    "SELECT hold_id, 'task', authorized_at, deadline + ? "
+                    "FROM task_holds WHERE (state='open' AND deadline + ?<=?) "
+                    "OR (state='disputed' AND deadline + ?<=?)"
+                    ") ORDER BY due_at, authorized_at, hold_id",
+                    (
+                        cutoff,
+                        cutoff,
+                        TASK_REFUND_GRACE_S,
+                        TASK_REFUND_GRACE_S,
+                        cutoff,
+                        TASK_DISPUTE_BACKSTOP_S,
+                        cutoff,
+                    ),
+                ).fetchall()
+            affected: list[str] = []
+            for offset in range(0, len(due), batch_size):
+                chunk = due[offset : offset + batch_size]
+
+                def operation(db: sqlite3.Connection) -> list[str]:
+                    changed: list[str] = []
+                    for hold in chunk:
+                        hold_id = str(hold["hold_id"])
+                        advanced = (
+                            self._advance_task_hold_in(
+                                db, hold_id, cutoff, is_frozen=is_frozen
+                            )
+                            if hold["hold_kind"] == "task"
+                            else self._advance_spend_hold_in(db, hold_id, cutoff)
+                        )
+                        if advanced:
+                            changed.append(hold_id)
+                    return changed
+
+                affected.extend(self._tx(operation))
+                time.sleep(0)
+            return affected
+
         affected: list[str] = []
         cutoff: int | None = None
         while True:
@@ -5218,6 +5373,25 @@ class LedgerStore:
                 "SELECT state FROM receipts WHERE receipt_id=?", (receipt_id,)
             ).fetchone()
         return str(row[0]) if row else None
+
+    def settled_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        """Return an immutable settled receipt result without recomputing it."""
+        receipt_id = _identifier(receipt_id, "receipt_id")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT state, credited, charged, delta FROM receipts WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+        if row is None or row["state"] != "settled":
+            return None
+        credited = json.loads(str(row["credited"]))
+        if not isinstance(credited, dict):
+            raise LedgerError("stored receipt credits are invalid")
+        return {
+            "credited": credited,
+            "charged": int(row["charged"]),
+            "delta": int(row["delta"]),
+        }
 
     def receipt_requester(self, receipt_id: str) -> str | None:
         """Return the immutable owner of a receipt for authorization checks."""

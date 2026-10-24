@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, ".."))
-from ledger_auth import canonical_string  # noqa: E402
+from ledger_auth import SettlementFrozen, canonical_string  # noqa: E402
 from ledger_migrate import migrate  # noqa: E402
 from core.ledger_store import LedgerStore  # noqa: E402
 from core import ledger_store as ledger_store_module  # noqa: E402
@@ -185,6 +185,7 @@ def v2_identities(tmp_path):
         ("alice_worker", "worker-alice", "alice", "known"),
         ("mallory", "stranger-node", "mallory", "stranger"),
         ("stranger_depositor", "deposit-node", "stranger-depositor", "stranger"),
+        ("suspended", "suspended-node", "suspended-operator", "suspended"),
         ("operator", "operator-node", "ledger-operator", "self"),
     ):
         private, public = _v2_keypair()
@@ -388,6 +389,90 @@ def test_v2_valid_receipt_settles_and_replay_is_idempotent(
     assert service.store.balance("carol") == 20
 
 
+def test_v2_suspended_participant_freezes_receipt_without_storing_it(
+    v2_server, v2_identities, timestamps
+):
+    base, service = v2_server
+    receipt = _sign_receipt(_v2_receipt(), v2_identities)
+    bob = v2_identities["bob"]["public"]
+    with service.rosters._lock:
+        normal = {key: dict(row) for key, row in service.rosters._roster.items()}
+        suspended = {key: dict(row) for key, row in normal.items()}
+        suspended[bob]["tier"] = "suspended"
+        service.rosters._roster = suspended
+
+    assert _v2_request(
+        base,
+        "POST",
+        "/settle",
+        v2_identities["alice"],
+        {"receipt": receipt},
+        timestamp=timestamps.next(),
+    ) == (409, {"error": "a participant is suspended; settlement is frozen"})
+    assert service.store._db.execute(
+        "SELECT COUNT(*) FROM receipts"
+    ).fetchone()[0] == 0
+
+    with service.rosters._lock:
+        service.rosters._roster = normal
+    code, result = _v2_request(
+        base,
+        "POST",
+        "/settle",
+        v2_identities["alice"],
+        {"receipt": receipt},
+        timestamp=timestamps.next(),
+    )
+    assert code == 200
+    assert result["credited"] == {"bob": 20, "carol": 20}
+    assert result["charged"] == 40
+
+
+def test_legacy_receipt_waits_for_unsuspend_then_replays_stored_values(
+    tmp_path, v2_identities
+):
+    service = V2LedgerService(
+        tmp_path / "ledger.sqlite", v2_identities["roster"], start_sweeper=False
+    )
+    try:
+        receipt = _sign_receipt(_v2_receipt(), v2_identities)
+        requester = v2_identities["alice"]["public"]
+        bob = v2_identities["bob"]["public"]
+        roster = service.rosters.snapshot()
+        suspended = {key: dict(row) for key, row in roster.items()}
+        suspended[bob]["tier"] = "suspended"
+
+        with pytest.raises(
+            SettlementFrozen,
+            match="a participant is suspended; settlement is frozen",
+        ):
+            service.settle({"receipt": receipt}, requester, suspended)
+        assert service.store._db.execute(
+            "SELECT COUNT(*) FROM receipts"
+        ).fetchone()[0] == 0
+        assert all(
+            service.store.balance(account) == 0
+            for account in ("alice", "bob", "carol")
+        )
+
+        first = service.settle({"receipt": receipt}, requester, roster)
+        balances = {
+            account: service.store.balance(account)
+            for account in ("alice", "bob", "carol")
+        }
+        replay = service.settle({"receipt": receipt}, requester, suspended)
+
+        assert replay == first
+        assert first["credited"] == {"bob": 20, "carol": 20}
+        assert first["charged"] == 40
+        assert {
+            account: service.store.balance(account)
+            for account in ("alice", "bob", "carol")
+        } == balances
+    finally:
+        service.close()
+
+
 def test_v2_settle_creates_credited_accounts_with_roster_tiers(
     v2_server, v2_identities, timestamps
 ):
@@ -411,6 +496,8 @@ def test_operator_tiers_uses_highest_roster_tier():
         "key-1": {"operator": "worker", "tier": "known"},
         "key-2": {"operator": "worker", "tier": "trusted"},
         "key-3": {"operator": "other", "tier": "unexpected"},
+        "key-4": {"operator": "suspended-only", "tier": "suspended"},
+        "key-5": {"operator": "worker", "tier": "suspended"},
     }
     assert _operator_tiers(roster) == {"worker": "trusted", "other": "stranger"}
 
@@ -483,6 +570,30 @@ def test_v2_transfer_source_is_always_signers_operator(
     assert service.store.balance("alice") == -1
     assert service.store.balance("bob") == 0
     assert service.store.balance("mallory") == 1
+
+
+def test_v2_transfer_to_suspended_operator_is_frozen(
+    v2_server, v2_identities, timestamps
+):
+    base, service = v2_server
+    bob = v2_identities["bob"]["public"]
+    with service.rosters._lock:
+        suspended = {
+            key: dict(row) for key, row in service.rosters._roster.items()
+        }
+        suspended[bob]["tier"] = "suspended"
+        service.rosters._roster = suspended
+
+    assert _v2_request(
+        base,
+        "POST",
+        "/transfer",
+        v2_identities["alice"],
+        {"to": "bob", "amount": 1},
+        timestamp=timestamps.next(),
+    ) == (409, {"error": "recipient is suspended; transfers are frozen"})
+    assert service.store.balance("alice") == 0
+    assert service.store.balance("bob") == 0
 
 
 def test_v2_dispute_by_stranger_is_refused(v2_server, v2_identities, timestamps):
@@ -601,6 +712,73 @@ def test_wallet_is_queued_and_all_gets_answer_only_for_signer(
 def test_row_identity_refuses_reserved_operator():
     with pytest.raises(PermissionError, match="reserved"):
         _row_identity("key", {"key": {"operator": "treasury", "tier": "self"}})
+
+
+def test_suspended_signer_gets_403_on_balance_withdraw_and_task_authorize(
+    v2_server, v2_identities, timestamps, monkeypatch
+):
+    monkeypatch.setenv("NAK_FUNDS_ROUTES", "on")
+    monkeypatch.setenv("NAK_SPEND_ROUTES", "on")
+    base, _ = v2_server
+    suspended = v2_identities["suspended"]
+    worker = v2_identities["bob"]
+
+    requests = (
+        ("GET", "/balance", None),
+        ("POST", "/withdraw", {"amount": MIN_WITHDRAW_CREDITS}),
+        ("POST", "/spend/task/authorize", {
+            "client_nonce": "suspended-authorize",
+            "task_hash": "a" * 64,
+            "worker_keyid": worker["public"],
+            "amount": 1,
+            "deadline": int(time.time()) + 60,
+        }),
+    )
+    for method, path, body in requests:
+        assert _v2_request(
+            base, method, path, suspended, body, timestamp=timestamps.next()
+        ) == (403, {"error": "signing key is suspended"})
+
+
+def test_known_payer_can_refund_existing_hold_after_worker_is_suspended(
+    tmp_path, v2_identities, timestamps, monkeypatch
+):
+    monkeypatch.setenv("NAK_SPEND_ROUTES", "on")
+    roster_path = v2_identities["roster"]
+    with _running_v2(tmp_path / "suspended-refund.sqlite", roster_path) as running:
+        base, service = running
+        service.store.deposit("funding", "alice", 100, 1)
+        authorize = {
+            "client_nonce": "before-worker-suspension",
+            "task_hash": "b" * 64,
+            "worker_keyid": v2_identities["bob"]["public"],
+            "amount": 100,
+            "deadline": int(time.time()) + 60,
+        }
+        code, hold = _v2_request(
+            base, "POST", "/spend/task/authorize", v2_identities["alice"],
+            authorize, timestamp=timestamps.next(),
+        )
+        assert code == 200
+
+        rows = roster_path.read_text(encoding="utf-8").splitlines()
+        roster_path.write_text(
+            "\n".join(
+                row.replace("\tknown\t", "\tsuspended\t")
+                if row.startswith(v2_identities["bob"]["public"] + "\t") else row
+                for row in rows
+            ) + "\n",
+            encoding="utf-8",
+        )
+        service.rosters.refresh_seconds = 0
+
+        assert _v2_request(
+            base, "POST", "/spend/task/refund", v2_identities["alice"],
+            {"hold_id": hold["hold_id"], "reason": "worker suspended"},
+            timestamp=timestamps.next(),
+        )[0] == 200
+        assert service.store.task_hold_status(hold["hold_id"])["state"] == "refunded"
+        assert service.store.balance("alice") == 100
 
 
 def test_withdraw_requires_bound_cooled_address_minimum_and_one_per_day(
@@ -755,3 +933,35 @@ def test_migration_refuses_nonempty_target_without_force(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+@pytest.mark.parametrize("tier", ["Suspended", "SUSPENDED", "suspended ", " SuSpEnDeD"])
+def test_suspended_tier_case_and_whitespace_variants_get_403(
+    tmp_path, timestamps, monkeypatch, tier
+):
+    monkeypatch.setenv("NAK_FUNDS_ROUTES", "on")
+    private, public = _v2_keypair()
+    roster = tmp_path / "variant-peers.tsv"
+    # tab-delimited so trailing/leading spaces survive into the tier field
+    roster.write_text(f"{public}\tvariant-node\tvariant-op\t{tier}\ttest\n", encoding="utf-8")
+    identity = {"private": private, "public": public}
+    with _running_v2(tmp_path / "variant.sqlite", roster) as (base, _):
+        assert _v2_request(
+            base, "GET", "/balance", identity, timestamp=timestamps.next()
+        ) == (403, {"error": "signing key is suspended"})
+
+
+def test_mangled_short_roster_row_is_not_admitted(tmp_path, timestamps, monkeypatch):
+    # Current behaviour: a row with fewer than 5 fields is silently skipped
+    # (the loader's `len(fields) < 5: continue`), so the key is unrostered
+    # and gets the same 401 as any unknown key -- never admitted, never a
+    # stranger-tier row.
+    monkeypatch.setenv("NAK_FUNDS_ROUTES", "on")
+    private, public = _v2_keypair()
+    roster = tmp_path / "short-peers.tsv"
+    roster.write_text(f"{public}\tshort-node\tshort-op\tsuspended\n", encoding="utf-8")
+    identity = {"private": private, "public": public}
+    with _running_v2(tmp_path / "short.sqlite", roster) as (base, _):
+        assert _v2_request(
+            base, "GET", "/balance", identity, timestamp=timestamps.next()
+        )[0] == 401

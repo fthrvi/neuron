@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 from ledger_auth import (  # noqa: E402
     InMemoryNonceStore,
     ReceiptError,
+    SettlementFrozen,
     canonical_string,
     load_roster,
     verify_envelope,
@@ -279,6 +280,86 @@ def test_roster_loader_skips_comments_blank_and_short_rows(tmp_path):
     }
     assert roster[second_pub]["tier"] == "stranger"
     assert roster[second_pub]["coord"] is None
+
+
+def test_roster_loader_preserves_suspended_tier(tmp_path):
+    _, suspended_pub = _keypair()
+    roster_path = tmp_path / "peers.tsv"
+    roster_path.write_text(
+        f"{suspended_pub}\tsuspended-node\talice\tsuspended\ttenant-a\n",
+        encoding="utf-8",
+    )
+
+    assert load_roster(roster_path)[suspended_pub]["tier"] == "suspended"
+
+
+@pytest.mark.parametrize("tier", ["Suspended", "SUSPENDED", "suspended ", " Suspended"])
+def test_roster_loader_normalises_suspended_variants(tmp_path, tier):
+    _, pub = _keypair()
+    roster_path = tmp_path / "peers.tsv"
+    roster_path.write_text(f"{pub}\tn\talice\t{tier}\ttenant-a\n", encoding="utf-8")
+
+    assert load_roster(roster_path)[pub]["tier"] == "suspended"
+
+
+@pytest.mark.parametrize("tier", ["SELF", "Self", "TRUSTED", "Trusted", "Known", "banned"])
+def test_roster_loader_does_not_widen_non_exact_tiers(tmp_path, tier):
+    # Only "suspended" is case-normalised; any other non-exact tier stays stranger.
+    _, pub = _keypair()
+    roster_path = tmp_path / "peers.tsv"
+    roster_path.write_text(f"{pub}\tn\talice\t{tier}\tt\n", encoding="utf-8")
+
+    assert load_roster(roster_path)[pub]["tier"] == "stranger"
+
+
+@pytest.mark.parametrize("tier", ["self", "trusted", "known", "stranger"])
+def test_roster_loader_exact_tiers_unchanged(tmp_path, tier):
+    _, pub = _keypair()
+    roster_path = tmp_path / "peers.tsv"
+    roster_path.write_text(f"{pub}\tn\talice\t{tier}\tt\n", encoding="utf-8")
+
+    assert load_roster(roster_path)[pub]["tier"] == tier
+
+
+@pytest.mark.parametrize("tier", ["suspended", "Suspended", "SUSPENDED", " suspended "])
+def test_suspended_worker_signature_freezes_whole_receipt(identities, tier):
+    _, requester_pub = identities["requester"]
+    a_private, a_pub = identities["worker_a"]
+    roster = {k: dict(v) for k, v in identities["roster"].items()}
+    roster[a_pub]["tier"] = tier
+    receipt = _receipt()
+    receipt["worker_signatures"] = [
+        _participation(a_private, a_pub, receipt, "worker-a", 0, 8)
+    ]
+    with pytest.raises(
+        SettlementFrozen,
+        match="a participant is suspended; settlement is frozen",
+    ):
+        verify_receipt(receipt, requester_pub, roster)
+
+
+def test_suspended_worker_freezes_other_valid_worker_shares_too(identities):
+    _, requester_pub = identities["requester"]
+    a_private, a_pub = identities["worker_a"]
+    b_private, b_pub = identities["worker_b"]
+    roster = {k: dict(v) for k, v in identities["roster"].items()}
+    roster[a_pub]["tier"] = "suspended"
+    receipt = _receipt()
+    receipt["worker_signatures"] = [
+        _participation(a_private, a_pub, receipt, "worker-a", 0, 8),
+        _participation(b_private, b_pub, receipt, "worker-b", 8, 24),
+    ]
+    with pytest.raises(SettlementFrozen):
+        verify_receipt(receipt, requester_pub, roster)
+
+
+def test_roster_loader_skips_short_row_so_key_is_not_admitted(tmp_path):
+    # Documents current behaviour: <5 fields => row dropped, key unrostered.
+    _, pub = _keypair()
+    roster_path = tmp_path / "peers.tsv"
+    roster_path.write_text(f"{pub}\tn\talice\tsuspended\n", encoding="utf-8")
+
+    assert pub not in load_roster(roster_path)
 
 
 def test_roster_loader_warns_and_ignores_reserved_operators(tmp_path):

@@ -341,7 +341,9 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
                 vault_account=vault_account,
                 enabled=True,
                 kill_file=tmp_path / "sent-payout.off",
+                roster_path=tmp_path / "roster.tsv",
             )
+            payout_config.roster_path.write_text("", encoding="utf-8")
             backend = SoldersTreasuryBackend(
                 rpc,
                 mint,

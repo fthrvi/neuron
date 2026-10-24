@@ -126,6 +126,9 @@ class FakeBackend:
 
 
 def config(tmp_path, **overrides):
+    roster = tmp_path / "roster.tsv"
+    if not roster.exists():
+        roster.write_text("", encoding="utf-8")
     values = {
         "cluster": "localnet",
         "mint": MINT,
@@ -133,6 +136,7 @@ def config(tmp_path, **overrides):
         "vault_account": VAULT_ACCOUNT,
         "enabled": True,
         "kill_file": tmp_path / "payout.off",
+        "roster_path": roster,
     }
     values.update(overrides)
     return PayoutConfig(**values)
@@ -300,6 +304,71 @@ def test_auto_cap_day_cap_and_injected_presence(tmp_path):
         assert row(store, "first")["approval_ref"] == "auto:devnet-caps-v1"
         assert row(store, "second")["approval_ref"] == "human:approved-second"
         assert [call[0] for call in presence_calls] == ["second"]
+
+
+def test_suspended_account_withdrawal_stays_pending_until_unsuspended(
+    tmp_path, caplog
+):
+    roster = tmp_path / "roster.tsv"
+    roster.write_text("key-a\tnode-a\talice\tsuspended\ttest\n", encoding="utf-8")
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    with LedgerStore(tmp_path / "ledger.sqlite") as store:
+        held(store, credits(1))
+        engine = PayoutEngine(
+            store,
+            rpc,
+            config(tmp_path, roster_path=roster),
+            backend=backend,
+        )
+        with caplog.at_level("INFO", logger="nak-treasury"):
+            assert engine.poll_once() == 0
+        assert row(store)["state"] == "pending"
+        assert backend.builds == []
+        assert sum(
+            "withdrawal-1 is frozen" in record.getMessage()
+            for record in caplog.records
+        ) == 1
+
+        roster.write_text("key-a\tnode-a\talice\tknown\ttest\n", encoding="utf-8")
+        assert engine.poll_once() == 2
+        assert row(store)["state"] == "sent"
+        assert len(backend.builds) == 1
+
+
+def test_more_than_one_page_of_frozen_withdrawals_cannot_starve_normal_one(
+    tmp_path,
+):
+    roster = tmp_path / "roster.tsv"
+    roster.write_text(
+        "key-frozen\tnode-frozen\tfrozen\tsuspended\ttest\n",
+        encoding="utf-8",
+    )
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    with LedgerStore(tmp_path / "ledger.sqlite") as store:
+        for index in range(101):
+            held(
+                store,
+                credits(1),
+                f"frozen-{index:03d}",
+                "frozen",
+            )
+        held(store, credits(1), "zz-normal", "normal")
+        engine = PayoutEngine(
+            store,
+            rpc,
+            config(tmp_path, roster_path=roster),
+            backend=backend,
+        )
+
+        assert engine.poll_once() == 2
+        assert row(store, "zz-normal")["state"] == "sent"
+        assert all(
+            row(store, f"frozen-{index:03d}")["state"] == "pending"
+            for index in range(101)
+        )
+        assert len(backend.builds) == 1
 
 
 def test_two_unanswered_presence_requests_release_hold(tmp_path):

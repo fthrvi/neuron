@@ -67,6 +67,8 @@ from core.ledger_store import (  # noqa: E402
 from ledger_auth import (  # noqa: E402
     TIER_RANK,
     ReceiptError,
+    SettlementFrozen,
+    is_suspended_tier,
     load_roster,
     verify_envelope,
     verify_receipt,
@@ -243,18 +245,31 @@ class RosterCache:
         self.path = Path(path)
         self.refresh_seconds = refresh_seconds
         self._lock = threading.Lock()
-        self._roster = load_roster(self.path)
-        self._loaded_at = time.monotonic()
+        self._roster: dict[str, dict[str, str | None]] | None = None
+        self._loaded_at = float("-inf")
+        try:
+            self._roster = load_roster(self.path)
+            self._loaded_at = time.monotonic()
+        except (OSError, UnicodeError):
+            # Authentication remains fail-closed because snapshot() retries and
+            # propagates the read error.  The sweeper can still refund from a
+            # store opened before the first usable roster snapshot.
+            pass
 
     def snapshot(self) -> dict[str, dict[str, str | None]]:
         with self._lock:
             now = time.monotonic()
-            if now - self._loaded_at >= self.refresh_seconds:
+            if self._roster is None or now - self._loaded_at >= self.refresh_seconds:
                 # Fail closed if the roster cannot be refreshed.  In particular,
                 # do not continue accepting a key that may have been revoked.
-                self._roster = load_roster(self.path)
+                refreshed = load_roster(self.path)
+                self._roster = refreshed
                 self._loaded_at = now
             return dict(self._roster)
+
+    def last_successful_snapshot(self) -> dict[str, dict[str, str | None]] | None:
+        with self._lock:
+            return None if self._roster is None else dict(self._roster)
 
 
 def _row_identity(
@@ -265,6 +280,8 @@ def _row_identity(
         raise PermissionError("signing key is not rostered")
     operator = row.get("operator")
     tier = row.get("tier")
+    if tier == "suspended":
+        raise PermissionError("signing key is suspended")
     if not isinstance(operator, str) or not operator:
         raise PermissionError("signing key has no roster operator")
     if is_reserved(operator):
@@ -283,10 +300,34 @@ def _operator_tiers(
         if not isinstance(operator, str) or not operator:
             continue
         tier = row.get("tier")
+        if tier == "suspended":
+            continue
         normalized = tier if isinstance(tier, str) and tier in TIER_RANK else "stranger"
         if TIER_RANK[normalized] > TIER_RANK.get(tiers.get(operator, ""), -1):
             tiers[operator] = normalized
     return tiers
+
+
+def _frozen_predicate(
+    roster: Mapping[str, Mapping[str, object]],
+) -> Callable[[str], bool]:
+    def is_frozen(keyid: str) -> bool:
+        row = roster.get(keyid)
+        return isinstance(row, Mapping) and is_suspended_tier(row.get("tier"))
+
+    return is_frozen
+
+
+def _frozen_operators(
+    roster: Mapping[str, Mapping[str, object]],
+) -> set[str]:
+    return {
+        str(row["operator"])
+        for row in roster.values()
+        if isinstance(row, Mapping)
+        and isinstance(row.get("operator"), str)
+        and is_suspended_tier(row.get("tier"))
+    }
 
 
 def _query_integer(value: str, name: str, *, low: int, high: int) -> int:
@@ -487,13 +528,32 @@ class V2LedgerService:
 
     def _sweep_spend_holds(self) -> None:
         while not self._sweep_stop.wait(self._sweep_interval):
-            try:
-                self.store.expire_spend_holds(SPEND_EXPIRY_BATCH_SIZE)
-                self._sweep_error = None
-            except Exception as exc:
-                # The readiness result goes false; the daemon stays alive so a
-                # transient SQLite failure can recover on the next bounded tick.
-                self._sweep_error = type(exc).__name__
+            self._sweep_spend_holds_once()
+
+    def _sweep_spend_holds_once(self) -> None:
+        roster_error: str | None = None
+        try:
+            roster = self.rosters.snapshot()
+        except Exception as exc:
+            roster_error = type(exc).__name__
+            roster = self.rosters.last_successful_snapshot()
+        is_frozen = (
+            (lambda _keyid: True)
+            if roster is None
+            else _frozen_predicate(roster)
+        )
+        try:
+            self.store.expire_spend_holds(
+                SPEND_EXPIRY_BATCH_SIZE,
+                is_frozen=is_frozen,
+            )
+            # A stale/absent roster keeps readiness false even though safe
+            # refund processing continues.
+            self._sweep_error = roster_error
+        except Exception as exc:
+            # The readiness result goes false; the daemon stays alive so a
+            # transient SQLite failure can recover on the next bounded tick.
+            self._sweep_error = type(exc).__name__
 
     @staticmethod
     def _status_response(status: Mapping[str, object]) -> dict[str, object]:
@@ -735,7 +795,10 @@ class V2LedgerService:
         ):
             raise LedgerValueError("signature must be 64-byte lowercase hex")
         status = self.store.settle_spend_usage(
-            receipt, signature, relayer_keyid=keyid
+            receipt,
+            signature,
+            relayer_keyid=keyid,
+            is_frozen=_frozen_predicate(roster),
         )
         worker = next(
             entry for entry in status["workers"]
@@ -841,6 +904,7 @@ class V2LedgerService:
             worker_account=worker_account,
             amount=amount,
             deadline=deadline,
+            is_frozen=_frozen_predicate(roster),
         )
         return self._task_hold_response(status)
 
@@ -853,7 +917,9 @@ class V2LedgerService:
         _row_identity(keyid, roster)
         request = _strict_fields(body, {"hold_id"}, name="task pay")
         hold_id = _bounded_text(request["hold_id"], "hold_id")
-        status = self.store.pay_task_hold(hold_id, keyid)
+        status = self.store.pay_task_hold(
+            hold_id, keyid, is_frozen=_frozen_predicate(roster)
+        )
         return self._task_hold_response(status, replayed=bool(status["replayed"]))
 
     def submit_task_hold(
@@ -933,7 +999,7 @@ class V2LedgerService:
         reason = _bounded_text(request["reason"], "reason", maximum=64)
         note = _bounded_note(request["note"])
         status = self.store.dispute_task_hold(
-            hold_id, keyid, reason, note
+            hold_id, keyid, reason, note, is_frozen=_frozen_predicate(roster)
         )
         return self._task_hold_response(status, replayed=bool(status["replayed"]))
 
@@ -956,7 +1022,9 @@ class V2LedgerService:
         party = self.store.task_hold_parties(hold_id)
         if party is not None and keyid in party:
             raise PermissionError("a party to the dispute may not resolve it")
-        status = self.store.resolve_task_hold(hold_id, outcome, reason)
+        status = self.store.resolve_task_hold(
+            hold_id, outcome, reason, is_frozen=_frozen_predicate(roster)
+        )
         return self._task_hold_response(status, replayed=bool(status["replayed"]))
 
     def task_hold_status(
@@ -967,7 +1035,9 @@ class V2LedgerService:
     ) -> dict[str, object]:
         _row_identity(keyid, roster)
         hold_id = _bounded_text(hold_id, "hold_id")
-        status = self.store.task_hold_status_scoped(hold_id, keyid)
+        status = self.store.task_hold_status_scoped(
+            hold_id, keyid, is_frozen=_frozen_predicate(roster)
+        )
         return {
             "v": 1,
             "hold_id": status["hold_id"],
@@ -1116,17 +1186,39 @@ class V2LedgerService:
         ):
             raise ReceiptError("legacy settle body must contain exactly receipt")
         requester, tier = _row_identity(keyid, roster)
-        receipt_id, credited, charged = verify_receipt(body["receipt"], keyid, roster)
-        delta = self.store.settle(
+        try:
+            receipt_id, credited, charged = verify_receipt(
+                body["receipt"], keyid, roster
+            )
+        except SettlementFrozen as exc:
+            # Replays are historical reads: roster changes must not alter the
+            # result already committed for this receipt.
+            stored = (
+                self.store.settled_receipt(exc.receipt_id)
+                if exc.receipt_id is not None
+                else None
+            )
+            if stored is None:
+                raise
+            return {
+                "receipt_id": exc.receipt_id,
+                "requester": requester,
+                "credited": stored["credited"],
+                "charged": stored["charged"],
+                "delta": stored["delta"],
+            }
+        stored = self.store.settle(
             receipt_id, requester, credited, charged, tier,
             account_tiers=_operator_tiers(roster),
+            return_stored=True,
         )
+        assert isinstance(stored, dict)
         return {
             "receipt_id": receipt_id,
             "requester": requester,
-            "credited": credited,
-            "charged": charged,
-            "delta": delta,
+            "credited": stored["credited"],
+            "charged": stored["charged"],
+            "delta": stored["delta"],
         }
 
     def transfer(
@@ -1140,6 +1232,8 @@ class V2LedgerService:
         src, tier = _row_identity(keyid, roster)
         dst = body.get("to", body.get("dst"))
         amount = body.get("amount")
+        if isinstance(dst, str) and dst in _frozen_operators(roster):
+            raise SpendConflict("recipient is suspended; transfers are frozen")
         moved = self.store.transfer(src, dst, amount, tier)
         return {
             "from": src,
@@ -1491,6 +1585,8 @@ def _make_v2_handler(svc: V2LedgerService):
                     payload["state"] = exc.state
                 self._send(code, payload)
             except ReceiptStateError as exc:
+                self._send(409, {"error": str(exc)})
+            except SettlementFrozen as exc:
                 self._send(409, {"error": str(exc)})
             except PermissionError as exc:
                 self._send(403, {"error": str(exc)})
