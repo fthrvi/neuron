@@ -59,6 +59,7 @@ from core.ledger_store import (  # noqa: E402
     SpendNotFound,
     SpendStateError,
     TaskHoldNotOpen,
+    TaskSubmittedLocked,
     WithdrawalRateLimitError,
     WithdrawalTierError,
     is_reserved,
@@ -95,6 +96,8 @@ _SPEND_POST_PATHS = frozenset(
         "/spend/task/received",
         "/spend/task/pay",
         "/spend/task/refund",
+        "/spend/task/dispute",
+        "/spend/task/resolve",
         "/spend/starter",
     }
 )
@@ -349,6 +352,18 @@ def _bounded_text(value: object, name: str, *, maximum: int = MAX_SPEND_IDENTIFI
         raise LedgerValueError(f"{name} exceeds {maximum} bytes")
     if any(ord(char) < 0x20 or ord(char) == 0x7f for char in value):
         raise LedgerValueError(f"{name} contains a control character")
+    return value
+
+
+def _bounded_note(value: object, name: str = "note", *, maximum: int = 280) -> str:
+    if not isinstance(value, str):
+        raise LedgerValueError(f"{name} must be a string")
+    if len(value) > maximum:
+        raise LedgerValueError(f"{name} exceeds {maximum} characters")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise LedgerValueError(f"{name} must be valid UTF-8") from exc
     return value
 
 
@@ -904,6 +919,42 @@ class V2LedgerService:
         status = self.store.refund_task_hold(hold_id, keyid, reason)
         return self._task_hold_response(status, replayed=bool(status["replayed"]))
 
+    def dispute_task_hold(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _row_identity(keyid, roster)
+        request = _strict_fields(
+            body, {"hold_id", "reason", "note"}, name="task dispute"
+        )
+        hold_id = _bounded_text(request["hold_id"], "hold_id")
+        reason = _bounded_text(request["reason"], "reason", maximum=64)
+        note = _bounded_note(request["note"])
+        status = self.store.dispute_task_hold(
+            hold_id, keyid, reason, note
+        )
+        return self._task_hold_response(status, replayed=bool(status["replayed"]))
+
+    def resolve_task_hold(
+        self,
+        body: object,
+        keyid: str,
+        roster: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        _operator, tier = _row_identity(keyid, roster)
+        if tier != "self":
+            raise PermissionError("only the ledger operator may resolve task disputes")
+        request = _strict_fields(
+            body, {"hold_id", "outcome", "reason"}, name="task resolve"
+        )
+        hold_id = _bounded_text(request["hold_id"], "hold_id")
+        outcome = _bounded_text(request["outcome"], "outcome", maximum=6)
+        reason = _bounded_text(request["reason"], "reason", maximum=64)
+        status = self.store.resolve_task_hold(hold_id, outcome, reason)
+        return self._task_hold_response(status, replayed=bool(status["replayed"]))
+
     def task_hold_status(
         self,
         hold_id: str,
@@ -926,6 +977,8 @@ class V2LedgerService:
             "result_hash": status["result_hash"],
             "received_at": int(status["received_at"]),
             "received_hash": status["received_hash"],
+            "dispute_reason": status["dispute_reason"],
+            "locked": bool(status["locked"]),
             "refund_after_submit": (
                 status["state"] == "refunded" and int(status["submitted_at"]) > 0
             ),
@@ -1397,6 +1450,10 @@ def _make_v2_handler(svc: V2LedgerService):
                     result = svc.pay_task_hold(body, keyid, roster)
                 elif target.path == "/spend/task/refund":
                     result = svc.refund_task_hold(body, keyid, roster)
+                elif target.path == "/spend/task/dispute":
+                    result = svc.dispute_task_hold(body, keyid, roster)
+                elif target.path == "/spend/task/resolve":
+                    result = svc.resolve_task_hold(body, keyid, roster)
                 elif target.path == "/spend/starter":
                     result = svc.grant_starter(body, keyid, roster)
                 else:
@@ -1421,6 +1478,8 @@ def _make_v2_handler(svc: V2LedgerService):
                 self._send(410, {"error": str(exc), "code": expiry})
             except SpendNotFound:
                 self._send(404, {"error": "spend hold not found"})
+            except TaskSubmittedLocked as exc:
+                self._send(409, {"error": str(exc), "code": exc.code})
             except SpendStateError as exc:
                 code = 404 if "does not exist" in str(exc) else 409
                 payload: dict[str, object] = {"error": str(exc)}

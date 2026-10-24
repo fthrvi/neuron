@@ -63,6 +63,7 @@ SPEND_RECEIPT_DOMAIN = b"nakshatra-spend-usage-receipt-v2\0"
 TASK_DEADLINE_MIN_S = 60
 TASK_DEADLINE_MAX_S = 30 * 24 * 60 * 60
 TASK_REFUND_GRACE_S = 24 * 60 * 60
+TASK_DISPUTE_BACKSTOP_S = 14 * 24 * 60 * 60
 
 SPEND_USAGE_FIELDS = frozenset(
     {
@@ -155,6 +156,18 @@ class TaskHoldNotOpen(SpendStateError):
     def __init__(self, state: str, reason: str | None = None):
         self.state = state
         super().__init__(reason or f"task hold is {state}")
+
+
+class TaskSubmittedLocked(SpendStateError):
+    """A payer tried to reclaim a reward after the worker submitted."""
+
+    code = "task_submitted_locked"
+
+    def __init__(self):
+        super().__init__(
+            "The worker has submitted. Accept to pay, or dispute; "
+            "you cannot take the reward back yourself."
+        )
 
 
 class SpendExpired(SpendStateError):
@@ -583,13 +596,19 @@ class LedgerStore:
                 deadline INTEGER NOT NULL CHECK(typeof(deadline) = 'integer'),
                 request_digest TEXT NOT NULL,
                 escrow_account TEXT NOT NULL UNIQUE,
-                state TEXT NOT NULL CHECK(state IN ('open','paid','refunded')),
+                state TEXT NOT NULL
+                    CHECK(state IN ('open','disputed','paid','refunded')),
                 submitted_at INTEGER NOT NULL DEFAULT 0
                     CHECK(typeof(submitted_at) = 'integer' AND submitted_at >= 0),
                 result_hash TEXT NOT NULL DEFAULT '',
                 received_at INTEGER NOT NULL DEFAULT 0
                     CHECK(typeof(received_at) = 'integer' AND received_at >= 0),
                 received_hash TEXT NOT NULL DEFAULT '',
+                dispute_reason TEXT,
+                dispute_note TEXT,
+                disputed_at INTEGER,
+                resolved_outcome TEXT CHECK(resolved_outcome IN ('pay','refund')),
+                resolution_reason TEXT,
                 refund_reason TEXT,
                 authorized_at INTEGER NOT NULL CHECK(typeof(authorized_at) = 'integer'),
                 terminal_at INTEGER,
@@ -597,8 +616,23 @@ class LedgerStore:
                 UNIQUE(payer_keyid, client_nonce),
                 CHECK(deadline >= authorized_at + {TASK_DEADLINE_MIN_S}),
                 CHECK(deadline <= authorized_at + {TASK_DEADLINE_MAX_S}),
-                CHECK((state = 'open') = (terminal_at IS NULL)),
-                CHECK((state = 'refunded') OR refund_reason IS NULL)
+                CHECK((state IN ('open','disputed')) = (terminal_at IS NULL)),
+                CHECK((state = 'refunded') OR refund_reason IS NULL),
+                CHECK(dispute_reason IS NULL OR
+                      (length(dispute_reason) BETWEEN 1 AND 64)),
+                CHECK(dispute_note IS NULL OR length(dispute_note) <= 280),
+                CHECK(disputed_at IS NULL OR
+                      (typeof(disputed_at) = 'integer' AND disputed_at > 0)),
+                CHECK((disputed_at IS NULL) = (dispute_reason IS NULL)),
+                CHECK((disputed_at IS NULL) = (dispute_note IS NULL)),
+                CHECK(disputed_at IS NULL OR submitted_at > 0),
+                CHECK(state != 'disputed' OR disputed_at IS NOT NULL),
+                CHECK((resolved_outcome IS NULL) = (resolution_reason IS NULL)),
+                CHECK(resolution_reason IS NULL OR
+                      (length(resolution_reason) BETWEEN 1 AND 64)),
+                CHECK(resolved_outcome IS NULL OR disputed_at IS NOT NULL),
+                CHECK(resolved_outcome != 'pay' OR state = 'paid'),
+                CHECK(resolved_outcome != 'refund' OR state = 'refunded')
             );
 
             CREATE TABLE IF NOT EXISTS task_earnings (
@@ -646,7 +680,8 @@ class LedgerStore:
             ON spend_hold_workers(worker_account_at_authorize, hold_id);
 
             CREATE UNIQUE INDEX IF NOT EXISTS task_holds_open_task
-            ON task_holds(payer_account, task_hash) WHERE state='open';
+            ON task_holds(payer_account, task_hash)
+            WHERE state IN ('open','disputed');
 
             CREATE INDEX IF NOT EXISTS task_holds_due
             ON task_holds(state, deadline, authorized_at);
@@ -763,6 +798,7 @@ class LedgerStore:
             END;
             """
         )
+        self._migrate_task_holds_for_disputes()
         self._backfill_legacy_funding_projection()
         collision = self._db.execute(
             "SELECT a.id, a.balance FROM accounts AS a "
@@ -856,6 +892,14 @@ class LedgerStore:
             DROP TRIGGER IF EXISTS spend_authorize_recovery_no_update;
             DROP TABLE IF EXISTS spend_authorize_recovery;
 
+            DROP INDEX IF EXISTS task_holds_open_task;
+            CREATE UNIQUE INDEX task_holds_open_task
+            ON task_holds(payer_account, task_hash)
+            WHERE state IN ('open','disputed');
+
+            CREATE INDEX IF NOT EXISTS task_holds_due
+            ON task_holds(state, deadline, authorized_at);
+
             DROP TRIGGER IF EXISTS spend_holds_snapshots_immutable;
             CREATE TRIGGER spend_holds_snapshots_immutable
             BEFORE UPDATE OF payer_keyid, payer_account_at_authorize,
@@ -880,6 +924,73 @@ class LedgerStore:
             WHEN NEW.request_digest IS NULL
             BEGIN
                 SELECT RAISE(ABORT, 'spend hold request digest is required');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_holds_snapshots_immutable
+            BEFORE UPDATE OF payer_keyid, payer_account, payer_tier, client_nonce,
+                task_hash, worker_keyid, worker_account, amount, deadline,
+                request_digest, escrow_account, authorized_at
+            ON task_holds
+            BEGIN
+                SELECT RAISE(ABORT, 'task hold snapshot is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_holds_no_delete
+            BEFORE DELETE ON task_holds
+            BEGIN
+                SELECT RAISE(ABORT, 'task holds are permanent');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_holds_dispute_fields_immutable
+            BEFORE UPDATE OF dispute_reason, dispute_note, disputed_at ON task_holds
+            WHEN OLD.disputed_at IS NOT NULL AND (
+                NEW.dispute_reason IS NOT OLD.dispute_reason
+                OR NEW.dispute_note IS NOT OLD.dispute_note
+                OR NEW.disputed_at IS NOT OLD.disputed_at
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'task dispute is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_holds_dispute_transition
+            BEFORE UPDATE OF dispute_reason, dispute_note, disputed_at ON task_holds
+            WHEN OLD.disputed_at IS NULL AND NOT (
+                OLD.state = 'open' AND NEW.state = 'disputed'
+                AND OLD.submitted_at > 0
+                AND NEW.disputed_at > 0
+                AND length(NEW.dispute_reason) BETWEEN 1 AND 64
+                AND NEW.dispute_note IS NOT NULL
+                AND length(NEW.dispute_note) <= 280
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid task dispute transition');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_holds_resolution_immutable
+            BEFORE UPDATE OF resolved_outcome, resolution_reason ON task_holds
+            WHEN OLD.resolved_outcome IS NOT NULL AND (
+                NEW.resolved_outcome IS NOT OLD.resolved_outcome
+                OR NEW.resolution_reason IS NOT OLD.resolution_reason
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'task dispute resolution is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS task_holds_resolution_transition
+            BEFORE UPDATE OF resolved_outcome, resolution_reason ON task_holds
+            WHEN OLD.resolved_outcome IS NULL
+                AND NEW.resolved_outcome IS NOT NULL
+                AND NOT (
+                    OLD.state = 'disputed'
+                    AND length(NEW.resolution_reason) BETWEEN 1 AND 64
+                    AND (
+                        (NEW.resolved_outcome = 'pay' AND NEW.state = 'paid')
+                        OR (NEW.resolved_outcome = 'refund'
+                            AND NEW.state = 'refunded')
+                    )
+                )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid task dispute resolution');
             END;
 
             CREATE TRIGGER IF NOT EXISTS task_holds_submission_valid_insert
@@ -1088,6 +1199,136 @@ class LedgerStore:
                 self._db.execute(
                     f"ALTER TABLE withdrawals ADD COLUMN {name} {definition}"
                 )
+
+    def _migrate_task_holds_for_disputes(self) -> None:
+        """Rebuild the task table when its state CHECK predates disputes.
+
+        SQLite cannot alter a table-level CHECK.  Foreign-key enforcement must
+        be disabled before starting the rebuild transaction; changing the
+        pragma inside a transaction is a documented no-op.
+        """
+        row = self._db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_holds'"
+        ).fetchone()
+        columns = {
+            str(info[1]) for info in self._db.execute("PRAGMA table_info(task_holds)")
+        }
+        dispute_columns = {
+            "dispute_reason", "dispute_note", "disputed_at",
+            "resolved_outcome", "resolution_reason",
+        }
+        if (
+            row is not None
+            and "'disputed'" in str(row[0])
+            and dispute_columns.issubset(columns)
+        ):
+            return
+
+        foreign_keys = int(self._db.execute("PRAGMA foreign_keys").fetchone()[0])
+        self._db.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute("DROP VIEW IF EXISTS economic_receipts")
+            self._db.execute(
+                f"""
+                CREATE TABLE task_holds_new (
+                    hold_id TEXT PRIMARY KEY,
+                    payer_keyid TEXT NOT NULL,
+                    payer_account TEXT NOT NULL,
+                    payer_tier TEXT NOT NULL,
+                    client_nonce TEXT NOT NULL,
+                    task_hash TEXT NOT NULL
+                        CHECK(length(task_hash) = 64 AND task_hash = lower(task_hash)),
+                    worker_keyid TEXT NOT NULL,
+                    worker_account TEXT NOT NULL,
+                    amount INTEGER NOT NULL
+                        CHECK(typeof(amount) = 'integer'
+                              AND amount BETWEEN 1 AND {TASK_MAX_AMOUNT}),
+                    deadline INTEGER NOT NULL CHECK(typeof(deadline) = 'integer'),
+                    request_digest TEXT NOT NULL,
+                    escrow_account TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('open','disputed','paid','refunded')),
+                    submitted_at INTEGER NOT NULL DEFAULT 0
+                        CHECK(typeof(submitted_at) = 'integer' AND submitted_at >= 0),
+                    result_hash TEXT NOT NULL DEFAULT '',
+                    received_at INTEGER NOT NULL DEFAULT 0
+                        CHECK(typeof(received_at) = 'integer' AND received_at >= 0),
+                    received_hash TEXT NOT NULL DEFAULT '',
+                    dispute_reason TEXT,
+                    dispute_note TEXT,
+                    disputed_at INTEGER,
+                    resolved_outcome TEXT CHECK(resolved_outcome IN ('pay','refund')),
+                    resolution_reason TEXT,
+                    refund_reason TEXT,
+                    authorized_at INTEGER NOT NULL
+                        CHECK(typeof(authorized_at) = 'integer'),
+                    terminal_at INTEGER,
+                    updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer'),
+                    UNIQUE(payer_keyid, client_nonce),
+                    CHECK(deadline >= authorized_at + {TASK_DEADLINE_MIN_S}),
+                    CHECK(deadline <= authorized_at + {TASK_DEADLINE_MAX_S}),
+                    CHECK((state IN ('open','disputed')) = (terminal_at IS NULL)),
+                    CHECK((state = 'refunded') OR refund_reason IS NULL),
+                    CHECK(dispute_reason IS NULL OR
+                          (length(dispute_reason) BETWEEN 1 AND 64)),
+                    CHECK(dispute_note IS NULL OR length(dispute_note) <= 280),
+                    CHECK(disputed_at IS NULL OR
+                          (typeof(disputed_at) = 'integer' AND disputed_at > 0)),
+                    CHECK((disputed_at IS NULL) = (dispute_reason IS NULL)),
+                    CHECK((disputed_at IS NULL) = (dispute_note IS NULL)),
+                    CHECK(disputed_at IS NULL OR submitted_at > 0),
+                    CHECK(state != 'disputed' OR disputed_at IS NOT NULL),
+                    CHECK((resolved_outcome IS NULL) = (resolution_reason IS NULL)),
+                    CHECK(resolution_reason IS NULL OR
+                          (length(resolution_reason) BETWEEN 1 AND 64)),
+                    CHECK(resolved_outcome IS NULL OR disputed_at IS NOT NULL),
+                    CHECK(resolved_outcome != 'pay' OR state = 'paid'),
+                    CHECK(resolved_outcome != 'refund' OR state = 'refunded')
+                )
+                """
+            )
+            optional = {
+                name: name if name in columns else "NULL"
+                for name in dispute_columns
+            }
+            lifecycle = {
+                "submitted_at": "submitted_at" if "submitted_at" in columns else "0",
+                "result_hash": "result_hash" if "result_hash" in columns else "''",
+                "received_at": "received_at" if "received_at" in columns else "0",
+                "received_hash": "received_hash" if "received_hash" in columns else "''",
+            }
+            self._db.execute(
+                "INSERT INTO task_holds_new(hold_id, payer_keyid, payer_account, "
+                "payer_tier, client_nonce, task_hash, worker_keyid, worker_account, "
+                "amount, deadline, request_digest, escrow_account, state, submitted_at, "
+                "result_hash, received_at, received_hash, dispute_reason, dispute_note, "
+                "disputed_at, resolved_outcome, resolution_reason, refund_reason, "
+                "authorized_at, terminal_at, updated_at) "
+                "SELECT hold_id, payer_keyid, payer_account, payer_tier, client_nonce, "
+                "task_hash, worker_keyid, worker_account, amount, deadline, request_digest, "
+                f"escrow_account, state, {lifecycle['submitted_at']}, "
+                f"{lifecycle['result_hash']}, {lifecycle['received_at']}, "
+                f"{lifecycle['received_hash']}, {optional['dispute_reason']}, "
+                f"{optional['dispute_note']}, "
+                f"{optional['disputed_at']}, {optional['resolved_outcome']}, "
+                f"{optional['resolution_reason']}, refund_reason, authorized_at, "
+                "terminal_at, updated_at FROM task_holds"
+            )
+            self._db.execute("DROP TABLE task_holds")
+            self._db.execute("ALTER TABLE task_holds_new RENAME TO task_holds")
+            self._db.execute("COMMIT")
+        except BaseException:
+            if self._db.in_transaction:
+                self._db.execute("ROLLBACK")
+            raise
+        finally:
+            self._db.execute(f"PRAGMA foreign_keys={foreign_keys}")
+        violation = self._db.execute("PRAGMA foreign_key_check").fetchone()
+        if violation is not None:
+            raise sqlite3.DatabaseError(
+                f"foreign key violation after task hold migration: {tuple(violation)!r}"
+            )
 
     def _backfill_legacy_funding_projection(self) -> None:
         """Materialize legacy funding once from chronological journal provenance."""
@@ -1324,7 +1565,9 @@ class LedgerStore:
         ).fetchone()
         if row is None:
             raise SpendNotFound("spend hold not found")
-        return dict(row)
+        result = dict(row)
+        result["locked"] = int(result["submitted_at"]) > 0
+        return result
 
     @classmethod
     def _assert_task_hold_in(
@@ -1336,7 +1579,11 @@ class LedgerStore:
         ).fetchone()
         if hold is None:
             raise SpendNotFound("spend hold not found")
-        expected = int(hold["amount"]) if hold["state"] == "open" else 0
+        expected = (
+            int(hold["amount"])
+            if hold["state"] in {"open", "disputed"}
+            else 0
+        )
         actual = cls._balance_in(db, str(hold["escrow_account"]))
         if actual != expected:
             raise LedgerError(
@@ -1351,18 +1598,31 @@ class LedgerStore:
         now: int,
         *,
         paid_by_silence: bool = False,
+        expected_state: str = "open",
+        detail_extra: Mapping[str, Any] | None = None,
+        resolution_reason: str | None = None,
     ) -> bool:
         hold_id = str(hold["hold_id"])
-        updated = db.execute(
-            "UPDATE task_holds SET state='paid', terminal_at=?, updated_at=? "
-            "WHERE hold_id=? AND state='open'",
-            (now, now, hold_id),
-        )
+        if resolution_reason is None:
+            updated = db.execute(
+                "UPDATE task_holds SET state='paid', terminal_at=?, updated_at=? "
+                "WHERE hold_id=? AND state=?",
+                (now, now, hold_id, expected_state),
+            )
+        else:
+            updated = db.execute(
+                "UPDATE task_holds SET state='paid', resolved_outcome='pay', "
+                "resolution_reason=?, terminal_at=?, updated_at=? "
+                "WHERE hold_id=? AND state=?",
+                (resolution_reason, now, now, hold_id, expected_state),
+            )
         if updated.rowcount != 1:
             return False
         detail: dict[str, Any] = {"hold_id": hold_id}
         if paid_by_silence:
             detail["paid_by_silence"] = True
+        if detail_extra:
+            detail.update(detail_extra)
         debit, credit = cls._move_spend_value(
             db,
             source=str(hold["escrow_account"]),
@@ -1389,16 +1649,35 @@ class LedgerStore:
         hold: Mapping[str, Any],
         now: int,
         reason: str,
+        *,
+        expected_state: str = "open",
+        detail_extra: Mapping[str, Any] | None = None,
+        resolution_reason: str | None = None,
     ) -> bool:
         hold_id = str(hold["hold_id"])
-        updated = db.execute(
-            "UPDATE task_holds SET state='refunded', refund_reason=?, "
-            "terminal_at=?, updated_at=? WHERE hold_id=? AND state='open'",
-            (reason, now, now, hold_id),
-        )
+        if resolution_reason is None:
+            updated = db.execute(
+                "UPDATE task_holds SET state='refunded', refund_reason=?, "
+                "terminal_at=?, updated_at=? WHERE hold_id=? AND state=?",
+                (reason, now, now, hold_id, expected_state),
+            )
+        else:
+            updated = db.execute(
+                "UPDATE task_holds SET state='refunded', refund_reason=?, "
+                "resolved_outcome='refund', resolution_reason=?, terminal_at=?, "
+                "updated_at=? WHERE hold_id=? AND state=?",
+                (reason, resolution_reason, now, now, hold_id, expected_state),
+            )
         if updated.rowcount != 1:
             return False
         refund_after_submit = int(hold["submitted_at"]) > 0
+        detail: dict[str, Any] = {
+            "hold_id": hold_id,
+            "reason": reason,
+            "refund_after_submit": refund_after_submit,
+        }
+        if detail_extra:
+            detail.update(detail_extra)
         cls._move_spend_value(
             db,
             source=str(hold["escrow_account"]),
@@ -1416,11 +1695,7 @@ class LedgerStore:
                 else "task_refund_credit"
             ),
             event_id=f"task-refund:{hold_id}",
-            detail={
-                "hold_id": hold_id,
-                "reason": reason,
-                "refund_after_submit": refund_after_submit,
-            },
+            detail=detail,
         )
         cls._assert_task_hold_in(db, hold_id)
         return True
@@ -1436,18 +1711,47 @@ class LedgerStore:
         ).fetchone()
         if hold is None:
             raise SpendNotFound("spend hold not found")
-        if hold["state"] != "open" or now < int(hold["deadline"]) + TASK_REFUND_GRACE_S:
+        state = str(hold["state"])
+        deadline = int(hold["deadline"])
+        if state == "open":
+            if now < deadline + TASK_REFUND_GRACE_S:
+                return False
+            silence_pay = (
+                int(hold["submitted_at"]) > 0
+                and int(hold["submitted_at"]) <= deadline
+                and int(hold["received_at"]) > 0
+                and hold["result_hash"] == hold["received_hash"]
+            )
+            return (
+                cls._pay_task_hold_in(db, hold, now, paid_by_silence=True)
+                if silence_pay
+                else cls._refund_task_hold_in(db, hold, now, "expired")
+            )
+        if state != "disputed" or now < deadline + TASK_DISPUTE_BACKSTOP_S:
             return False
-        silence_pay = (
+        delivered = (
             int(hold["submitted_at"]) > 0
-            and int(hold["submitted_at"]) <= int(hold["deadline"])
+            and int(hold["submitted_at"]) <= deadline
             and int(hold["received_at"]) > 0
             and hold["result_hash"] == hold["received_hash"]
         )
+        detail = {
+            "dispute_backstop": True,
+            "dispute_reason": str(hold["dispute_reason"]),
+        }
         return (
-            cls._pay_task_hold_in(db, hold, now, paid_by_silence=True)
-            if silence_pay
-            else cls._refund_task_hold_in(db, hold, now, "expired")
+            cls._pay_task_hold_in(
+                db, hold, now, expected_state="disputed", detail_extra=detail
+            )
+            if delivered
+            else cls._refund_task_hold_in(
+                db,
+                hold,
+                now,
+                "dispute_backstop",
+                expected_state="disputed",
+                detail_extra=detail,
+            )
         )
 
     @staticmethod
@@ -1792,6 +2096,31 @@ class LedgerStore:
                     separators=(",", ":"),
                 ),
             }
+            if row["resolved_outcome"] == "pay":
+                valid_details.add(
+                    json.dumps(
+                        {
+                            "hold_id": row["hold_id"],
+                            "resolved_by": "operator",
+                            "dispute_reason": row["dispute_reason"],
+                            "resolution_reason": row["resolution_reason"],
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            elif row["disputed_at"] is not None:
+                valid_details.add(
+                    json.dumps(
+                        {
+                            "hold_id": row["hold_id"],
+                            "dispute_backstop": True,
+                            "dispute_reason": row["dispute_reason"],
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
             if (
                 row["terminal_at"] == row["earned_at"]
                 and int(row["matures_at"]) == int(row["earned_at"]) + HOLD_S
@@ -3272,10 +3601,10 @@ class LedgerStore:
                 )
             if db.execute(
                 "SELECT 1 FROM task_holds WHERE payer_account=? AND task_hash=? "
-                "AND state='open'",
+                "AND state IN ('open','disputed')",
                 (resolved_payer, task_hash),
             ).fetchone() is not None:
-                raise SpendConflict("task already has an open hold")
+                raise SpendConflict("task already has an open hold or unresolved dispute")
             if db.execute(
                 "SELECT 1 FROM task_holds WHERE hold_id=?", (proposed_hold_id,)
             ).fetchone() is not None:
@@ -3490,9 +3819,124 @@ class LedgerStore:
                 return result
             if hold["state"] != "open":
                 raise SpendStateError(f"task hold is {hold['state']}")
+            if int(hold["submitted_at"]) > 0:
+                raise TaskSubmittedLocked()
             now = self._now()
             if not self._refund_task_hold_in(db, hold, now, reason):
                 raise SpendStateError("task hold is not open")
+            result = self._task_status_in(db, hold_id)
+            result["replayed"] = False
+            return result
+
+        return self._tx(operation)
+
+    def dispute_task_hold(
+        self, hold_id: str, payer_keyid: str, reason: str, note: str
+    ) -> dict[str, Any]:
+        """Lock a submitted reward for operator adjudication."""
+        hold_id = _identifier(hold_id, "hold_id")
+        payer_keyid = _identifier(payer_keyid, "payer_keyid")
+        reason = _identifier(reason, "reason")
+        if len(reason) > 64:
+            raise LedgerValueError("reason must be at most 64 characters")
+        if not isinstance(note, str):
+            raise LedgerValueError("note must be a string")
+        if len(note) > 280:
+            raise LedgerValueError("note must be at most 280 characters")
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            hold = db.execute(
+                "SELECT * FROM task_holds WHERE hold_id=? AND payer_keyid=?",
+                (hold_id, payer_keyid),
+            ).fetchone()
+            if hold is None:
+                raise SpendNotFound("spend hold not found")
+            if hold["disputed_at"] is not None:
+                if hold["dispute_reason"] != reason or hold["dispute_note"] != note:
+                    raise SpendConflict(
+                        "task hold was already disputed with different details"
+                    )
+                result = self._task_status_in(db, hold_id)
+                result["replayed"] = True
+                return result
+            if hold["state"] != "open":
+                raise SpendStateError(f"task hold is {hold['state']}")
+            if int(hold["submitted_at"]) == 0:
+                raise SpendStateError("task hold has not been submitted")
+            now = self._now()
+            updated = db.execute(
+                "UPDATE task_holds SET state='disputed', dispute_reason=?, "
+                "dispute_note=?, disputed_at=?, updated_at=? "
+                "WHERE hold_id=? AND state='open' AND submitted_at>0",
+                (reason, note, now, now, hold_id),
+            )
+            if updated.rowcount != 1:
+                raise SpendConflict("task hold dispute raced with another transition")
+            self._assert_task_hold_in(db, hold_id)
+            result = self._task_status_in(db, hold_id)
+            result["replayed"] = False
+            return result
+
+        return self._tx(operation)
+
+    def resolve_task_hold(
+        self, hold_id: str, outcome: str, reason: str
+    ) -> dict[str, Any]:
+        """Resolve a disputed reward after service-boundary operator auth."""
+        hold_id = _identifier(hold_id, "hold_id")
+        if outcome not in {"pay", "refund"}:
+            raise LedgerValueError("outcome must be pay or refund")
+        reason = _identifier(reason, "reason")
+        if len(reason) > 64:
+            raise LedgerValueError("reason must be at most 64 characters")
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            hold = db.execute(
+                "SELECT * FROM task_holds WHERE hold_id=?", (hold_id,)
+            ).fetchone()
+            if hold is None:
+                raise SpendNotFound("spend hold not found")
+            if hold["resolved_outcome"] is not None:
+                if (
+                    hold["resolved_outcome"] != outcome
+                    or hold["resolution_reason"] != reason
+                ):
+                    raise SpendConflict(
+                        "task dispute was already resolved with a different outcome"
+                    )
+                result = self._task_status_in(db, hold_id)
+                result["replayed"] = True
+                return result
+            if hold["state"] != "disputed":
+                raise SpendStateError(f"task hold is {hold['state']}")
+            now = self._now()
+            detail = {
+                "resolved_by": "operator",
+                "dispute_reason": str(hold["dispute_reason"]),
+                "resolution_reason": reason,
+            }
+            changed = (
+                self._pay_task_hold_in(
+                    db,
+                    hold,
+                    now,
+                    expected_state="disputed",
+                    detail_extra=detail,
+                    resolution_reason=reason,
+                )
+                if outcome == "pay"
+                else self._refund_task_hold_in(
+                    db,
+                    hold,
+                    now,
+                    reason,
+                    expected_state="disputed",
+                    detail_extra=detail,
+                    resolution_reason=reason,
+                )
+            )
+            if not changed:
+                raise SpendConflict("task dispute resolution raced with another transition")
             result = self._task_status_in(db, hold_id)
             result["replayed"] = False
             return result
@@ -4402,14 +4846,21 @@ class LedgerStore:
                 "WHERE (state='open' AND execution_deadline<=?) "
                 "OR (state='closing' AND settlement_deadline<=?) "
                 "UNION ALL "
-                "SELECT hold_id, 'task', authorized_at, deadline + ? "
-                "FROM task_holds WHERE state='open' AND deadline + ?<=?"
+                "SELECT hold_id, 'task', authorized_at, "
+                "CASE state WHEN 'open' THEN deadline + ? "
+                "ELSE deadline + ? END "
+                "FROM task_holds WHERE "
+                "(state='open' AND deadline + ?<=?) OR "
+                "(state='disputed' AND deadline + ?<=?)"
                 ") ORDER BY due_at, authorized_at, hold_id LIMIT ?",
                 (
                     sweep_cutoff,
                     sweep_cutoff,
                     TASK_REFUND_GRACE_S,
+                    TASK_DISPUTE_BACKSTOP_S,
                     TASK_REFUND_GRACE_S,
+                    sweep_cutoff,
+                    TASK_DISPUTE_BACKSTOP_S,
                     sweep_cutoff,
                     batch_size + 1,
                 ),
