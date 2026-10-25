@@ -599,6 +599,26 @@ def test_unfunded_earnings_are_never_withdrawable(tmp_path, monkeypatch):
         _assert_zero_sum(store)
 
 
+def test_legacy_starter_balance_does_not_mark_earnings_funded(tmp_path, monkeypatch):
+    clock = [1_500_000]
+    monkeypatch.setattr(ledger_store_module.time, "time", lambda: clock[0])
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        store.grant_starter(
+            "starter", "grantor", "consumer", "a" * 64, 50, "self", "self"
+        )
+        store.settle("starter-spend", "consumer", {"worker": 50}, 50, "self")
+        projection = store._db.execute(
+            "SELECT funded FROM legacy_funding_projection "
+            "WHERE receipt_id='starter-spend'"
+        ).fetchone()
+        assert projection is not None and projection["funded"] == 0
+        assert json.loads(store.history("worker")[0]["detail"])["funded"] is False
+        clock[0] += HOLD_S + 1
+        assert store.balance("worker") == 50
+        assert store.withdrawable("worker") == 0
+        _assert_zero_sum(store)
+
+
 def test_legacy_funded_earnings_use_inclusive_maturity_and_dispute_boundary(
     tmp_path, monkeypatch
 ):

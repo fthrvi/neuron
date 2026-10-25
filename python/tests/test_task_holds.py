@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -131,6 +132,55 @@ def test_pay_refund_replays_conflicts_conserve_and_earnings_mature(tmp_path):
                 "SELECT balance FROM accounts WHERE id LIKE '__task_hold__:%'"
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("funding", "amount", "expected_funded"),
+    (
+        ("starter", 100, False),
+        ("overdraft", 100, False),
+        ("deposit", 100, True),
+        ("mixed", 505, False),
+    ),
+)
+def test_only_deposit_backed_task_holds_create_cashable_earnings(
+    tmp_path, funding, amount, expected_funded
+):
+    clock = [1_200_000]
+    with LedgerStore(tmp_path / f"{funding}.db", clock=lambda: clock[0]) as store:
+        if funding == "starter":
+            store.grant_starter(
+                "starter", "grantor", "payer", "a" * 64, amount,
+                "self", "self",
+            )
+        elif funding == "deposit":
+            store.deposit("deposit", "payer", amount, 1)
+        elif funding == "mixed":
+            store.deposit("deposit", "payer", 500, 1)
+            store.grant_starter(
+                "starter", "grantor", "payer", "a" * 64, 10,
+                "self", "self",
+            )
+
+        hold = _authorize(
+            store,
+            clock,
+            nonce=funding,
+            task_hash=hashlib.sha256(funding.encode()).hexdigest(),
+            tier="self",
+            amount=amount,
+        )
+        assert bool(hold["funded"]) is expected_funded
+        with pytest.raises(sqlite3.IntegrityError, match="snapshot is immutable"):
+            store._db.execute(
+                "UPDATE task_holds SET funded=1-funded WHERE hold_id=?",
+                (hold["hold_id"],),
+            )
+
+        store.pay_task_hold(hold["hold_id"], "payer-key")
+        clock[0] += HOLD_S + 1
+        assert store.balance("worker") == amount
+        assert store.withdrawable("worker") == (amount if expected_funded else 0)
 
 
 def test_suspended_task_worker_freezes_pay_and_silence_pay_but_not_refund(tmp_path):
@@ -969,6 +1019,7 @@ with module.LedgerStore(sys.argv[2], clock=lambda: 1000000) as store:
     for _ in range(2):
         with LedgerStore(database, clock=lambda: 1_000_000) as store:
             assert store.spend_status("base-hold")["state"] == "open"
+            assert store.spend_status("base-hold")["funded"] == 1
             assert {
                 row["id"]: int(row["balance"])
                 for row in store._db.execute(
@@ -979,6 +1030,7 @@ with module.LedgerStore(sys.argv[2], clock=lambda: 1000000) as store:
                 "SELECT COUNT(*) FROM task_holds"
             ).fetchone()[0] == 2
             assert store.task_hold_status("base-paid-task")["state"] == "paid"
+            assert store.task_hold_status("base-paid-task")["funded"] == 1
             assert store._db.execute(
                 "SELECT COUNT(*) FROM task_earnings WHERE hold_id='base-paid-task'"
             ).fetchone()[0] == 1
@@ -992,7 +1044,7 @@ with module.LedgerStore(sys.argv[2], clock=lambda: 1000000) as store:
             assert "'disputed'" in table_sql
             assert {
                 "dispute_reason", "dispute_note", "disputed_at",
-                "resolved_outcome", "resolution_reason",
+                "resolved_outcome", "resolution_reason", "funded",
             }.issubset({
                 row[1] for row in store._db.execute("PRAGMA table_info(task_holds)")
             })
@@ -1098,7 +1150,7 @@ def test_signed_http_routes_gating_strict_shapes_scopes_and_codes(
             assert code == 200
             assert set(authorization) == {
                 "v", "hold_id", "task_hash", "worker_keyid", "amount",
-                "deadline", "state",
+                "funded", "deadline", "state",
             }
             hold_id = authorization["hold_id"]
             path = f"/spend/task/status?hold_id={hold_id}"
@@ -1106,13 +1158,14 @@ def test_signed_http_routes_gating_strict_shapes_scopes_and_codes(
             assert code == 200
             assert set(status) == {
                 "v", "hold_id", "task_hash", "payer_account", "worker_keyid",
-                "amount", "deadline", "state", "submitted_at", "result_hash",
+                "amount", "funded", "deadline", "state", "submitted_at", "result_hash",
                 "received_at", "received_hash", "dispute_reason", "locked",
                 "refund_after_submit", "server_time",
             }
             assert (status["submitted_at"], status["result_hash"]) == (0, "")
             assert (status["received_at"], status["received_hash"]) == (0, "")
             assert status["dispute_reason"] is None and status["locked"] is False
+            assert authorization["funded"] is True and status["funded"] is True
             assert status["refund_after_submit"] is False
             submit_body = {"hold_id": hold_id, "result_hash": "b" * 64}
             for caller in (identities["payer"], identities["outsider"]):

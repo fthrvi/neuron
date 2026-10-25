@@ -1372,7 +1372,7 @@ class Reconciler:
                         "payer_account": hold["payer_account_at_authorize"],
                         "worker_account": entry["worker_account_at_authorize"],
                         "amount": delta,
-                        "funded": 1,
+                        "funded": int(hold["funded"]),
                         "hold_terminal_at": terminal,
                         "matures_at": maturity,
                         "earned_at": int(stored["accepted_at"]),
@@ -1774,16 +1774,23 @@ class Reconciler:
                     min(int(row["seq"]) for row in settlement_rows), []
                 ).append(receipt)
         running_balances: dict[str, int] = {}
-        legacy_balance_before: dict[str, int] = {}
+        starter_received: dict[str, int] = {}
+        legacy_backed_before: dict[str, int] = {}
         for journal in ledger["journal"]:
             for receipt in first_legacy_seq.get(int(journal["seq"]), []):
-                legacy_balance_before[receipt["receipt_id"]] = running_balances.get(
-                    receipt["requester"], 0
+                requester = receipt["requester"]
+                legacy_backed_before[receipt["receipt_id"]] = (
+                    running_balances.get(requester, 0)
+                    - starter_received.get(requester, 0)
                 )
             account = journal["account"]
             running_balances[account] = running_balances.get(account, 0) + int(
                 journal["amount"]
             )
+            if journal["kind"] == "starter_receive":
+                starter_received[account] = (
+                    starter_received.get(account, 0) + int(journal["amount"])
+                )
         for account, balance in balances.items():
             if (
                 account != TREASURY_ACCOUNT
@@ -1800,7 +1807,7 @@ class Reconciler:
                 continue
             reconstructed_funded = (
                 int(receipt["charged"]) == 0
-                or legacy_balance_before.get(receipt_id, 0) >= int(receipt["charged"])
+                or legacy_backed_before.get(receipt_id, 0) >= int(receipt["charged"])
             )
             projection = legacy_projection.get(receipt_id)
             if projection is None or projection["funded"] != int(reconstructed_funded):
@@ -1896,7 +1903,7 @@ class Reconciler:
                 credit = journals.get(int(row["credit_journal_seq"]))
                 reconstructed_funded = (
                     receipt is not None
-                    and legacy_balance_before.get(row["receipt_id"], 0)
+                    and legacy_backed_before.get(row["receipt_id"], 0)
                     >= int(receipt["charged"])
                 )
                 if (

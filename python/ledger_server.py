@@ -862,6 +862,7 @@ class V2LedgerService:
             "task_hash": status["task_hash"],
             "worker_keyid": status["worker_keyid"],
             "amount": int(status["amount"]),
+            "funded": bool(status["funded"]),
             "deadline": int(status["deadline"]),
             "state": status["state"],
         }
@@ -1056,6 +1057,7 @@ class V2LedgerService:
             "payer_account": status["payer_account"],
             "worker_keyid": status["worker_keyid"],
             "amount": int(status["amount"]),
+            "funded": bool(status["funded"]),
             "deadline": int(status["deadline"]),
             "state": status["state"],
             "submitted_at": int(status["submitted_at"]),

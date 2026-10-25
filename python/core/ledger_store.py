@@ -434,6 +434,7 @@ class LedgerStore:
                 max_cost INTEGER NOT NULL
                     CHECK(typeof(max_cost) = 'integer'
                           AND max_cost BETWEEN 0 AND {max_units}),
+                funded INTEGER NOT NULL DEFAULT 1 CHECK(funded IN (0, 1)),
                 authorization_digest TEXT NOT NULL,
                 request_digest TEXT NOT NULL,
                 token_digest TEXT UNIQUE,
@@ -597,6 +598,7 @@ class LedgerStore:
                 amount INTEGER NOT NULL
                     CHECK(typeof(amount) = 'integer'
                           AND amount BETWEEN 1 AND {TASK_MAX_AMOUNT}),
+                funded INTEGER NOT NULL DEFAULT 1 CHECK(funded IN (0, 1)),
                 deadline INTEGER NOT NULL CHECK(typeof(deadline) = 'integer'),
                 request_digest TEXT NOT NULL,
                 escrow_account TEXT NOT NULL UNIQUE,
@@ -840,6 +842,14 @@ class LedgerStore:
         }
         if "request_digest" not in spend_hold_columns:
             self._db.execute("ALTER TABLE spend_holds ADD COLUMN request_digest TEXT")
+        if "funded" not in spend_hold_columns:
+            # Pre-migration v2 holds have already made their immutable authorization
+            # debit, so their original backing cannot be recovered reliably.  Preserve
+            # their historical treatment by grandfathering them as funded.
+            self._db.execute(
+                "ALTER TABLE spend_holds ADD COLUMN funded INTEGER NOT NULL "
+                "DEFAULT 1 CHECK(funded IN (0, 1))"
+            )
         spend_worker_columns = {
             str(row[1])
             for row in self._db.execute("PRAGMA table_info(spend_hold_workers)")
@@ -909,7 +919,7 @@ class LedgerStore:
             BEFORE UPDATE OF payer_keyid, payer_account_at_authorize,
                 payer_tier_at_authorize, client_nonce, session_id, model_id,
                 billing_mode, max_prompt_tokens, max_output_tokens,
-                max_token_layers, max_cost, authorization_digest,
+                max_token_layers, max_cost, funded, authorization_digest,
                 escrow_account, authorized_at, execution_deadline,
                 settlement_deadline
             ON spend_holds
@@ -930,9 +940,10 @@ class LedgerStore:
                 SELECT RAISE(ABORT, 'spend hold request digest is required');
             END;
 
-            CREATE TRIGGER IF NOT EXISTS task_holds_snapshots_immutable
+            DROP TRIGGER IF EXISTS task_holds_snapshots_immutable;
+            CREATE TRIGGER task_holds_snapshots_immutable
             BEFORE UPDATE OF payer_keyid, payer_account, payer_tier, client_nonce,
-                task_hash, worker_keyid, worker_account, amount, deadline,
+                task_hash, worker_keyid, worker_account, amount, funded, deadline,
                 request_digest, escrow_account, authorized_at
             ON task_holds
             BEGIN
@@ -1108,7 +1119,7 @@ class LedgerStore:
               AND e.payer_account=h.payer_account_at_authorize
               AND e.worker_account=w.worker_account_at_authorize
               AND e.amount=u.accepted_delta
-              AND e.funded=1
+              AND e.funded=h.funded
               AND e.earned_at=u.accepted_at
               AND e.hold_terminal_at IS h.terminal_at
               AND e.matures_at IS CASE WHEN h.terminal_at IS NULL THEN NULL
@@ -1141,7 +1152,7 @@ class LedgerStore:
               )
             UNION ALL
             SELECT 'task:' || t.hold_id, 'task', 'task-pay:' || t.hold_id,
-                t.hold_id, t.payer_account, t.worker_account, t.amount, 1,
+                t.hold_id, t.payer_account, t.worker_account, t.amount, t.funded,
                 e.earned_at, e.earned_at, e.matures_at, e.matures_at + 1,
                 'none', e.debit_journal_seq, e.credit_journal_seq
             FROM task_holds AS t
@@ -1205,11 +1216,15 @@ class LedgerStore:
                 )
 
     def _migrate_task_holds_for_disputes(self) -> None:
-        """Rebuild the task table when its state CHECK predates disputes.
+        """Rebuild the task table when its schema predates disputes or funding.
 
         SQLite cannot alter a table-level CHECK.  Foreign-key enforcement must
         be disabled before starting the rebuild transaction; changing the
         pragma inside a transaction is a documented no-op.
+
+        Existing holds predate the deposit-backed snapshot, so they are
+        deliberately grandfathered as ``funded=1`` during this idempotent
+        migration.  New holds record the decision at their authorization debit.
         """
         dispute_columns = {
             "dispute_reason", "dispute_note", "disputed_at",
@@ -1234,6 +1249,7 @@ class LedgerStore:
                 row is not None
                 and "'disputed'" in str(row[0])
                 and dispute_columns.issubset(columns)
+                and "funded" in columns
             ):
                 self._db.execute("ROLLBACK")
                 return
@@ -1253,6 +1269,7 @@ class LedgerStore:
                     amount INTEGER NOT NULL
                         CHECK(typeof(amount) = 'integer'
                               AND amount BETWEEN 1 AND {TASK_MAX_AMOUNT}),
+                    funded INTEGER NOT NULL DEFAULT 1 CHECK(funded IN (0, 1)),
                     deadline INTEGER NOT NULL CHECK(typeof(deadline) = 'integer'),
                     request_digest TEXT NOT NULL,
                     escrow_account TEXT NOT NULL UNIQUE,
@@ -1307,15 +1324,16 @@ class LedgerStore:
                 "received_at": "received_at" if "received_at" in columns else "0",
                 "received_hash": "received_hash" if "received_hash" in columns else "''",
             }
+            funded = "funded" if "funded" in columns else "1"
             self._db.execute(
                 "INSERT INTO task_holds_new(hold_id, payer_keyid, payer_account, "
                 "payer_tier, client_nonce, task_hash, worker_keyid, worker_account, "
-                "amount, deadline, request_digest, escrow_account, state, submitted_at, "
+                "amount, funded, deadline, request_digest, escrow_account, state, submitted_at, "
                 "result_hash, received_at, received_hash, dispute_reason, dispute_note, "
                 "disputed_at, resolved_outcome, resolution_reason, refund_reason, "
                 "authorized_at, terminal_at, updated_at) "
                 "SELECT hold_id, payer_keyid, payer_account, payer_tier, client_nonce, "
-                "task_hash, worker_keyid, worker_account, amount, deadline, request_digest, "
+                f"task_hash, worker_keyid, worker_account, amount, {funded}, deadline, request_digest, "
                 f"escrow_account, state, {lifecycle['submitted_at']}, "
                 f"{lifecycle['result_hash']}, {lifecycle['received_at']}, "
                 f"{lifecycle['received_hash']}, {optional['dispute_reason']}, "
@@ -1371,6 +1389,7 @@ class LedgerStore:
                 if int(row["charged"]) == 0
             }
             running: dict[str, int] = {}
+            starter_received: dict[str, int] = {}
             for row in self._db.execute(
                 "SELECT seq, kind, receipt_id, account, amount "
                 "FROM journal ORDER BY seq"
@@ -1384,10 +1403,15 @@ class LedgerStore:
                     receipt = receipts[str(receipt_id)]
                     funding[str(receipt_id)] = int(
                         running.get(str(receipt["requester"]), 0)
+                        - starter_received.get(str(receipt["requester"]), 0)
                         >= int(receipt["charged"])
                     )
                 account = str(row["account"])
                 running[account] = running.get(account, 0) + int(row["amount"])
+                if row["kind"] == "starter_receive":
+                    starter_received[account] = (
+                        starter_received.get(account, 0) + int(row["amount"])
+                    )
             self._db.executemany(
                 "INSERT OR IGNORE INTO legacy_funding_projection(receipt_id, funded) "
                 "VALUES (?, ?)",
@@ -1534,6 +1558,18 @@ class LedgerStore:
     def _balance_in(db: sqlite3.Connection, account: str) -> int:
         row = db.execute("SELECT balance FROM accounts WHERE id=?", (account,)).fetchone()
         return int(row[0]) if row else 0
+
+    @staticmethod
+    def _deposit_backed_balance_in(db: sqlite3.Connection, account: str) -> int:
+        """Return balance after removing all starter credit ever received."""
+        starter_credit = int(
+            db.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM starter_grants "
+                "WHERE dst_account=?",
+                (account,),
+            ).fetchone()[0]
+        )
+        return LedgerStore._balance_in(db, account) - starter_credit
 
     @staticmethod
     def _checked_balance(value: int, account: str) -> int:
@@ -1902,7 +1938,8 @@ class LedgerStore:
             stored = db.execute(
                 "SELECT u.*, h.payer_keyid, h.payer_account_at_authorize, "
                 "h.session_id, h.model_id, h.billing_mode, h.execution_deadline, "
-                "h.escrow_account, h.state AS hold_state, h.terminal_at, "
+                "h.escrow_account, h.funded AS hold_funded, "
+                "h.state AS hold_state, h.terminal_at, "
                 "w.claim_response_sha256, w.worker_account_at_authorize, "
                 "w.billable, w.layer_start, w.layer_end, w.layers, "
                 "w.price_multiplier, w.max_cost, w.max_token_layers, w.claimed_at "
@@ -2075,6 +2112,7 @@ class LedgerStore:
                 and economic["payer_account"] == stored["payer_account_at_authorize"]
                 and economic["worker_account"] == stored["worker_account_at_authorize"]
                 and int(economic["amount"]) == delta
+                and int(economic["funded"]) == int(stored["hold_funded"])
                 and int(economic["earned_at"]) == int(stored["accepted_at"])
                 and economic["debit_journal_seq"] == stored["debit_journal_seq"]
                 and economic["credit_journal_seq"] == stored["credit_journal_seq"]
@@ -2099,7 +2137,8 @@ class LedgerStore:
             "SELECT t.*, e.earned_at, e.matures_at, e.debit_journal_seq, "
             "e.credit_journal_seq FROM task_holds AS t "
             "JOIN task_earnings AS e ON e.hold_id=t.hold_id "
-            "WHERE t.worker_account=? AND t.state='paid' AND ?>e.matures_at",
+            "WHERE t.worker_account=? AND t.state='paid' AND t.funded=1 "
+            "AND ?>e.matures_at",
             (operator, now),
         ).fetchall()
         for row in rows:
@@ -2334,7 +2373,7 @@ class LedgerStore:
                 )
 
             old_requester_balance = self._balance_in(db, requester)
-            funded = old_requester_balance >= charged
+            funded = self._deposit_backed_balance_in(db, requester) >= charged
             if not _may_debit(old_requester_balance, charged, tier):
                 limit = TIER_LIMITS[tier]
                 raise CreditLimitError(
@@ -3669,6 +3708,7 @@ class LedgerStore:
                 raise SpendConflict("hold_id already exists")
 
             balance = self._balance_in(db, resolved_payer)
+            funded = self._deposit_backed_balance_in(db, resolved_payer) >= amount
             restricted = self._restricted_unproven_balance_in(db, resolved_payer, now)
             limit = TIER_LIMITS[resolved_tier]
             if limit is not None and amount > balance - restricted + limit:
@@ -3684,13 +3724,13 @@ class LedgerStore:
             db.execute(
                 "INSERT INTO task_holds(hold_id, payer_keyid, payer_account, "
                 "payer_tier, client_nonce, task_hash, worker_keyid, worker_account, "
-                "amount, deadline, request_digest, escrow_account, state, "
-                "authorized_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "amount, funded, deadline, request_digest, escrow_account, state, "
+                "authorized_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                 "?, ?, 'open', ?, ?)",
                 (
                     proposed_hold_id, payer_keyid, resolved_payer, resolved_tier,
                     client_nonce, task_hash, worker_keyid, resolved_worker, amount,
-                    deadline, request_digest, escrow_account, now, now,
+                    int(funded), deadline, request_digest, escrow_account, now, now,
                 ),
             )
             self._ensure_account(db, resolved_payer, resolved_tier)
@@ -4299,6 +4339,10 @@ class LedgerStore:
             now = self._now()
 
             balance = self._balance_in(db, resolved_payer_account)
+            funded = (
+                self._deposit_backed_balance_in(db, resolved_payer_account)
+                >= total_cost
+            )
             restricted = self._restricted_unproven_balance_in(
                 db, resolved_payer_account, now
             )
@@ -4318,10 +4362,10 @@ class LedgerStore:
                 "INSERT INTO spend_holds(hold_id, payer_keyid, "
                 "payer_account_at_authorize, payer_tier_at_authorize, client_nonce, "
                 "session_id, model_id, billing_mode, max_prompt_tokens, "
-                "max_output_tokens, max_token_layers, max_cost, "
+                "max_output_tokens, max_token_layers, max_cost, funded, "
                 "authorization_digest, request_digest, token_digest, escrow_account, state, authorized_at, "
                 "execution_deadline, settlement_deadline, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
                 (
                     proposed_hold_id,
                     payer_keyid,
@@ -4335,6 +4379,7 @@ class LedgerStore:
                     max_output_tokens,
                     total_token_layers,
                     total_cost,
+                    int(funded),
                     authorization_digest,
                     request_digest,
                     token_digest,
@@ -4776,9 +4821,9 @@ class LedgerStore:
             db.execute(
                 "INSERT INTO spend_economic_receipts(receipt_id, hold_id, payer_account, "
                 "worker_account, amount, funded, earned_at, debit_journal_seq, "
-                "credit_journal_seq) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                "credit_journal_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (receipt_id, hold_id, hold["payer_account_at_authorize"], worker_account,
-                 delta, now, debit_seq, credit_seq),
+                 delta, int(hold["funded"]), now, debit_seq, credit_seq),
             )
             state = "final" if receipt["final"] else "claimed"
             db.execute(

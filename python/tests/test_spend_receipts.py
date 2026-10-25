@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import time
 
@@ -148,6 +149,40 @@ def test_strict_v2_replay_sequence_conflicts_and_single_zero_delta_final(tmp_pat
                 _private("worker").sign(canonical).hex(),
                 relayer_keyid=_public("worker"),
             )
+
+
+def test_v2_starter_backed_hold_credits_spendable_but_uncashable_earnings(tmp_path):
+    clock = [900_000]
+    path = tmp_path / "ledger.db"
+    with LedgerStore(path, clock=lambda: clock[0]) as store:
+        store.grant_starter(
+            "starter", "grantor", "payer", "a" * 64, 40, "self", "self"
+        )
+        hold = _authorize(store)
+        assert hold["funded"] == 0
+        with pytest.raises(sqlite3.IntegrityError, match="snapshot is immutable"):
+            store._db.execute(
+                "UPDATE spend_holds SET funded=1 WHERE hold_id=?",
+                (hold["hold_id"],),
+            )
+        _claim(store, hold["hold_id"])
+        result = _settle(
+            store, _receipt(store, hold["hold_id"], 1, 0, final=True)
+        )
+        assert result["state"] == "settled"
+        economic = store._db.execute(
+            "SELECT funded FROM spend_economic_receipts"
+        ).fetchone()
+        assert economic is not None and economic["funded"] == 0
+        assert store.economic_receipts("worker")[0]["funded"] == 0
+
+        terminal = int(result["terminal_at"])
+        clock[0] = terminal + HOLD_S + 1
+        assert store.balance("worker") == 2
+        assert store.withdrawable("worker") == 0
+
+    report = Reconciler(path, FakeReconcileRPC({VAULT: 0}), _config(tmp_path)).collect()
+    assert report["outcome"] == "match", report
 
 
 def test_receipt_schema_hash_signature_and_hold_worker_binding_are_strict(tmp_path):
