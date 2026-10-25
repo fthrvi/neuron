@@ -183,6 +183,114 @@ def test_only_deposit_backed_task_holds_create_cashable_earnings(
         assert store.withdrawable("worker") == (amount if expected_funded else 0)
 
 
+def test_unfunded_task_earnings_cannot_fund_a_colluder_chain(tmp_path):
+    clock = [1_300_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        first = _authorize(
+            store,
+            clock,
+            nonce="overdraft-hop",
+            task_hash="a" * 64,
+            payer_keyid="stranger-key",
+            payer_account="stranger",
+            tier="stranger",
+            worker_keyid="worker-one-key",
+            worker_account="worker-one",
+        )
+        assert first["funded"] == 0
+        store.pay_task_hold(first["hold_id"], "stranger-key")
+
+        second = _authorize(
+            store,
+            clock,
+            nonce="colluder-hop",
+            task_hash="b" * 64,
+            payer_keyid="worker-one-key",
+            payer_account="worker-one",
+            tier="known",
+            worker_keyid="worker-two-key",
+            worker_account="worker-two",
+        )
+        assert second["funded"] == 0
+        store.pay_task_hold(second["hold_id"], "worker-one-key")
+
+        clock[0] += HOLD_S + 1
+        assert store.balance("worker-two") == 100
+        assert store.withdrawable("worker-two") == 0
+
+
+def test_unmatured_funded_task_earnings_can_back_one_payment(tmp_path):
+    clock = [1_325_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("deposit", "payer", 100, 1)
+        first = _authorize(
+            store,
+            clock,
+            nonce="funded-hop",
+            task_hash="1" * 64,
+            worker_keyid="worker-one-key",
+            worker_account="worker-one",
+        )
+        assert first["funded"] == 1
+        store.pay_task_hold(first["hold_id"], "payer-key")
+        assert store.withdrawable("worker-one") == 0
+
+        second = _authorize(
+            store,
+            clock,
+            nonce="earning-hop",
+            task_hash="2" * 64,
+            payer_keyid="worker-one-key",
+            payer_account="worker-one",
+            tier="known",
+            worker_keyid="worker-two-key",
+            worker_account="worker-two",
+        )
+        assert second["funded"] == 1
+
+
+def test_funded_holds_consume_backing_only_once(tmp_path):
+    clock = [1_350_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("deposit", "payer", 100, 1)
+        store.grant_starter(
+            "starter", "grantor", "payer", "a" * 64, 100, "self", "self"
+        )
+        first = _authorize(
+            store, clock, nonce="first", task_hash="c" * 64, amount=100
+        )
+        second = _authorize(
+            store, clock, nonce="second", task_hash="d" * 64, amount=100
+        )
+        assert first["funded"] == 1
+        assert second["funded"] == 0
+        assert store.withdrawable("payer") == 0
+
+
+def test_spending_starter_first_preserves_deposit_backing(tmp_path):
+    clock = [1_400_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("deposit", "payer", 100, 1)
+        store.grant_starter(
+            "starter", "grantor", "payer", "a" * 64, 10, "self", "self"
+        )
+        store.transfer("payer", "sink", 10, "self")
+        hold = _authorize(
+            store, clock, nonce="deposit", task_hash="e" * 64, amount=100
+        )
+        assert hold["funded"] == 1
+
+
+def test_transfer_received_value_never_backs_a_task_hold(tmp_path):
+    clock = [1_450_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.transfer("sender", "payer", 100, "self")
+        hold = _authorize(
+            store, clock, nonce="transfer", task_hash="f" * 64, amount=100
+        )
+        assert hold["funded"] == 0
+
+
 def test_suspended_task_worker_freezes_pay_and_silence_pay_but_not_refund(tmp_path):
     clock = [1_500_000]
     frozen = [True]

@@ -599,6 +599,45 @@ def test_unfunded_earnings_are_never_withdrawable(tmp_path, monkeypatch):
         _assert_zero_sum(store)
 
 
+def test_unfunded_legacy_earnings_cannot_fund_a_colluder_chain(
+    tmp_path, monkeypatch
+):
+    clock = [1_250_000]
+    monkeypatch.setattr(ledger_store_module.time, "time", lambda: clock[0])
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        store.settle("overdraft-hop", "stranger", {"worker-one": 100}, 100, "stranger")
+        store.settle("colluder-hop", "worker-one", {"worker-two": 100}, 100, "known")
+        funded = dict(
+            store._db.execute(
+                "SELECT receipt_id, funded FROM legacy_funding_projection"
+            )
+        )
+        assert funded == {"overdraft-hop": 0, "colluder-hop": 0}
+
+        clock[0] += HOLD_S + 1
+        assert store.balance("worker-two") == 100
+        assert store.withdrawable("worker-two") == 0
+        _assert_zero_sum(store)
+
+
+def test_unmatured_funded_earnings_back_exactly_one_legacy_payment(
+    tmp_path, monkeypatch
+):
+    clock = [1_300_000]
+    monkeypatch.setattr(ledger_store_module.time, "time", lambda: clock[0])
+    with LedgerStore(tmp_path / "ledger.db") as store:
+        store.deposit("deposit", "payer", 100, 1)
+        store.settle("first", "payer", {"worker": 100}, 100, "self")
+        store.settle("second", "worker", {"recipient": 100}, 100, "known")
+        store.settle("third", "worker", {"other": 100}, 100, "self")
+        funded = dict(
+            store._db.execute(
+                "SELECT receipt_id, funded FROM legacy_funding_projection"
+            )
+        )
+        assert funded == {"first": 1, "second": 1, "third": 0}
+
+
 def test_legacy_starter_balance_does_not_mark_earnings_funded(tmp_path, monkeypatch):
     clock = [1_500_000]
     monkeypatch.setattr(ledger_store_module.time, "time", lambda: clock[0])

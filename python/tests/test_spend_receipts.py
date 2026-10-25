@@ -44,7 +44,16 @@ def _public(label):
     ).hex()
 
 
-def _authorize(store, *, payer_account="payer", nonce="n", session="s", tokens=10):
+def _authorize(
+    store,
+    *,
+    payer_account="payer",
+    nonce="n",
+    session="s",
+    tokens=10,
+    worker_label="worker",
+    worker_account="worker",
+):
     return store.authorize_spend(
         payer_keyid="payer-key",
         payer_account=payer_account,
@@ -56,8 +65,8 @@ def _authorize(store, *, payer_account="payer", nonce="n", session="s", tokens=1
         max_prompt_tokens=tokens,
         max_output_tokens=tokens,
         workers=[{
-            "worker_keyid": _public("worker"),
-            "worker_account": "worker",
+            "worker_keyid": _public(worker_label),
+            "worker_account": worker_account,
             "layer_start": 0,
             "layer_end": 2,
             "price_multiplier": 1,
@@ -65,7 +74,9 @@ def _authorize(store, *, payer_account="payer", nonce="n", session="s", tokens=1
     )
 
 
-def _receipt(store, hold_id, prompt, generated, *, final=False, **changes):
+def _receipt(
+    store, hold_id, prompt, generated, *, final=False, worker_label="worker", **changes
+):
     status = store.spend_status(hold_id)
     entry = status["workers"][0]
     token_layers = (prompt + generated) * entry["layers"]
@@ -100,11 +111,11 @@ def _receipt(store, hold_id, prompt, generated, *, final=False, **changes):
     canonical = json.dumps(
         receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode()
-    return receipt, _private("worker").sign(canonical).hex()
+    return receipt, _private(worker_label).sign(canonical).hex()
 
 
-def _claim(store, hold_id):
-    return store.claim_spend_worker(hold_id, _public("worker"), "claim")
+def _claim(store, hold_id, worker_label="worker"):
+    return store.claim_spend_worker(hold_id, _public(worker_label), "claim")
 
 
 def _settle(store, signed, *, relayer=None):
@@ -183,6 +194,97 @@ def test_v2_starter_backed_hold_credits_spendable_but_uncashable_earnings(tmp_pa
 
     report = Reconciler(path, FakeReconcileRPC({VAULT: 0}), _config(tmp_path)).collect()
     assert report["outcome"] == "match", report
+
+
+def test_unfunded_v2_earnings_cannot_fund_a_colluder_chain(tmp_path):
+    clock = [950_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        first = _authorize(
+            store,
+            payer_account="stranger",
+            nonce="overdraft-hop",
+            session="overdraft-session",
+            worker_label="worker-one",
+            worker_account="worker-one",
+        )
+        assert first["funded"] == 0
+        _claim(store, first["hold_id"], "worker-one")
+        _settle(
+            store,
+            _receipt(
+                store,
+                first["hold_id"],
+                1,
+                0,
+                final=True,
+                worker_label="worker-one",
+            ),
+            relayer=_public("worker-one"),
+        )
+
+        second = _authorize(
+            store,
+            payer_account="worker-one",
+            nonce="colluder-hop",
+            session="colluder-session",
+            worker_label="worker-two",
+            worker_account="worker-two",
+        )
+        assert second["funded"] == 0
+        _claim(store, second["hold_id"], "worker-two")
+        result = _settle(
+            store,
+            _receipt(
+                store,
+                second["hold_id"],
+                1,
+                0,
+                final=True,
+                worker_label="worker-two",
+            ),
+            relayer=_public("worker-two"),
+        )
+
+        clock[0] = int(result["terminal_at"]) + HOLD_S + 1
+        assert store.balance("worker-two") == 2
+        assert store.withdrawable("worker-two") == 0
+
+
+def test_unmatured_funded_v2_earnings_can_back_a_payment(tmp_path):
+    clock = [975_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("deposit", "payer", 40, 1)
+        first = _authorize(
+            store,
+            nonce="funded-hop",
+            session="funded-session",
+            worker_label="worker-one",
+            worker_account="worker-one",
+        )
+        assert first["funded"] == 1
+        _claim(store, first["hold_id"], "worker-one")
+        _settle(
+            store,
+            _receipt(
+                store,
+                first["hold_id"],
+                10,
+                10,
+                worker_label="worker-one",
+            ),
+            relayer=_public("worker-one"),
+        )
+        assert store.withdrawable("worker-one") == 0
+
+        second = _authorize(
+            store,
+            payer_account="worker-one",
+            nonce="earning-hop",
+            session="earning-session",
+            worker_label="worker-two",
+            worker_account="worker-two",
+        )
+        assert second["funded"] == 1
 
 
 def test_receipt_schema_hash_signature_and_hold_worker_binding_are_strict(tmp_path):
