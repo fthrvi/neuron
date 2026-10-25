@@ -250,7 +250,7 @@ def test_unfunded_v2_earnings_cannot_fund_a_colluder_chain(tmp_path):
         assert store.withdrawable("worker-two") == 0
 
 
-def test_unmatured_funded_v2_earnings_can_back_a_payment(tmp_path):
+def test_unmatured_funded_v2_earnings_do_not_back_a_payment(tmp_path):
     clock = [975_000]
     with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
         store.deposit("deposit", "payer", 40, 1)
@@ -284,7 +284,7 @@ def test_unmatured_funded_v2_earnings_can_back_a_payment(tmp_path):
             worker_label="worker-two",
             worker_account="worker-two",
         )
-        assert second["funded"] == 1
+        assert second["funded"] == 0  # still disputable: spendable, not backing
 
 
 def test_receipt_schema_hash_signature_and_hold_worker_binding_are_strict(tmp_path):

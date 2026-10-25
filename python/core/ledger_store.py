@@ -2363,9 +2363,17 @@ class LedgerStore:
     def _funding_backed_balance_in(
         db: sqlite3.Connection, operator: str, now: int
     ) -> int:
-        """Return spendable balance backed by unconsumed cashable entitlement."""
+        """Return spendable balance backed by unconsumed cashable entitlement.
+
+        Only MATURED earnings back a payment (strictly past the dispute window): an
+        earning still disputable can be clawed back after the earner forwards it, which
+        would leave both the original payer and the downstream worker cashable."""
         entitlement = LedgerStore._cashable_entitlement_in(
-            db, operator, now, include_unmatured_earnings=True
+            db,
+            operator,
+            now,
+            include_unmatured_earnings=False,
+            strict_legacy_maturity=True,
         )
         return max(0, min(LedgerStore._balance_in(db, operator), entitlement))
 

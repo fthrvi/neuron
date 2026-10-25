@@ -219,7 +219,7 @@ def test_unfunded_task_earnings_cannot_fund_a_colluder_chain(tmp_path):
         assert store.withdrawable("worker-two") == 0
 
 
-def test_unmatured_funded_task_earnings_can_back_one_payment(tmp_path):
+def test_only_matured_funded_task_earnings_back_a_payment(tmp_path):
     clock = [1_325_000]
     with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
         store.deposit("deposit", "payer", 100, 1)
@@ -235,10 +235,11 @@ def test_unmatured_funded_task_earnings_can_back_one_payment(tmp_path):
         store.pay_task_hold(first["hold_id"], "payer-key")
         assert store.withdrawable("worker-one") == 0
 
-        second = _authorize(
+        # Still inside its dispute window: spendable, but it does not back a payment.
+        early = _authorize(
             store,
             clock,
-            nonce="earning-hop",
+            nonce="early-hop",
             task_hash="2" * 64,
             payer_keyid="worker-one-key",
             payer_account="worker-one",
@@ -246,7 +247,39 @@ def test_unmatured_funded_task_earnings_can_back_one_payment(tmp_path):
             worker_keyid="worker-two-key",
             worker_account="worker-two",
         )
-        assert second["funded"] == 1
+        assert early["funded"] == 0
+        store.refund_task_hold(early["hold_id"], "worker-one-key", "unclaimed")
+
+        clock[0] += HOLD_S + 1
+        late = _authorize(
+            store,
+            clock,
+            nonce="late-hop",
+            task_hash="3" * 64,
+            payer_keyid="worker-one-key",
+            payer_account="worker-one",
+            tier="known",
+            worker_keyid="worker-two-key",
+            worker_account="worker-two",
+        )
+        assert late["funded"] == 1
+
+
+def test_disputed_earning_forwarded_inside_its_window_is_not_cashed_twice(tmp_path):
+    clock = [1_330_000]
+    with LedgerStore(tmp_path / "ledger.db", clock=lambda: clock[0]) as store:
+        store.deposit("dep", "S", 100, 1)
+        store.settle("r1", "S", {"W1": 100}, 100, "trusted")
+        hold = _authorize(
+            store, clock, nonce="forward", task_hash="d" * 64,
+            payer_keyid="w1-key", payer_account="W1", tier="known",
+            worker_keyid="w2-key", worker_account="W2",
+        )
+        assert hold["funded"] == 0
+        store.pay_task_hold(hold["hold_id"], "w1-key")
+        store.dispute("r1")
+        clock[0] += HOLD_S * 3
+        assert store.withdrawable("S") + store.withdrawable("W2") <= 100
 
 
 def test_funded_holds_consume_backing_only_once(tmp_path):

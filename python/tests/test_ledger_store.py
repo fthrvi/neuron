@@ -620,7 +620,7 @@ def test_unfunded_legacy_earnings_cannot_fund_a_colluder_chain(
         _assert_zero_sum(store)
 
 
-def test_unmatured_funded_earnings_back_exactly_one_legacy_payment(
+def test_unmatured_funded_earnings_back_no_legacy_payment(
     tmp_path, monkeypatch
 ):
     clock = [1_300_000]
@@ -635,7 +635,8 @@ def test_unmatured_funded_earnings_back_exactly_one_legacy_payment(
                 "SELECT receipt_id, funded FROM legacy_funding_projection"
             )
         )
-        assert funded == {"first": 1, "second": 1, "third": 0}
+        # Earnings still inside the dispute window never back a forwarded payment.
+        assert funded == {"first": 1, "second": 0, "third": 0}
 
 
 def test_legacy_starter_balance_does_not_mark_earnings_funded(tmp_path, monkeypatch):
