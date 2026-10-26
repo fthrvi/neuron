@@ -2863,6 +2863,12 @@ class LedgerStore:
                 "ON CONFLICT(operator) DO NOTHING",
                 (operator, now),
             )
+            # The treasury creates accounts only from this queue.
+            db.execute(
+                "INSERT OR IGNORE INTO deposit_account_queue(operator, requested_ts) "
+                "VALUES (?, ?)",
+                (operator, now),
+            )
             requested = db.execute(
                 "SELECT requested_ts FROM deposit_account_requests WHERE operator=?",
                 (operator,),

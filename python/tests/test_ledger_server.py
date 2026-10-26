@@ -720,6 +720,10 @@ def test_wallet_is_queued_and_all_gets_answer_only_for_signer(
         "SELECT operator FROM deposit_account_requests"
     ).fetchall()
     assert [row["operator"] for row in queued] == ["alice"]
+    # The treasury worker reads only its queue; the route must reach it.
+    assert [row["operator"] for row in service.store.pending_deposit_accounts()] == [
+        "alice"
+    ]
 
     service.store.deposit("alice:0", "alice", MIN_WITHDRAW_CREDITS * 2, 1)
     service.store.deposit("bob:0", "bob", MIN_WITHDRAW_CREDITS * 3, 2)
