@@ -19,6 +19,7 @@ from core.ledger_store import (  # noqa: E402
     CreditLimitError,
     DepositBalanceMismatch,
     DepositConflict,
+    LedgerError,
     LedgerInvariantError,
     LedgerStore,
     LedgerValueError,
@@ -556,6 +557,52 @@ def test_deposit_batch_reconciles_per_token_account(tmp_path):
         )
         assert totals == {"token-a": 100, "token-b": 200}
         _assert_zero_sum(store)
+
+
+def test_chain_sweep_state_machine_is_immutable_and_idempotent(tmp_path):
+    path = tmp_path / "ledger.sqlite"
+    with LedgerStore(path) as store:
+        store._db.execute(
+            "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
+            "VALUES ('alice', 'token-a', 1)"
+        )
+        assert store.begin_sweep(
+            "sweep-a", "alice", "token-a", 10, "sig-a", "hash-a", 12
+        ) == 10
+        assert store.swept_total("token-a") == 10
+        assert [row["id"] for row in store.sweeps_in_flight()] == ["sweep-a"]
+        assert store.begin_sweep(
+            "sweep-a", "alice", "token-a", 10, "sig-a", "hash-a", 12
+        ) == 10
+        with pytest.raises(LedgerError):
+            store.begin_sweep(
+                "sweep-b", "alice", "token-a", 1, "sig-b", "hash-b", 13
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            store._db.execute("DELETE FROM chain_sweeps WHERE id='sweep-a'")
+        with pytest.raises(sqlite3.IntegrityError):
+            store._db.execute(
+                "INSERT INTO chain_sweeps VALUES "
+                "('bad', 'alice', 'token-a', 1, 'finalized', 'bad-sig', "
+                "'bad-hash', 1, 1, 1)"
+            )
+        assert store.finalize_sweep("sweep-a") == 10
+        with pytest.raises(LedgerError):
+            store.fail_sweep("sweep-a")
+        with pytest.raises(sqlite3.IntegrityError):
+            store._db.execute(
+                "UPDATE chain_sweeps SET operator='mallory' WHERE id='sweep-a'"
+            )
+        assert store.begin_sweep(
+            "sweep-b", "alice", "token-a", 2, "sig-b", "hash-b", 13
+        ) == 2
+        assert store.fail_sweep("sweep-b") == 2
+        assert store.swept_total("token-a") == 10
+
+    # Opening an already-migrated store must leave the additive schema intact.
+    with LedgerStore(path) as reopened:
+        assert reopened.swept_total("token-a") == 10
+        assert reopened.sweeps_in_flight() == []
 
 
 def test_deposit_token_accounts_are_unique(tmp_path):

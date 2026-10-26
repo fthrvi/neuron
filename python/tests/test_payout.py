@@ -63,6 +63,7 @@ class FakeRPC:
         self.existing_accounts = {RECIPIENT_ATA}
         self.before_send = None
         self.status_calls = []
+        self.token_accounts = {}
 
     def pin_genesis(self, expected=None):
         assert expected in (None, DEVNET_GENESIS_HASH)
@@ -83,6 +84,13 @@ class FakeRPC:
     def get_block_height(self):
         return self.height
 
+    def get_token_account(self, address):
+        return {
+            "mint": MINT,
+            "amount": self.token_accounts.get(address, 0),
+            "decimals": 6,
+        }
+
     def send_transaction(self, wire):
         if self.before_send is not None:
             self.before_send(wire)
@@ -96,6 +104,7 @@ class FakeBackend:
         self.builds = []
         self.created_atas = []
         self.deposit_accounts = []
+        self.sweeps = []
 
     def recipient_ata(self, owner):
         assert owner == RECIPIENT
@@ -123,6 +132,14 @@ class FakeBackend:
         self.deposit_accounts.append(account)
         self.rpc.existing_accounts.add(account)
         return account
+
+    def build_sweep(self, source, micro_usdc, blockhash, last_valid):
+        signature = f"sweep-signature-{len(self.sweeps) + 1}"
+        wire = f"sweep-wire-{len(self.sweeps) + 1}"
+        self.rpc.wire_signatures[wire] = signature
+        signed = SignedTransaction(signature, wire, blockhash, last_valid)
+        self.sweeps.append((source, micro_usdc, signed))
+        return signed
 
 
 def config(tmp_path, **overrides):
@@ -160,6 +177,135 @@ def row(store, withdrawal_id="withdrawal-1"):
             "SELECT * FROM withdrawals WHERE id=?", (withdrawal_id,)
         ).fetchone()
     )
+
+
+def indexed_account(store, account, amount_micro, operator="alice"):
+    store._db.execute(
+        "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
+        "VALUES (?, ?, 1)",
+        (operator, account),
+    )
+    store.deposit_batch(
+        operator,
+        account,
+        [(f"deposit-{operator}:0", amount_micro * RATE, 1)],
+        amount_micro * RATE,
+    )
+
+
+def test_sweep_is_persisted_before_send_and_later_finalized_once(tmp_path):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    account = BLOCKHASHES[0]
+    amount = 1_000_000
+    with LedgerStore(tmp_path / "sweep.sqlite") as store:
+        indexed_account(store, account, amount)
+        rpc.token_accounts[account] = amount
+
+        def assert_persisted(_wire):
+            assert store._db.execute(
+                "SELECT 1 FROM chain_sweeps WHERE token_account=? AND state='sent'",
+                (account,),
+            ).fetchone()
+
+        rpc.before_send = assert_persisted
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+        assert engine.poll_once() == 1
+        sweep = dict(store._db.execute("SELECT * FROM chain_sweeps").fetchone())
+        assert rpc.broadcasts == ["sweep-wire-1"]
+        assert len(backend.sweeps) == 1
+
+        rpc.before_send = None
+        rpc.statuses[sweep["signature"]] = {
+            "err": None,
+            "confirmationStatus": "finalized",
+        }
+        rpc.token_accounts[account] = 0
+        assert engine.poll_once() == 1
+        assert store._db.execute(
+            "SELECT state FROM chain_sweeps WHERE id=?", (sweep["id"],)
+        ).fetchone()[0] == "finalized"
+        assert len(backend.sweeps) == 1
+        assert rpc.broadcasts == ["sweep-wire-1"]
+
+
+@pytest.mark.parametrize("mode", ["funds_off", "kill", "lag", "paused", "below_min"])
+def test_sweep_safety_skips(tmp_path, mode):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    account = BLOCKHASHES[0]
+    amount = 1_000_000
+    with LedgerStore(tmp_path / f"{mode}.sqlite") as store:
+        indexed_account(store, account, amount)
+        rpc.token_accounts[account] = amount
+        cfg = config(tmp_path)
+        if mode == "funds_off":
+            cfg = config(tmp_path, enabled=False)
+        elif mode == "kill":
+            cfg.kill_file.touch()
+        elif mode == "lag":
+            rpc.token_accounts[account] += 1
+        elif mode == "paused":
+            store._db.execute(
+                "CREATE TABLE chain_indexer_accounts "
+                "(token_account TEXT PRIMARY KEY, cursor TEXT, paused INTEGER, updated_ts INTEGER)"
+            )
+            store._db.execute(
+                "INSERT INTO chain_indexer_accounts VALUES (?, NULL, 1, 1)", (account,)
+            )
+        elif mode == "below_min":
+            cfg = config(tmp_path, sweep_min_micro=amount + 1)
+        engine = PayoutEngine(store, rpc, cfg, backend=backend)
+        assert engine.poll_once() == 0
+        assert backend.sweeps == []
+        assert rpc.broadcasts == []
+
+
+def test_sweep_crash_after_persist_is_not_rebuilt_or_double_sent(tmp_path):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    account = BLOCKHASHES[0]
+    with LedgerStore(tmp_path / "crash.sqlite") as store:
+        indexed_account(store, account, 1_000_000)
+        rpc.token_accounts[account] = 1_000_000
+        rpc.before_send = lambda _wire: (_ for _ in ()).throw(RuntimeError("crash"))
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+        assert engine.poll_once() == 0
+        assert store._db.execute(
+            "SELECT state FROM chain_sweeps"
+        ).fetchone()[0] == "sent"
+        assert len(backend.sweeps) == 1
+        assert rpc.broadcasts == []
+
+        rpc.before_send = None
+        assert engine.poll_once() == 0
+        assert len(backend.sweeps) == 1
+        assert rpc.broadcasts == []
+
+
+def test_one_sweep_account_failure_does_not_stop_another(tmp_path):
+    rpc = FakeRPC()
+
+    class FailingBackend(FakeBackend):
+        def build_sweep(self, source, micro_usdc, blockhash, last_valid):
+            if source == BLOCKHASHES[0]:
+                raise PayoutError("one bad account")
+            return super().build_sweep(source, micro_usdc, blockhash, last_valid)
+
+    backend = FailingBackend(rpc)
+    with LedgerStore(tmp_path / "isolated.sqlite") as store:
+        indexed_account(store, BLOCKHASHES[0], 1_000_000, "alice")
+        indexed_account(store, BLOCKHASHES[1], 2_000_000, "bob")
+        rpc.token_accounts.update(
+            {BLOCKHASHES[0]: 1_000_000, BLOCKHASHES[1]: 2_000_000}
+        )
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+        assert engine.poll_once() == 1
+        sweep = store._db.execute(
+            "SELECT operator, token_account, state FROM chain_sweeps"
+        ).fetchone()
+        assert tuple(sweep) == ("bob", BLOCKHASHES[1], "sent")
+        assert rpc.broadcasts == ["sweep-wire-1"]
 
 
 def test_store_payout_transitions_are_strict_and_attempts_are_durable(tmp_path):
@@ -219,6 +365,30 @@ def test_vault_secret_stays_in_memory_and_real_signature_verifies():
     assert str(transaction.signatures[0]) == signed.signature
     assert transaction.signatures[0].verify(treasury.pubkey(), bytes(transaction.message))
     assert transaction.verify_with_results() == [True]
+
+
+def test_real_sweep_signature_and_transfer_checked_message_verify():
+    treasury = Keypair()
+    mint = Pubkey.new_unique()
+    vault = Pubkey.new_unique()
+    source = Pubkey.new_unique()
+    blockhash = str(Hash.new_unique())
+    backend = SoldersTreasuryBackend(
+        FakeRPC(),
+        str(mint),
+        str(vault),
+        secret_loader=lambda _name: treasury.to_json(),
+    )
+    signed = backend.build_sweep(str(source), 1_234_567, blockhash, 10)
+    transaction = Transaction.from_bytes(base64.b64decode(signed.wire_b64))
+    assert str(transaction.signatures[0]) == signed.signature
+    assert transaction.verify_with_results() == [True]
+    compiled = transaction.message.instructions[0]
+    assert transaction.message.account_keys[compiled.program_id_index] == TOKEN_PROGRAM_ID
+    assert backend._resolved_accounts(transaction.message, compiled) == [
+        source, mint, vault, treasury.pubkey()
+    ]
+    assert compiled.data == b"\x0c" + (1_234_567).to_bytes(8, "little") + b"\x06"
 
 
 def test_tampered_transfer_messages_are_refused():

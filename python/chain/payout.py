@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -66,6 +67,7 @@ DEFAULT_STORE = "~/.neuron/credits/ledger.sqlite"
 DEFAULT_KILL_FILE = "~/.neuron/credits/payout.off"
 DEFAULT_LOCK_FILE = "~/.neuron/credits/payout.lock"
 DEFAULT_ROSTER = "~/.nakshatra/admission-peers.tsv"
+DEFAULT_SWEEP_MIN_MICRO = 1_000_000
 MICRO_USDC = 10 ** USDC_DECIMALS
 AUTO_CAP_USDC = Decimal("5")
 DAY_CAP_USDC = Decimal("50")
@@ -463,6 +465,63 @@ class SoldersTreasuryBackend:
             last_valid_block_height=last_valid_block_height,
         )
 
+    def build_sweep(
+        self,
+        source: str,
+        micro_usdc: int,
+        blockhash: str,
+        last_valid_block_height: int,
+    ) -> SignedTransaction:
+        """Build and audit a treasury-authorized deposit-account sweep."""
+        source_key = Pubkey.from_string(validate_pubkey(source, "deposit token account"))
+        blockhash = validate_pubkey(blockhash, "blockhash")
+        if micro_usdc <= 0:
+            raise PayoutError("sweep amount must be positive")
+        treasury = self._treasury.pubkey()
+        data = b"\x0c" + struct.pack("<Q", micro_usdc) + bytes([USDC_DECIMALS])
+        expected_accounts = [source_key, self.mint, self.vault_account, treasury]
+        instruction = Instruction(
+            TOKEN_PROGRAM_ID,
+            data,
+            [
+                AccountMeta(source_key, False, True),
+                AccountMeta(self.mint, False, False),
+                AccountMeta(self.vault_account, False, True),
+                AccountMeta(treasury, True, False),
+            ],
+        )
+        message = self._decode_message(
+            Message.new_with_blockhash(
+                [instruction], treasury, Hash.from_string(blockhash)
+            )
+        )
+        if message.recent_blockhash != Hash.from_string(blockhash):
+            raise PayoutError("compiled sweep uses the wrong blockhash")
+        if not message.account_keys or message.account_keys[0] != treasury:
+            raise PayoutError("compiled sweep uses the wrong fee payer")
+        if message.header.num_required_signatures != 1 or len(message.instructions) != 1:
+            raise PayoutError("compiled sweep has unexpected signatures or instructions")
+        compiled = message.instructions[0]
+        if message.account_keys[compiled.program_id_index] != TOKEN_PROGRAM_ID:
+            raise PayoutError("compiled sweep uses the wrong program")
+        if self._resolved_accounts(message, compiled) != expected_accounts:
+            raise PayoutError("compiled sweep uses the wrong accounts")
+        if compiled.data != data:
+            raise PayoutError("compiled sweep uses the wrong amount or decimals")
+        self._assert_message_keys(message, [treasury, *expected_accounts, TOKEN_PROGRAM_ID])
+        expected = Message.new_with_blockhash(
+            [instruction], treasury, Hash.from_string(blockhash)
+        )
+        if bytes(message) != bytes(expected):
+            raise PayoutError("compiled sweep metadata differs from the expected message")
+        transaction = self._sign_message(message, [self._treasury])
+        return SignedTransaction(
+            signature=str(transaction.signatures[0]),
+            wire_b64=base64.b64encode(bytes(transaction)).decode("ascii"),
+            blockhash=blockhash,
+            last_valid_block_height=last_valid_block_height,
+        )
+
 
 @dataclass(frozen=True)
 class PayoutConfig:
@@ -478,6 +537,7 @@ class PayoutConfig:
     presence_wait_s: int = 120
     require_live_funds_env: bool = False
     roster_path: Path = Path(DEFAULT_ROSTER).expanduser()
+    sweep_min_micro: int = DEFAULT_SWEEP_MIN_MICRO
 
     def __post_init__(self) -> None:
         # Reuse S3's complete cluster/RPC/pubkey validation.
@@ -492,6 +552,12 @@ class PayoutConfig:
             raise ValueError("payout caps must be positive")
         if self.presence_wait_s <= 0:
             raise ValueError("presence wait must be positive")
+        if (
+            isinstance(self.sweep_min_micro, bool)
+            or not isinstance(self.sweep_min_micro, int)
+            or self.sweep_min_micro <= 0
+        ):
+            raise ValueError("sweep minimum must be a positive integer")
 
     @classmethod
     def from_env(cls) -> "PayoutConfig":
@@ -530,6 +596,9 @@ class PayoutConfig:
                 os.path.expanduser(
                     os.environ.get("NAK_ADMISSION_ROSTER", DEFAULT_ROSTER)
                 )
+            ),
+            sweep_min_micro=int(
+                os.environ.get("NAK_SWEEP_MIN_MICRO", str(DEFAULT_SWEEP_MIN_MICRO))
             ),
         )
 
@@ -695,6 +764,122 @@ class PayoutEngine:
                 LOG.error("deposit account creation failed for %s: %s", row["operator"], exc)
         return changed
 
+    def _advance_sweep(self, row: dict[str, Any]) -> int:
+        """Resolve one durable sweep without ever constructing a competing tx."""
+        status = self.rpc.get_signature_status(row["signature"])
+        if isinstance(status, dict):
+            if status.get("err") is not None:
+                self.store.fail_sweep(row["id"])
+                LOG.error(
+                    "sweep failed operator=%s account=%s signature=%s",
+                    row["operator"], row["token_account"], row["signature"],
+                )
+                return 1
+            if status.get("confirmationStatus") == "finalized":
+                self.store.finalize_sweep(row["id"])
+                LOG.info(
+                    "sweep finalized operator=%s account=%s amount_micro=%s signature=%s",
+                    row["operator"], row["token_account"], row["amount_micro"],
+                    row["signature"],
+                )
+                return 1
+            return 0
+        if self.rpc.get_block_height() > int(row["last_valid_block_height"]):
+            # Search history once more after observing expiry, matching payout fencing.
+            status = self.rpc.get_signature_status(row["signature"])
+            if status is None:
+                self.store.fail_sweep(row["id"])
+                LOG.warning(
+                    "sweep expired operator=%s account=%s signature=%s",
+                    row["operator"], row["token_account"], row["signature"],
+                )
+                return 1
+            if status.get("err") is not None:
+                self.store.fail_sweep(row["id"])
+                return 1
+            if status.get("confirmationStatus") == "finalized":
+                self.store.finalize_sweep(row["id"])
+                return 1
+        return 0
+
+    def _start_sweep(self, row: dict[str, Any], amount_micro: int) -> int:
+        latest = self.rpc.get_latest_blockhash()
+        signed = self._backend().build_sweep(
+            row["token_account"],
+            amount_micro,
+            latest["blockhash"],
+            latest["last_valid_block_height"],
+        )
+        sweep_id = uuid.uuid4().hex
+        # The immutable signature and validity window are durable before broadcast.
+        self.store.begin_sweep(
+            sweep_id,
+            row["operator"],
+            row["token_account"],
+            amount_micro,
+            signed.signature,
+            signed.blockhash,
+            signed.last_valid_block_height,
+        )
+        try:
+            self._may_act()
+            returned = self.rpc.send_transaction(signed.wire_b64)
+            if returned != signed.signature:
+                raise PayoutError(
+                    "RPC returned a signature different from the signed sweep"
+                )
+        except RPCError as exc:
+            LOG.warning("sweep broadcast ambiguous for %s: %s", sweep_id, exc)
+        LOG.info(
+            "sweep sent operator=%s account=%s amount_micro=%s signature=%s",
+            row["operator"], row["token_account"], amount_micro, signed.signature,
+        )
+        return 1
+
+    def _sweep_pass(self) -> int:
+        changed = 0
+        for sweep in self.store.sweeps_in_flight():
+            try:
+                changed += self._advance_sweep(sweep)
+            except Exception:
+                LOG.exception(
+                    "sweep resolution failed operator=%s account=%s",
+                    sweep["operator"], sweep["token_account"],
+                )
+        in_flight = {
+            row["token_account"] for row in self.store.sweeps_in_flight()
+        }
+        for row in self.store.sweep_accounts():
+            account = str(row["token_account"])
+            if int(row["paused"]) or account in in_flight:
+                continue
+            try:
+                snapshot = self.rpc.get_token_account(account)
+                if (
+                    snapshot.get("mint") != self.config.mint
+                    or int(snapshot.get("decimals")) != USDC_DECIMALS
+                ):
+                    raise PayoutError("deposit account mint or decimals differ")
+                balance = int(snapshot["amount"])
+                if balance < self.config.sweep_min_micro:
+                    continue
+                indexed = int(row["indexed_credits"])
+                swept = int(row["swept_micro"])
+                if balance * RATE != indexed - swept * RATE:
+                    LOG.info(
+                        "sweep deferred for indexer lag operator=%s account=%s",
+                        row["operator"], account,
+                    )
+                    continue
+                changed += self._start_sweep(row, balance)
+                in_flight.add(account)
+            except Exception:
+                LOG.exception(
+                    "sweep failed operator=%s account=%s",
+                    row["operator"], account,
+                )
+        return changed
+
     def _build_and_send(self, row: dict[str, Any]) -> int:
         ata = self._ensure_recipient_ata(row["address"])
         latest = self.rpc.get_latest_blockhash()
@@ -805,6 +990,8 @@ class PayoutEngine:
                 LOG.info("DRY-RUN would create deposit account for %s", row["operator"])
             return changed
 
+        # Internal consolidation is guarded like payouts, but has no cap or presence gate.
+        changed += PayoutEngine._sweep_pass(self)
         changed += self._create_deposit_accounts()
         for row in self.store.withdrawals(
             "sent", exclude_operators=frozen_operators

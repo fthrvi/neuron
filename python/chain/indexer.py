@@ -45,6 +45,7 @@ from core.ledger_store import (
     DepositBalanceMismatch,
     LedgerError,
     LedgerStore,
+    SweepInFlight,
 )
 
 
@@ -566,6 +567,12 @@ class DepositIndexer:
                 int(after_snapshot["amount"]) * RATE,
                 cursor=cursor,
             )
+        except SweepInFlight:
+            LOG.info(
+                "sweep in flight for %s; reconciliation deferred",
+                account.token_account,
+            )
+            return 0
         except DepositBalanceMismatch as exc:
             self._pause(
                 account,

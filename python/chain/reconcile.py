@@ -571,6 +571,12 @@ class Reconciler:
                             "ORDER BY withdrawal_id, attempt"
                         )
                     ],
+                    "chain_sweeps": [
+                        dict(row)
+                        for row in db.execute(
+                            "SELECT * FROM chain_sweeps ORDER BY id"
+                        )
+                    ],
                 }
                 db.execute("COMMIT")
             except Exception:
@@ -602,6 +608,13 @@ class Reconciler:
                 for row in ledger["withdrawals"]
                 if isinstance(row.get("tx_sig"), str) and row["tx_sig"]
             }
+            | {
+                row["signature"]
+                for row in ledger["chain_sweeps"]
+                if row.get("state") in {"sent", "finalized"}
+                and isinstance(row.get("signature"), str)
+                and row["signature"]
+            }
         )
 
     def _token_accounts(self, addresses: list[str]) -> dict[str, Any]:
@@ -620,7 +633,7 @@ class Reconciler:
             confirmed = self.confirm_rpc.get_signature_statuses(signatures)
             if primary != confirmed:
                 raise ReconcileError(
-                    "withdrawal statuses differ between primary and confirmation RPCs"
+                    "transaction statuses differ between primary and confirmation RPCs"
                 )
         return primary
 
@@ -727,6 +740,103 @@ class Reconciler:
             proof["error"] = f"{type(exc).__name__}: {exc}"
         return proof
 
+    def _sweep_transfer_proof(
+        self, row: dict[str, Any], status: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        proof: dict[str, Any] = {
+            "sweep_id": row["id"],
+            "operator": row["operator"],
+            "token_account": row["token_account"],
+            "signature": row["signature"],
+            "amount_micro": int(row["amount_micro"]),
+            "ledger_state": row["state"],
+            "ok": False,
+        }
+        try:
+            signature = row["signature"]
+            if not isinstance(signature, str) or not signature:
+                raise ReconcileError("sweep has no transaction signature")
+            if not isinstance(status, dict):
+                raise ReconcileError("sweep transaction has no chain status")
+            proof["confirmation_status"] = status.get("confirmationStatus")
+            if status.get("confirmationStatus") != "finalized" or status.get("err") is not None:
+                raise ReconcileError("sweep transaction is not successfully finalized")
+            transaction = self._transaction(signature)
+            if not isinstance(transaction, dict):
+                raise ReconcileError("finalized sweep transaction body is unavailable")
+            meta = transaction.get("meta")
+            if not isinstance(meta, dict) or meta.get("err") is not None:
+                raise ReconcileError("sweep transaction metadata is absent or failed")
+            transfers: list[dict[str, Any]] = []
+            for _index, instruction in _flatten_instructions(transaction):
+                if (
+                    instruction.get("program") != TOKEN_PROGRAM
+                    or instruction.get("programId") != TOKEN_PROGRAM_ID
+                ):
+                    continue
+                parsed = instruction.get("parsed")
+                if not isinstance(parsed, dict) or parsed.get("type") not in {
+                    "transfer", "transferChecked"
+                }:
+                    continue
+                info = parsed.get("info")
+                if isinstance(info, dict):
+                    transfers.append(info)
+            if len(transfers) != 1:
+                raise ReconcileError(
+                    f"expected exactly one parsed sweep transfer, found {len(transfers)}"
+                )
+            transfer = transfers[0]
+            token_amount = transfer.get("tokenAmount")
+            if not isinstance(token_amount, dict):
+                raise ReconcileError("sweep is not a TransferChecked instruction")
+            if (
+                transfer.get("source") != row["token_account"]
+                or transfer.get("destination") != self.config.vault_account
+                or transfer.get("mint") != self.config.mint
+                or token_amount.get("decimals") != USDC_DECIMALS
+                or str(token_amount.get("amount")) != str(row["amount_micro"])
+            ):
+                raise ReconcileError(
+                    "sweep source, destination, mint, decimals, or amount differs"
+                )
+            proof["ok"] = True
+        except (KeyError, OSError, RPCError, ReconcileError, TypeError, ValueError) as exc:
+            proof["error"] = f"{type(exc).__name__}: {exc}"
+        return proof
+
+    def _sweep_provenance(
+        self,
+        ledger: dict[str, Any],
+        statuses: dict[str, dict[str, Any] | None],
+    ) -> tuple[list[str], list[dict[str, Any]], dict[str, int], int]:
+        errors: list[str] = []
+        proofs: list[dict[str, Any]] = []
+        swept_by_account: dict[str, int] = {}
+        total = 0
+        for row in ledger["chain_sweeps"]:
+            state = row["state"]
+            if state == "failed":
+                continue
+            status = statuses.get(row["signature"])
+            chain_finalized = (
+                isinstance(status, dict)
+                and status.get("confirmationStatus") == "finalized"
+                and status.get("err") is None
+            )
+            if state == "sent" and not chain_finalized:
+                continue
+            proof = self._sweep_transfer_proof(row, status)
+            proofs.append(proof)
+            if not proof["ok"]:
+                errors.append(f"{row['id']}: finalized sweep proof is missing or mismatched")
+                continue
+            amount_credits = int(row["amount_micro"]) * RATE
+            account = str(row["token_account"])
+            swept_by_account[account] = swept_by_account.get(account, 0) + amount_credits
+            total += amount_credits
+        return errors, proofs, swept_by_account, total
+
     @staticmethod
     def _detail(row: dict[str, Any]) -> dict[str, Any] | None:
         try:
@@ -740,6 +850,8 @@ class Reconciler:
         ledger: dict[str, Any],
         token_amounts: dict[str, int],
         verified_vault_outflow: int,
+        swept_by_account: dict[str, int],
+        verified_swept_total: int,
     ) -> tuple[list[str], list[str]]:
         errors: list[str] = []
         lag: list[str] = []
@@ -783,15 +895,22 @@ class Reconciler:
             token_account = ref.get("token_account")
             if isinstance(token_account, str):
                 indexed[token_account] = indexed.get(token_account, 0) + int(ref["amount"])
-        for row in ledger["deposit_accounts"]:
-            address = row["token_account"]
+        addresses = {
+            row["token_account"] for row in ledger["deposit_accounts"]
+        } | {self.config.vault_account}
+        for address in sorted(addresses):
             on_chain = token_amounts.get(address, 0) * RATE
-            expected = indexed.get(address, 0)
             if address == self.config.vault_account:
-                expected -= verified_vault_outflow
+                expected = (
+                    indexed.get(address, 0)
+                    + verified_swept_total
+                    - verified_vault_outflow
+                )
+            else:
+                expected = indexed.get(address, 0) - swept_by_account.get(address, 0)
             if expected < 0:
                 errors.append(
-                    f"{address}: verified withdrawals exceed indexed deposits"
+                    f"{address}: verified outflow exceeds indexed deposits and sweeps"
                 )
                 continue
             if on_chain > expected:
@@ -1990,6 +2109,9 @@ class Reconciler:
         lifecycle_errors, sent_proofs, finalized_proofs, sent_adjustment = (
             self._withdrawal_lifecycle(ledger, statuses)
         )
+        sweep_errors, sweep_proofs, swept_by_account, verified_swept_total = (
+            self._sweep_provenance(ledger, statuses)
+        )
         verified_vault_outflow = sum(
             int(item["amount_credits"])
             for item in finalized_proofs
@@ -2000,8 +2122,18 @@ class Reconciler:
             if item["chain_state"] == "finalized_pending_ledger"
         )
         deposit_errors, lag = self._deposit_provenance(
-            ledger, token_amounts, verified_vault_outflow
+            ledger,
+            token_amounts,
+            verified_vault_outflow,
+            swept_by_account,
+            verified_swept_total,
         )
+        # An unproved finalized sweep is a stable mismatch, not ordinary
+        # indexer lag. Its missing adjustment can otherwise make the vault's
+        # observed balance look merely ahead of the ledger.
+        if sweep_errors and lag:
+            deposit_errors.extend(lag)
+            lag = []
         balances = {row["id"]: int(row["balance"]) for row in ledger["accounts"]}
         treasury_balance = balances.get(TREASURY_ACCOUNT, 0)
         balance_sum = sum(balances.values())
@@ -2068,10 +2200,17 @@ class Reconciler:
             },
             {
                 "id": "deposit_provenance",
-                "ok": not deposit_errors,
+                "ok": not deposit_errors and not sweep_errors,
                 "chain_ref_credits": chain_ref_deposits,
                 "journal_credits": journal_deposits,
-                "errors": deposit_errors,
+                "errors": [*deposit_errors, *sweep_errors],
+            },
+            {
+                "id": "chain_sweeps",
+                "ok": not sweep_errors,
+                "checked": len(sweep_proofs),
+                "verified_credits": verified_swept_total,
+                "errors": sweep_errors,
             },
             {
                 "id": "withdrawal_lifecycle",
@@ -2137,11 +2276,19 @@ class Reconciler:
                 "all_balances_credits": balance_sum,
                 "chain_ref_deposit_credits": chain_ref_deposits,
                 "journal_deposit_credits": journal_deposits,
+                "verified_swept_credits": verified_swept_total,
             },
             "token_accounts": token_accounts,
             "sent_withdrawals": sent_proofs,
             "finalized_withdrawals": finalized_proofs,
             "finalized_withdrawal_verification": "all",
+            "chain_sweeps": sweep_proofs,
+            "chain_sweep_summary": {
+                "ledger_rows": len(ledger["chain_sweeps"]),
+                "proofs_checked": len(sweep_proofs),
+                "verified_credits": verified_swept_total,
+                "verification": "all finalized ledger and chain-finalized sent sweeps",
+            },
             "alerts": [],
         }
         return report, lag

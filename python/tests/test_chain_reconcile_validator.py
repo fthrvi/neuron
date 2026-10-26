@@ -233,6 +233,7 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
             return _run([solana, "address", "-k", str(keypair)], env).stdout.strip()
 
         vault_account = token_account("vault-token")
+        deposit_account = token_account("deposit-token")
         source_account = token_account("source-token")
         _run(
             common + ["mint", mint, "1", source_account, "--mint-authority", str(treasury)],
@@ -244,7 +245,7 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
                 "transfer",
                 mint,
                 "1",
-                vault_account,
+                deposit_account,
                 "--from",
                 source_account,
                 "--owner",
@@ -265,7 +266,7 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
             store._db.execute(
                 "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
                 "VALUES ('validator-user', ?, 1)",
-                (vault_account,),
+                (deposit_account,),
             )
             indexer = DepositIndexer(
                 store,
@@ -275,6 +276,42 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
             assert indexer.poll_once() == 1
             amount = 1_000_000 * RATE
             assert store.balance("validator-user") == amount
+
+            sweep_config = PayoutConfig(
+                cluster="localnet",
+                mint=mint,
+                rpc_url=rpc_url,
+                vault_account=vault_account,
+                enabled=True,
+                kill_file=tmp_path / "sweep-payout.off",
+                roster_path=tmp_path / "roster.tsv",
+            )
+            sweep_config.roster_path.write_text("", encoding="utf-8")
+            sweep_backend = SoldersTreasuryBackend(
+                rpc,
+                mint,
+                vault_account,
+                secret_loader=lambda name: (
+                    treasury.read_text() if name == "nak-treasury-secret" else ""
+                ),
+            )
+            sweep_engine = PayoutEngine(
+                store, rpc, sweep_config, backend=sweep_backend
+            )
+            assert sweep_engine.poll_once() == 1
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                sweep_engine.poll_once()
+                sweep_state = store._db.execute(
+                    "SELECT state FROM chain_sweeps"
+                ).fetchone()[0]
+                if sweep_state == "finalized":
+                    break
+                time.sleep(0.2)
+            else:
+                pytest.fail(f"sweep did not finalize; state={sweep_state}")
+            assert rpc.get_token_account(deposit_account)["amount"] == 0
+            assert rpc.get_token_account(vault_account)["amount"] == 1_000_000
 
             def reconcile_config(name, kill_name="payout.off"):
                 return ReconcileConfig(
@@ -299,6 +336,7 @@ def test_real_validator_signed_report_kill_and_sent_adjustment(tmp_path):
             assert verify_report(envelope, None) is False
             assert verify_report(json.loads(report_path.read_text()), signing_public_key) is True
             assert envelope["report"]["finalized_withdrawal_verification"] == "all"
+            assert envelope["report"]["chain_sweep_summary"]["proofs_checked"] == 1
             assert not (tmp_path / "payout.off").exists()
 
             # SQLite backup gives the test a transactionally consistent temp copy;

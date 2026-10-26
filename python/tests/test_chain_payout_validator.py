@@ -203,11 +203,6 @@ def test_real_deposit_hold_send_finalize_is_zero_sum(tmp_path):
             + ["mint", mint, "1", source_account, "--mint-authority", str(treasury)],
             env,
         )
-        _run(
-            common
-            + ["mint", mint, "1", vault_account, "--mint-authority", str(treasury)],
-            env,
-        )
         # The payout RPC intentionally preflights at finalized commitment.
         # Wait for CLI-created fixtures to reach that bank before exercising it.
         deadline = time.monotonic() + 20
@@ -291,6 +286,23 @@ def test_real_deposit_hold_send_finalize_is_zero_sum(tmp_path):
             assert indexer.poll_once() == 1
             amount = 1_000_000 * RATE
             assert store.balance("validator-user") == amount
+
+            # Consolidate the fully indexed deposit before paying from the vault.
+            assert engine.poll_once() == 1
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                engine.poll_once()
+                sweep_state = store._db.execute(
+                    "SELECT state FROM chain_sweeps"
+                ).fetchone()[0]
+                if sweep_state == "finalized":
+                    break
+                time.sleep(0.2)
+            else:
+                pytest.fail(f"sweep did not finalize; state={sweep_state}")
+            assert rpc.get_token_account(deposit_account)["amount"] == 0
+            assert rpc.get_token_account(vault_account)["amount"] == 1_000_000
+
             store.withdraw_hold(
                 "validator-user", amount, recipient_address, "validator-withdrawal"
             )

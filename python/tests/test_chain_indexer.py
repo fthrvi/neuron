@@ -177,6 +177,39 @@ def test_balance_mismatch_pauses_account_and_writes_alert(recorded, tmp_path, ca
         assert "chain_indexer_alert" in caplog.text
 
 
+def test_finalized_sweep_then_new_deposit_is_credited(recorded, tmp_path):
+    recorded["signatures"] = [
+        item for item in recorded["signatures"] if item["signature"] == "sig-checked"
+    ]
+    rpc = FakeRPC(recorded, balance=5)
+    with LedgerStore(tmp_path / "ledger.sqlite") as store:
+        _register(store, recorded)
+        account = recorded["addresses"]["deposit"]
+        store.deposit_batch("alice", account, [("old:0", 10 * RATE, 1)], 10 * RATE)
+        store.begin_sweep("sweep", "alice", account, 10, "sweep-sig", "hash", 99)
+        store.finalize_sweep("sweep")
+        assert DepositIndexer(store, rpc, _config(recorded)).poll_once() == 1
+        assert store.balance("alice") == 15 * RATE
+        assert store._db.execute(
+            "SELECT paused FROM chain_indexer_accounts WHERE token_account=?", (account,)
+        ).fetchone()[0] == 0
+
+
+def test_sent_sweep_defers_account_without_pause_or_cursor_advance(recorded, tmp_path):
+    rpc = FakeRPC(recorded, balance=0)
+    with LedgerStore(tmp_path / "ledger.sqlite") as store:
+        _register(store, recorded)
+        account = recorded["addresses"]["deposit"]
+        store.begin_sweep("sweep", "alice", account, 10, "sweep-sig", "hash", 99)
+        indexer = DepositIndexer(store, rpc, _config(recorded))
+        assert indexer.poll_once() == 0
+        state = store._db.execute(
+            "SELECT paused, cursor FROM chain_indexer_accounts WHERE token_account=?",
+            (account,),
+        ).fetchone()
+        assert tuple(state) == (0, None)
+
+
 def test_mainnet_and_malformed_keys_are_refused(recorded, tmp_path):
     with pytest.raises(ValueError, match="mainnet-beta is refused"):
         _config(recorded, cluster="mainnet-beta")

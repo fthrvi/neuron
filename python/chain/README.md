@@ -11,8 +11,8 @@ repository.
 
 1. Install and configure `nak-indexer.service` first. It is read-only and must be healthy
    before money routes are exposed.
-2. Install `nak-treasury.service` with `NAK_FUNDS=off`. Confirm its vault, mint, caps, and
-   kill-file path before turning funds on.
+2. Install `nak-treasury.service` with `NAK_FUNDS=off`. Confirm its vault, mint, sweep
+   minimum, caps, and kill-file path before turning funds on.
 3. Install `nak-reconcile.service` and `nak-reconcile.timer` last. Run the service once by
    hand, verify the signed report, then enable the daily timer.
 
@@ -22,15 +22,16 @@ with `~/.nakshatra/keys/worker.ed25519`, checks every finalized withdrawal (not 
 validates every pending/approved/sent/expired/finalized/released hold and lifecycle journal,
 and appends mismatches or inconclusive collections to `reconcile/alerts.jsonl`. It opens
 the existing ledger through SQLite's `file:...?mode=ro` URI, performs the complete ledger
-read in an explicit read transaction, and never runs `LedgerStore` initialization or
+read in an explicit read transaction, verifies every finalized deposit-to-vault sweep,
+and never runs `LedgerStore` initialization or
 migrations. A missing, unreadable, or old-schema ledger is therefore a collection error
 and creates the payout kill file rather than a new database.
 
 It uses only read RPC methods and does not need `solders`; `/usr/bin/python3` is sufficient
 when Neuron's normal Python dependencies are installed. Every collection brackets one
 transactional ledger image with two finalized `getMultipleAccounts` reads and batches all
-withdrawal statuses into one `getSignatureStatuses` call. A changing chain/ledger view or
-a deposit visible on chain before the indexer records it is `inconclusive`, not a mismatch.
+withdrawal and sweep statuses into one `getSignatureStatuses` call. A changing chain/ledger
+view or a deposit visible on chain before the indexer records it is `inconclusive`, not a mismatch.
 The service retries three times by default, alerts without killing after an inconclusive
 run, and creates the kill file after three consecutive inconclusive runs. Configure these
 budgets with `NAK_RECONCILE_SNAPSHOT_ATTEMPTS`, `NAK_RECONCILE_RETRY_DELAY_S`, and
@@ -74,6 +75,12 @@ path, and `nak-credit-reconciliation-v1` purpose inside the signed payload.
 ## Safety switches
 
 - `NAK_FUNDS=off` is the payout worker's safe default. Only `on` permits treasury writes.
+- `NAK_SWEEP_MIN_MICRO` is the smallest deposit-account balance the treasury consolidates
+  into `NAK_TREASURY_USDC_ACCOUNT`; it defaults to `1000000` (1 USDC). Sweeps run before
+  payouts and use the same `NAK_FUNDS` and kill-file gates, but not payout caps or presence.
+  An account is swept only when its finalized balance is fully indexed. The signed intent
+  is durable before broadcast, and an unresolved intent prevents both another sweep and
+  indexer cursor advancement for that account.
 - `NAK_FUNDS_ROUTES=on` exposes the wallet/withdraw HTTP routes. Leave it unset or `off`
   until the indexer, treasury, and first reconciliation are healthy.
 - `NAK_SPEND_ROUTES=on` exposes the signed loopback-only `/spend/*` routes. It defaults
@@ -130,3 +137,11 @@ signed reports, and alert log. Reconciliation never repairs balances; resolve th
 journal discrepancy by an audited append-only operation, run reconciliation again, and
 remove the kill file only after a human has verified a clean signed report. Disabling the
 timer is the code rollback; it does not roll back journal rows or on-chain transfers.
+
+To roll back the sweep worker, first turn `NAK_FUNDS=off` and create the kill file, then
+disable sweep initiation while retaining the sweep-aware indexer, reconciliation code, and
+`chain_sweeps` table. Never delete or edit a sweep row: finalized rows are reconciliation
+proof, and `sent` rows must be resolved as finalized or failed. Do not deploy a pre-sweep
+indexer after any finalized sweep; it cannot account for the deposit account's lower
+balance. A sweep already finalized on chain is irreversible; rollback changes automation
+only, not token location or liability.

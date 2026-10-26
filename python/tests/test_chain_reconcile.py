@@ -127,6 +127,37 @@ def _check(report, check_id):
     return next(check for check in report["checks"] if check["id"] == check_id)
 
 
+def _sweep_transaction(source, destination, amount_micro):
+    return {
+        "slot": 20,
+        "transaction": {
+            "signatures": ["sweep-signature"],
+            "message": {
+                "accountKeys": [],
+                "instructions": [
+                    {
+                        "program": "spl-token",
+                        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                        "parsed": {
+                            "type": "transferChecked",
+                            "info": {
+                                "source": source,
+                                "destination": destination,
+                                "mint": MINT,
+                                "tokenAmount": {
+                                    "amount": str(amount_micro),
+                                    "decimals": 6,
+                                },
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+        "meta": {"err": None, "innerInstructions": []},
+    }
+
+
 def test_read_only_snapshot_and_batched_stable_collection(tmp_path):
     path = tmp_path / "ledger.sqlite"
     with _ledger(path) as store:
@@ -149,6 +180,53 @@ def test_read_only_snapshot_and_batched_stable_collection(tmp_path):
     assert path.stat().st_mtime_ns == before_mtime
     with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as db:
         assert db.execute("SELECT COUNT(*) FROM journal").fetchone()[0] == before_rows
+
+
+def test_finalized_sweep_moves_expectation_to_vault_without_changing_backing(tmp_path):
+    path = tmp_path / "swept.sqlite"
+    with _ledger(path, (("alice", SECOND_ACCOUNT, "deposit-a", 100),)) as store:
+        store.begin_sweep(
+            "sweep-a", "alice", SECOND_ACCOUNT, 100,
+            "sweep-signature", "blockhash", 100,
+        )
+        store.finalize_sweep("sweep-a")
+    status = {"err": None, "confirmationStatus": "finalized"}
+    rpc = FakeReconcileRPC(
+        {VAULT: 100, SECOND_ACCOUNT: 0},
+        statuses={"sweep-signature": status},
+        transactions={
+            "sweep-signature": _sweep_transaction(SECOND_ACCOUNT, VAULT, 100)
+        },
+    )
+    report = Reconciler(path, rpc, _config(tmp_path)).collect()
+    assert report["outcome"] == "match"
+    assert _check(report, "chain_sweeps")["ok"] is True
+    assert _check(report, "treasury_backing")["ok"] is True
+    assert report["chain_sweep_summary"]["verified_credits"] == 100 * RATE
+    assert rpc.calls[2] == ("statuses", ("sweep-signature",))
+
+
+@pytest.mark.parametrize("bad_proof", ["missing", "wrong_source"])
+def test_finalized_sweep_requires_matching_chain_proof(tmp_path, bad_proof):
+    path = tmp_path / f"sweep-{bad_proof}.sqlite"
+    with _ledger(path, (("alice", SECOND_ACCOUNT, "deposit-a", 100),)) as store:
+        store.begin_sweep(
+            "sweep-a", "alice", SECOND_ACCOUNT, 100,
+            "sweep-signature", "blockhash", 100,
+        )
+        store.finalize_sweep("sweep-a")
+    status = {"err": None, "confirmationStatus": "finalized"}
+    transaction = None
+    if bad_proof == "wrong_source":
+        transaction = _sweep_transaction(VAULT, VAULT, 100)
+    rpc = FakeReconcileRPC(
+        {VAULT: 100, SECOND_ACCOUNT: 0},
+        statuses={"sweep-signature": status},
+        transactions={"sweep-signature": transaction},
+    )
+    report = Reconciler(path, rpc, _config(tmp_path)).collect()
+    assert report["outcome"] == "mismatch"
+    assert _check(report, "chain_sweeps")["ok"] is False
 
 
 def test_transient_chain_change_retries_without_mismatch(tmp_path):

@@ -126,6 +126,14 @@ class DepositBalanceMismatch(LedgerError):
         )
 
 
+class SweepInFlight(LedgerError):
+    """A deposit account is temporarily locked by an unconfirmed sweep."""
+
+
+class SweepStateError(LedgerError):
+    """A chain sweep does not exist or cannot make the requested transition."""
+
+
 class WithdrawalStateError(ReceiptStateError):
     """A withdrawal does not exist or cannot make the requested state transition."""
 
@@ -412,6 +420,26 @@ class LedgerStore:
                 PRIMARY KEY(withdrawal_id, attempt),
                 FOREIGN KEY(withdrawal_id) REFERENCES withdrawals(id)
             );
+
+            CREATE TABLE IF NOT EXISTS chain_sweeps (
+                id TEXT PRIMARY KEY,
+                operator TEXT NOT NULL,
+                token_account TEXT NOT NULL,
+                amount_micro INTEGER NOT NULL
+                    CHECK(typeof(amount_micro) = 'integer'
+                          AND amount_micro BETWEEN 1 AND {max_units}),
+                state TEXT NOT NULL CHECK(state IN ('sent','finalized','failed')),
+                signature TEXT NOT NULL UNIQUE,
+                blockhash TEXT NOT NULL,
+                last_valid_block_height INTEGER NOT NULL
+                    CHECK(typeof(last_valid_block_height) = 'integer'
+                          AND last_valid_block_height >= 0),
+                created_ts INTEGER NOT NULL CHECK(typeof(created_ts) = 'integer'),
+                updated_ts INTEGER NOT NULL CHECK(typeof(updated_ts) = 'integer')
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS chain_sweeps_one_sent_per_account
+            ON chain_sweeps(token_account) WHERE state='sent';
 
             CREATE TABLE IF NOT EXISTS spend_holds (
                 hold_id TEXT PRIMARY KEY,
@@ -702,6 +730,34 @@ class LedgerStore:
             BEFORE DELETE ON journal
             BEGIN
                 SELECT RAISE(ABORT, 'journal is append-only');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS chain_sweeps_core_immutable
+            BEFORE UPDATE OF id, operator, token_account, amount_micro, signature,
+                blockhash, last_valid_block_height, created_ts
+            ON chain_sweeps
+            BEGIN
+                SELECT RAISE(ABORT, 'chain sweep intent is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS chain_sweeps_initial_state
+            BEFORE INSERT ON chain_sweeps
+            WHEN NEW.state != 'sent'
+            BEGIN
+                SELECT RAISE(ABORT, 'chain sweep must begin sent');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS chain_sweeps_state_transition
+            BEFORE UPDATE ON chain_sweeps
+            WHEN OLD.state != 'sent' OR NEW.state NOT IN ('finalized','failed')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid chain sweep state transition');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS chain_sweeps_no_delete
+            BEFORE DELETE ON chain_sweeps
+            BEGIN
+                SELECT RAISE(ABORT, 'chain sweeps are permanent');
             END;
 
             CREATE TRIGGER IF NOT EXISTS spend_holds_snapshots_immutable
@@ -2659,6 +2715,13 @@ class LedgerStore:
         now = int(time.time())
 
         def operation(db: sqlite3.Connection) -> int:
+            if db.execute(
+                "SELECT 1 FROM chain_sweeps WHERE token_account=? AND state='sent'",
+                (token_account,),
+            ).fetchone() is not None:
+                raise SweepInFlight(
+                    f"deposit account {token_account!r} has a sweep in flight"
+                )
             already_indexed = int(
                 db.execute(
                     "SELECT COALESCE(SUM(amount), 0) FROM chain_refs "
@@ -2687,9 +2750,16 @@ class LedgerStore:
                     continue
                 pending.append((ref, credits, slot))
 
+            swept_credits = int(
+                db.execute(
+                    "SELECT COALESCE(SUM(amount_micro), 0) * ? FROM chain_sweeps "
+                    "WHERE token_account=? AND state IN ('sent','finalized')",
+                    (RATE, token_account),
+                ).fetchone()[0]
+            )
             reconciled_total = already_indexed + sum(
                 credits for _ref, credits, _slot in pending
-            )
+            ) - swept_credits
             if reconciled_total != expected_total:
                 raise DepositBalanceMismatch(expected_total, reconciled_total)
 
@@ -2741,6 +2811,151 @@ class LedgerStore:
             return added
 
         return self._tx(operation)
+
+    def begin_sweep(
+        self,
+        sweep_id: str,
+        operator: str,
+        token_account: str,
+        amount_micro: int,
+        signature: str,
+        blockhash: str,
+        last_valid_block_height: int,
+    ) -> int:
+        """Persist an immutable signed sweep intent before any broadcast."""
+        sweep_id = _identifier(sweep_id, "sweep_id")
+        operator = _identifier(operator, "operator")
+        if is_reserved(operator):
+            raise LedgerValueError("operator is reserved")
+        token_account = _identifier(token_account, "token_account")
+        amount_micro = _amount(amount_micro, "amount_micro")
+        signature = _identifier(signature, "signature")
+        blockhash = _identifier(blockhash, "blockhash")
+        if (
+            isinstance(last_valid_block_height, bool)
+            or not isinstance(last_valid_block_height, int)
+            or not 0 <= last_valid_block_height <= 2 ** 63 - 1
+        ):
+            raise LedgerValueError("last_valid_block_height is invalid")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> int:
+            existing = db.execute(
+                "SELECT * FROM chain_sweeps WHERE id=?", (sweep_id,)
+            ).fetchone()
+            if existing is not None:
+                same = (
+                    existing["operator"] == operator
+                    and existing["token_account"] == token_account
+                    and int(existing["amount_micro"]) == amount_micro
+                    and existing["signature"] == signature
+                    and existing["blockhash"] == blockhash
+                    and int(existing["last_valid_block_height"])
+                    == last_valid_block_height
+                )
+                if same:
+                    return amount_micro
+                raise SweepStateError(f"sweep {sweep_id!r} already has different details")
+            bound = db.execute(
+                "SELECT token_account FROM deposit_accounts WHERE operator=?",
+                (operator,),
+            ).fetchone()
+            if bound is None or bound["token_account"] != token_account:
+                raise LedgerValueError("sweep account is not bound to operator")
+            try:
+                db.execute(
+                    "INSERT INTO chain_sweeps(id, operator, token_account, amount_micro, "
+                    "state, signature, blockhash, last_valid_block_height, created_ts, "
+                    "updated_ts) VALUES (?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?)",
+                    (
+                        sweep_id, operator, token_account, amount_micro, signature,
+                        blockhash, last_valid_block_height, now, now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise SweepStateError(
+                    "sweep signature is reused or account already has a sent sweep"
+                ) from exc
+            return amount_micro
+
+        return self._tx(operation)
+
+    def _finish_sweep(self, sweep_id: str, state: str) -> int:
+        sweep_id = _identifier(sweep_id, "sweep_id")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> int:
+            row = db.execute(
+                "SELECT amount_micro, state FROM chain_sweeps WHERE id=?", (sweep_id,)
+            ).fetchone()
+            if row is None:
+                raise SweepStateError(f"sweep {sweep_id!r} does not exist")
+            if row["state"] != "sent":
+                raise SweepStateError(
+                    f"sweep {sweep_id!r} is {row['state']} and cannot become {state}"
+                )
+            db.execute(
+                "UPDATE chain_sweeps SET state=?, updated_ts=? WHERE id=?",
+                (state, now, sweep_id),
+            )
+            return int(row["amount_micro"])
+
+        return self._tx(operation)
+
+    def finalize_sweep(self, sweep_id: str) -> int:
+        return self._finish_sweep(sweep_id, "finalized")
+
+    def fail_sweep(self, sweep_id: str) -> int:
+        return self._finish_sweep(sweep_id, "failed")
+
+    def sweeps_in_flight(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM chain_sweeps WHERE state='sent' ORDER BY created_ts, id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def swept_total(self, token_account: str) -> int:
+        """Return sent plus finalized sweep value in raw micro-token units."""
+        token_account = _identifier(token_account, "token_account")
+        with self._lock:
+            return int(
+                self._db.execute(
+                    "SELECT COALESCE(SUM(amount_micro), 0) FROM chain_sweeps "
+                    "WHERE token_account=? AND state IN ('sent','finalized')",
+                    (token_account,),
+                ).fetchone()[0]
+            )
+
+    def sweep_accounts(self) -> list[dict[str, Any]]:
+        """Return deposit accounts with atomic indexer and sweep accounting."""
+        with self._lock:
+            has_indexer_state = self._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='chain_indexer_accounts'"
+            ).fetchone() is not None
+            paused = (
+                "COALESCE(i.paused, 0)"
+                if has_indexer_state
+                else "0"
+            )
+            join = (
+                "LEFT JOIN chain_indexer_accounts AS i "
+                "ON i.token_account=d.token_account"
+                if has_indexer_state
+                else ""
+            )
+            rows = self._db.execute(
+                f"SELECT d.operator, d.token_account, {paused} AS paused, "
+                "COALESCE((SELECT SUM(r.amount) FROM chain_refs AS r "
+                "WHERE r.kind='deposit' AND r.account=d.operator "
+                "AND r.token_account=d.token_account), 0) AS indexed_credits, "
+                "COALESCE((SELECT SUM(s.amount_micro) FROM chain_sweeps AS s "
+                "WHERE s.token_account=d.token_account "
+                "AND s.state IN ('sent','finalized')), 0) AS swept_micro "
+                f"FROM deposit_accounts AS d {join} ORDER BY d.operator"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def queue_deposit_account(self, operator: str) -> bool:
         """Queue creation of a treasury-owned token account for *operator*.
