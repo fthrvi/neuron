@@ -106,6 +106,7 @@ DEFAULT_REPORT_DIR = "~/.neuron/credits/reconcile"
 DEFAULT_KILL_FILE = "~/.neuron/credits/payout.off"
 DEFAULT_SIGNING_KEY = "~/.nakshatra/keys/worker.ed25519"
 DEFAULT_BUZZ_HELPER = Path("/home/prithvi/trisul/infra/mesh-agent/buzz-say.sh")
+DEFAULT_SWEEP_STALE_BLOCKS = 300
 REPORT_METHOD = "REPORT"
 REPORT_PATH_PREFIX = "/credits/reconcile/"
 REPORT_SCHEME = "Sthambha-Ed25519"
@@ -136,6 +137,7 @@ class ReconcileConfig:
     snapshot_attempts: int = 3
     snapshot_retry_delay_s: float = 0.25
     inconclusive_kill_runs: int = 3
+    sweep_stale_blocks: int = DEFAULT_SWEEP_STALE_BLOCKS
 
     def __post_init__(self) -> None:
         # S3 owns the cluster, URL, independent-confirmation, and mint policy.
@@ -153,6 +155,12 @@ class ReconcileConfig:
             raise ValueError("snapshot_retry_delay_s must not be negative")
         if self.inconclusive_kill_runs < 1:
             raise ValueError("inconclusive_kill_runs must be positive")
+        if (
+            isinstance(self.sweep_stale_blocks, bool)
+            or not isinstance(self.sweep_stale_blocks, int)
+            or self.sweep_stale_blocks < 0
+        ):
+            raise ValueError("sweep stale block allowance must be a non-negative integer")
 
     @classmethod
     def from_env(cls) -> "ReconcileConfig":
@@ -191,6 +199,11 @@ class ReconcileConfig:
             ),
             inconclusive_kill_runs=int(
                 os.environ.get("NAK_RECONCILE_INCONCLUSIVE_KILL_RUNS", "3")
+            ),
+            sweep_stale_blocks=int(
+                os.environ.get(
+                    "NAK_SWEEP_STALE_BLOCKS", str(DEFAULT_SWEEP_STALE_BLOCKS)
+                )
             ),
         )
 
@@ -809,6 +822,7 @@ class Reconciler:
         self,
         ledger: dict[str, Any],
         statuses: dict[str, dict[str, Any] | None],
+        current_block_height: int | None,
     ) -> tuple[list[str], list[dict[str, Any]], dict[str, int], int]:
         errors: list[str] = []
         proofs: list[dict[str, Any]] = []
@@ -825,6 +839,18 @@ class Reconciler:
                 and status.get("err") is None
             )
             if state == "sent" and not chain_finalized:
+                status_finalized = (
+                    isinstance(status, dict)
+                    and status.get("confirmationStatus") == "finalized"
+                )
+                if (
+                    not status_finalized
+                    and current_block_height is not None
+                    and current_block_height
+                    > int(row["last_valid_block_height"])
+                    + self.config.sweep_stale_blocks
+                ):
+                    errors.append(f"stale in-flight sweep {row['id']}")
                 continue
             proof = self._sweep_transfer_proof(row, status)
             proofs.append(proof)
@@ -2101,6 +2127,7 @@ class Reconciler:
         generated: int,
         attempt: int,
         before_slot: int,
+        current_block_height: int | None,
     ) -> tuple[dict[str, Any], list[str]]:
         stamp = dt.datetime.fromtimestamp(generated, tz=dt.timezone.utc)
         token_accounts, token_errors, token_amounts = self._format_token_accounts(
@@ -2110,7 +2137,7 @@ class Reconciler:
             self._withdrawal_lifecycle(ledger, statuses)
         )
         sweep_errors, sweep_proofs, swept_by_account, verified_swept_total = (
-            self._sweep_provenance(ledger, statuses)
+            self._sweep_provenance(ledger, statuses, current_block_height)
         )
         verified_vault_outflow = sum(
             int(item["amount_credits"])
@@ -2305,6 +2332,11 @@ class Reconciler:
             signatures = self._signatures(baseline)
             before = self._token_accounts(addresses)
             statuses = self._statuses(signatures)
+            current_block_height = (
+                self.rpc.get_block_height()
+                if any(row["state"] == "sent" for row in baseline["chain_sweeps"])
+                else None
+            )
             ledger = self._ledger_snapshot()
             after_addresses = self._addresses(ledger)
             after_signatures = self._signatures(ledger)
@@ -2326,6 +2358,7 @@ class Reconciler:
                     generated=generated,
                     attempt=attempt,
                     before_slot=int(before["slot"]),
+                    current_block_height=current_block_height,
                 )
                 reasons.extend(lag)
                 if not reasons:
@@ -2340,6 +2373,11 @@ class Reconciler:
             addresses = self._addresses(baseline)
             before = self._token_accounts(addresses)
             statuses = self._statuses(self._signatures(baseline))
+            current_block_height = (
+                self.rpc.get_block_height()
+                if any(row["state"] == "sent" for row in baseline["chain_sweeps"])
+                else None
+            )
             after = self._token_accounts(addresses)
             last_report, lag = self._build_report(
                 baseline,
@@ -2348,6 +2386,7 @@ class Reconciler:
                 generated=generated,
                 attempt=self.config.snapshot_attempts,
                 before_slot=int(before["slot"]),
+                current_block_height=current_block_height,
             )
             reasons.extend(lag)
         last_report["outcome"] = "inconclusive"

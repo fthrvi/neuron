@@ -40,6 +40,7 @@ class FakeReconcileRPC:
         self.transactions = transactions or {}
         self.calls = []
         self.slot = 100
+        self.height = 100
 
     def get_genesis_hash(self):
         self.calls.append(("genesis",))
@@ -66,6 +67,10 @@ class FakeReconcileRPC:
     def get_signature_statuses(self, signatures):
         self.calls.append(("statuses", tuple(signatures)))
         return {signature: deepcopy(self.statuses.get(signature)) for signature in signatures}
+
+    def get_block_height(self):
+        self.calls.append(("height",))
+        return self.height
 
     def get_transaction(self, signature):
         self.calls.append(("transaction", signature))
@@ -227,6 +232,34 @@ def test_finalized_sweep_requires_matching_chain_proof(tmp_path, bad_proof):
     report = Reconciler(path, rpc, _config(tmp_path)).collect()
     assert report["outcome"] == "mismatch"
     assert _check(report, "chain_sweeps")["ok"] is False
+
+
+def test_stale_in_flight_sweep_fails_check_and_fires_kill_alert(tmp_path):
+    path = tmp_path / "stale-sweep.sqlite"
+    with _ledger(path, (("alice", SECOND_ACCOUNT, "deposit-a", 100),)) as store:
+        store.begin_sweep(
+            "sweep-stale", "alice", SECOND_ACCOUNT, 100,
+            "sweep-signature", "blockhash", 100,
+        )
+    status = {"err": None, "confirmationStatus": "confirmed"}
+    rpc = FakeReconcileRPC(
+        {VAULT: 0, SECOND_ACCOUNT: 100},
+        statuses={"sweep-signature": status},
+    )
+    rpc.height = 104
+    cfg = _config(tmp_path, sweep_stale_blocks=3)
+    _write_key(cfg.signing_key)
+
+    envelope, _report_path = Reconciler(path, rpc, cfg).run()
+
+    report = envelope["report"]
+    sweep_check = _check(report, "chain_sweeps")
+    assert report["outcome"] == "mismatch"
+    assert sweep_check["ok"] is False
+    assert sweep_check["errors"] == ["stale in-flight sweep sweep-stale"]
+    assert cfg.kill_file.is_file()
+    assert report["alerts"][0]["event"] == "nak_reconcile_mismatch"
+    assert "chain_sweeps" in report["alerts"][0]["failed_checks"]
 
 
 def test_transient_chain_change_retries_without_mismatch(tmp_path):

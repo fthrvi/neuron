@@ -190,6 +190,11 @@ class SolanaRPC:
             }
             if isinstance(info.get("owner"), str):
                 parsed_account["owner"] = info["owner"]
+            # Preserve optional authority fields for callers that must fence
+            # writes against delegated or unexpectedly closeable accounts.
+            for key in ("delegate", "delegatedAmount", "closeAuthority"):
+                if key in info:
+                    parsed_account[key] = info[key]
             return parsed_account
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise RPCError(f"{address} is not a parsed SPL token account") from exc

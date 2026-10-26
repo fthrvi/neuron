@@ -68,6 +68,7 @@ DEFAULT_KILL_FILE = "~/.neuron/credits/payout.off"
 DEFAULT_LOCK_FILE = "~/.neuron/credits/payout.lock"
 DEFAULT_ROSTER = "~/.nakshatra/admission-peers.tsv"
 DEFAULT_SWEEP_MIN_MICRO = 1_000_000
+DEFAULT_SWEEP_STALE_BLOCKS = 300
 MICRO_USDC = 10 ** USDC_DECIMALS
 AUTO_CAP_USDC = Decimal("5")
 DAY_CAP_USDC = Decimal("50")
@@ -538,6 +539,7 @@ class PayoutConfig:
     require_live_funds_env: bool = False
     roster_path: Path = Path(DEFAULT_ROSTER).expanduser()
     sweep_min_micro: int = DEFAULT_SWEEP_MIN_MICRO
+    sweep_stale_blocks: int = DEFAULT_SWEEP_STALE_BLOCKS
 
     def __post_init__(self) -> None:
         # Reuse S3's complete cluster/RPC/pubkey validation.
@@ -558,6 +560,12 @@ class PayoutConfig:
             or self.sweep_min_micro <= 0
         ):
             raise ValueError("sweep minimum must be a positive integer")
+        if (
+            isinstance(self.sweep_stale_blocks, bool)
+            or not isinstance(self.sweep_stale_blocks, int)
+            or self.sweep_stale_blocks < 0
+        ):
+            raise ValueError("sweep stale block allowance must be a non-negative integer")
 
     @classmethod
     def from_env(cls) -> "PayoutConfig":
@@ -599,6 +607,11 @@ class PayoutConfig:
             ),
             sweep_min_micro=int(
                 os.environ.get("NAK_SWEEP_MIN_MICRO", str(DEFAULT_SWEEP_MIN_MICRO))
+            ),
+            sweep_stale_blocks=int(
+                os.environ.get(
+                    "NAK_SWEEP_STALE_BLOCKS", str(DEFAULT_SWEEP_STALE_BLOCKS)
+                )
             ),
         )
 
@@ -769,12 +782,18 @@ class PayoutEngine:
         status = self.rpc.get_signature_status(row["signature"])
         if isinstance(status, dict):
             if status.get("err") is not None:
-                self.store.fail_sweep(row["id"])
-                LOG.error(
-                    "sweep failed operator=%s account=%s signature=%s",
-                    row["operator"], row["token_account"], row["signature"],
-                )
-                return 1
+                if status.get("confirmationStatus") == "finalized":
+                    self.store.fail_sweep(row["id"])
+                    LOG.error(
+                        "sweep failed operator=%s account=%s signature=%s",
+                        row["operator"], row["token_account"], row["signature"],
+                    )
+                    return 1
+                # A processed/confirmed error can disappear with its fork. The
+                # immutable signed transaction may still land, so do not let a
+                # competing sweep be constructed.
+                self._log_stale_sweep(row, self.rpc.get_block_height())
+                return 0
             if status.get("confirmationStatus") == "finalized":
                 self.store.finalize_sweep(row["id"])
                 LOG.info(
@@ -783,8 +802,10 @@ class PayoutEngine:
                     row["signature"],
                 )
                 return 1
+            self._log_stale_sweep(row, self.rpc.get_block_height())
             return 0
-        if self.rpc.get_block_height() > int(row["last_valid_block_height"]):
+        height = self.rpc.get_block_height()
+        if height > int(row["last_valid_block_height"]):
             # Search history once more after observing expiry, matching payout fencing.
             status = self.rpc.get_signature_status(row["signature"])
             if status is None:
@@ -795,12 +816,68 @@ class PayoutEngine:
                 )
                 return 1
             if status.get("err") is not None:
-                self.store.fail_sweep(row["id"])
-                return 1
+                if status.get("confirmationStatus") == "finalized":
+                    self.store.fail_sweep(row["id"])
+                    return 1
+                self._log_stale_sweep(row, height)
+                return 0
             if status.get("confirmationStatus") == "finalized":
                 self.store.finalize_sweep(row["id"])
                 return 1
+            self._log_stale_sweep(row, height)
         return 0
+
+    def _log_stale_sweep(self, row: dict[str, Any], height: int) -> None:
+        stale_after = (
+            int(row["last_valid_block_height"]) + self.config.sweep_stale_blocks
+        )
+        if height > stale_after:
+            LOG.error(
+                "stale in-flight sweep %s operator=%s account=%s signature=%s "
+                "block_height=%s stale_after=%s",
+                row["id"], row["operator"], row["token_account"],
+                row["signature"], height, stale_after,
+            )
+
+    @staticmethod
+    def _sweep_alert(row: dict[str, Any], kind: str, detail: str) -> None:
+        LOG.error(
+            "%s",
+            json.dumps(
+                {
+                    "event": "chain_sweep_alert",
+                    "kind": kind,
+                    "operator": row["operator"],
+                    "token_account": row["token_account"],
+                    "detail": detail,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    def _validate_sweep_source(
+        self, row: dict[str, Any], snapshot: dict[str, Any]
+    ) -> None:
+        treasury = str(self._backend().pubkey)
+        owner = snapshot.get("owner")
+        if owner != treasury:
+            detail = f"source owner {owner!r} != treasury {treasury}"
+            self._sweep_alert(row, "source_authority", detail)
+            raise PayoutError(detail)
+        if snapshot.get("delegate") is not None:
+            detail = f"source account has delegate {snapshot.get('delegate')!r}"
+            self._sweep_alert(row, "source_authority", detail)
+            raise PayoutError(detail)
+        close_authority = snapshot.get(
+            "closeAuthority", snapshot.get("close_authority")
+        )
+        if close_authority not in {None, treasury}:
+            detail = (
+                f"source close authority {close_authority!r} != treasury {treasury}"
+            )
+            self._sweep_alert(row, "source_authority", detail)
+            raise PayoutError(detail)
 
     def _start_sweep(self, row: dict[str, Any], amount_micro: int) -> int:
         latest = self.rpc.get_latest_blockhash()
@@ -860,6 +937,7 @@ class PayoutEngine:
                     or int(snapshot.get("decimals")) != USDC_DECIMALS
                 ):
                     raise PayoutError("deposit account mint or decimals differ")
+                self._validate_sweep_source(row, snapshot)
                 balance = int(snapshot["amount"])
                 if balance < self.config.sweep_min_micro:
                     continue

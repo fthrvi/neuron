@@ -104,6 +104,41 @@ def test_parses_token_account_raw_amount(monkeypatch):
     }
 
 
+def test_preserves_optional_token_account_authorities(monkeypatch):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": 99},
+            "value": {
+                "data": {
+                    "parsed": {
+                        "type": "account",
+                        "info": {
+                            "mint": "mint",
+                            "owner": "owner",
+                            "delegate": "delegate",
+                            "delegatedAmount": {"amount": "1", "decimals": 6},
+                            "closeAuthority": "closer",
+                            "tokenAmount": {"amount": "1234567", "decimals": 6},
+                        },
+                    }
+                }
+            },
+        },
+    }
+    monkeypatch.setattr(
+        solana_rpc.urllib.request,
+        "urlopen",
+        lambda _request, timeout: _Response(json.dumps(payload).encode()),
+    )
+    account = SolanaRPC("http://127.0.0.1:8899").get_token_account("account")
+    assert account["owner"] == "owner"
+    assert account["delegate"] == "delegate"
+    assert account["delegatedAmount"] == {"amount": "1", "decimals": 6}
+    assert account["closeAuthority"] == "closer"
+
+
 def test_pinned_client_checks_genesis_before_each_connection(monkeypatch):
     methods = []
 

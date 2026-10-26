@@ -41,6 +41,7 @@ MINT = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 VAULT_ACCOUNT = "11111111111111111111111111111111"
 RECIPIENT = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 RECIPIENT_ATA = "SysvarRent111111111111111111111111111111111"
+TREASURY = RECIPIENT
 BLOCKHASHES = [
     "SysvarC1ock11111111111111111111111111111111",
     "SysvarRecentB1ockHashes11111111111111111111",
@@ -64,6 +65,7 @@ class FakeRPC:
         self.before_send = None
         self.status_calls = []
         self.token_accounts = {}
+        self.token_account_metadata = {}
 
     def pin_genesis(self, expected=None):
         assert expected in (None, DEVNET_GENESIS_HASH)
@@ -85,11 +87,14 @@ class FakeRPC:
         return self.height
 
     def get_token_account(self, address):
-        return {
+        account = {
             "mint": MINT,
             "amount": self.token_accounts.get(address, 0),
             "decimals": 6,
+            "owner": TREASURY,
         }
+        account.update(self.token_account_metadata.get(address, {}))
+        return account
 
     def send_transaction(self, wire):
         if self.before_send is not None:
@@ -101,6 +106,7 @@ class FakeRPC:
 class FakeBackend:
     def __init__(self, rpc):
         self.rpc = rpc
+        self.pubkey = TREASURY
         self.builds = []
         self.created_atas = []
         self.deposit_accounts = []
@@ -227,6 +233,95 @@ def test_sweep_is_persisted_before_send_and_later_finalized_once(tmp_path):
         ).fetchone()[0] == "finalized"
         assert len(backend.sweeps) == 1
         assert rpc.broadcasts == ["sweep-wire-1"]
+
+
+def test_processed_sweep_failure_stays_sent_without_second_broadcast(tmp_path):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    account = BLOCKHASHES[0]
+    with LedgerStore(tmp_path / "processed-sweep-error.sqlite") as store:
+        indexed_account(store, account, 1_000_000)
+        rpc.token_accounts[account] = 1_000_000
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+        assert engine.poll_once() == 1
+        sweep = dict(store._db.execute("SELECT * FROM chain_sweeps").fetchone())
+        rpc.statuses[sweep["signature"]] = {
+            "confirmationStatus": "processed",
+            "err": {"InstructionError": [0, "Custom"]},
+        }
+
+        assert engine.poll_once() == 0
+        assert store._db.execute(
+            "SELECT state FROM chain_sweeps WHERE id=?", (sweep["id"],)
+        ).fetchone()[0] == "sent"
+        assert rpc.broadcasts == ["sweep-wire-1"]
+        assert len(backend.sweeps) == 1
+
+
+@pytest.mark.parametrize(
+    ("metadata", "detail"),
+    [
+        ({"owner": "not-the-treasury"}, "source owner"),
+        ({"delegate": "unexpected-delegate"}, "has delegate"),
+    ],
+)
+def test_sweep_refuses_untrusted_source_authority(
+    tmp_path, caplog, metadata, detail
+):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    account = BLOCKHASHES[0]
+    with LedgerStore(tmp_path / f"source-{detail.replace(' ', '-')}.sqlite") as store:
+        indexed_account(store, account, 1_000_000)
+        rpc.token_accounts[account] = 1_000_000
+        rpc.token_account_metadata[account] = metadata
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+
+        with caplog.at_level("ERROR", logger="nak-treasury"):
+            assert engine.poll_once() == 0
+
+        assert store._db.execute("SELECT COUNT(*) FROM chain_sweeps").fetchone()[0] == 0
+        assert backend.sweeps == []
+        assert rpc.broadcasts == []
+        messages = [record.getMessage() for record in caplog.records]
+        assert any('"event":"chain_sweep_alert"' in message for message in messages)
+        assert any(detail in message for message in messages)
+
+
+def test_stale_visible_sweep_logs_each_pass_without_resigning(tmp_path, caplog):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    account = BLOCKHASHES[0]
+    with LedgerStore(tmp_path / "stale-sweep.sqlite") as store:
+        indexed_account(store, account, 1_000_000)
+        rpc.token_accounts[account] = 1_000_000
+        engine = PayoutEngine(
+            store,
+            rpc,
+            config(tmp_path, sweep_stale_blocks=3),
+            backend=backend,
+        )
+        assert engine.poll_once() == 1
+        sweep = dict(store._db.execute("SELECT * FROM chain_sweeps").fetchone())
+        rpc.statuses[sweep["signature"]] = {
+            "confirmationStatus": "confirmed",
+            "err": None,
+        }
+        rpc.height = int(sweep["last_valid_block_height"]) + 4
+
+        with caplog.at_level("ERROR", logger="nak-treasury"):
+            assert engine.poll_once() == 0
+            assert engine.poll_once() == 0
+
+        assert store._db.execute(
+            "SELECT state FROM chain_sweeps WHERE id=?", (sweep["id"],)
+        ).fetchone()[0] == "sent"
+        assert len(backend.sweeps) == 1
+        assert rpc.broadcasts == ["sweep-wire-1"]
+        assert sum(
+            f"stale in-flight sweep {sweep['id']}" in record.getMessage()
+            for record in caplog.records
+        ) == 2
 
 
 @pytest.mark.parametrize("mode", ["funds_off", "kill", "lag", "paused", "below_min"])
