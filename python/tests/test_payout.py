@@ -66,6 +66,8 @@ class FakeRPC:
         self.status_calls = []
         self.token_accounts = {}
         self.token_account_metadata = {}
+        self.account_signatures = {}
+        self.signature_address_calls = []
 
     def pin_genesis(self, expected=None):
         assert expected in (None, DEVNET_GENESIS_HASH)
@@ -95,6 +97,16 @@ class FakeRPC:
         }
         account.update(self.token_account_metadata.get(address, {}))
         return account
+
+    def get_signatures_for_address(
+        self, address, *, before=None, until=None, limit=1000
+    ):
+        assert before is None
+        assert until is None
+        self.signature_address_calls.append((address, limit))
+        return self.account_signatures.get(
+            address, [{"signature": f"deposit-{address}"}]
+        )[:limit]
 
     def send_transaction(self, wire):
         if self.before_send is not None:
@@ -187,9 +199,20 @@ def row(store, withdrawal_id="withdrawal-1"):
 
 def indexed_account(store, account, amount_micro, operator="alice"):
     store._db.execute(
+        "CREATE TABLE IF NOT EXISTS chain_indexer_accounts "
+        "(token_account TEXT PRIMARY KEY, cursor TEXT, "
+        "paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1)), "
+        "updated_ts INTEGER NOT NULL)"
+    )
+    store._db.execute(
         "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
         "VALUES (?, ?, 1)",
         (operator, account),
+    )
+    store._db.execute(
+        "INSERT INTO chain_indexer_accounts(token_account, cursor, updated_ts) "
+        "VALUES (?, ?, 1)",
+        (account, f"deposit-{account}"),
     )
     store.deposit_batch(
         operator,
@@ -233,6 +256,40 @@ def test_sweep_is_persisted_before_send_and_later_finalized_once(tmp_path):
         ).fetchone()[0] == "finalized"
         assert len(backend.sweeps) == 1
         assert rpc.broadcasts == ["sweep-wire-1"]
+
+        # Once the indexer advances over the outgoing sweep and indexes a new
+        # deposit, the account is eligible for its next sweep.
+        rpc.account_signatures[account] = [{"signature": "deposit-next"}]
+        rpc.token_accounts[account] = amount
+        store.deposit_batch(
+            "alice",
+            account,
+            [("deposit-next:0", amount * RATE, 2)],
+            amount * RATE,
+            cursor="deposit-next",
+        )
+        assert engine.poll_once() == 1
+        assert len(backend.sweeps) == 2
+        assert rpc.broadcasts == ["sweep-wire-1", "sweep-wire-2"]
+
+
+def test_sweep_skips_net_balance_match_when_indexer_cursor_is_behind(tmp_path):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    account = BLOCKHASHES[0]
+    amount = 1_000_000
+    with LedgerStore(tmp_path / "cursor-behind.sqlite") as store:
+        indexed_account(store, account, amount)
+        # An unexplained outflow and an unindexed inflow can net to the exact
+        # expected balance. The newer chain signature still blocks sweeping.
+        rpc.token_accounts[account] = amount
+        rpc.account_signatures[account] = [{"signature": "unindexed-inflow"}]
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+
+        assert engine.poll_once() == 0
+        assert rpc.signature_address_calls == [(account, 1)]
+        assert backend.sweeps == []
+        assert store._db.execute("SELECT COUNT(*) FROM chain_sweeps").fetchone()[0] == 0
 
 
 def test_processed_sweep_failure_stays_sent_without_second_broadcast(tmp_path):
@@ -342,11 +399,8 @@ def test_sweep_safety_skips(tmp_path, mode):
             rpc.token_accounts[account] += 1
         elif mode == "paused":
             store._db.execute(
-                "CREATE TABLE chain_indexer_accounts "
-                "(token_account TEXT PRIMARY KEY, cursor TEXT, paused INTEGER, updated_ts INTEGER)"
-            )
-            store._db.execute(
-                "INSERT INTO chain_indexer_accounts VALUES (?, NULL, 1, 1)", (account,)
+                "UPDATE chain_indexer_accounts SET paused=1 WHERE token_account=?",
+                (account,),
             )
         elif mode == "below_min":
             cfg = config(tmp_path, sweep_min_micro=amount + 1)

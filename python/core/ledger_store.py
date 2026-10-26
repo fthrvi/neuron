@@ -2856,6 +2856,19 @@ class LedgerStore:
                 if same:
                     return amount_micro
                 raise SweepStateError(f"sweep {sweep_id!r} already has different details")
+            try:
+                indexer = db.execute(
+                    "SELECT paused FROM chain_indexer_accounts WHERE token_account=?",
+                    (token_account,),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                raise SweepStateError(
+                    "sweep account has no indexer state"
+                ) from exc
+            if indexer is None:
+                raise SweepStateError("sweep account has no indexer state")
+            if int(indexer["paused"]):
+                raise SweepStateError("sweep account is paused")
             bound = db.execute(
                 "SELECT token_account FROM deposit_accounts WHERE operator=?",
                 (operator,),
@@ -2939,6 +2952,12 @@ class LedgerStore:
                 if has_indexer_state
                 else "0"
             )
+            cursor = "i.cursor" if has_indexer_state else "NULL"
+            indexer_ready = (
+                "CASE WHEN i.token_account IS NULL THEN 0 ELSE 1 END"
+                if has_indexer_state
+                else "0"
+            )
             join = (
                 "LEFT JOIN chain_indexer_accounts AS i "
                 "ON i.token_account=d.token_account"
@@ -2947,6 +2966,7 @@ class LedgerStore:
             )
             rows = self._db.execute(
                 f"SELECT d.operator, d.token_account, {paused} AS paused, "
+                f"{cursor} AS cursor, {indexer_ready} AS indexer_ready, "
                 "COALESCE((SELECT SUM(r.amount) FROM chain_refs AS r "
                 "WHERE r.kind='deposit' AND r.account=d.operator "
                 "AND r.token_account=d.token_account), 0) AS indexed_credits, "

@@ -84,7 +84,10 @@ path, and `nak-credit-reconciliation-v1` purpose inside the signed payload.
 - `NAK_SWEEP_STALE_BLOCKS` defaults to `300`. A sweep signature that remains visible but
   unfinalized beyond its last valid block height plus this allowance is never re-signed or
   marked failed merely for age: the treasury logs it on every pass, while reconciliation
-  treats it as a mismatch and creates the payout kill file and alert.
+  treats it as a mismatch and creates the payout kill file and alert. If a sweep was
+  confirmed but never finalized and becomes stale this way, recovery is a human checking
+  that signature on chain before deciding how to resolve the immutable in-flight row and
+  remove the kill file.
 - `NAK_FUNDS_ROUTES=on` exposes the wallet/withdraw HTTP routes. Leave it unset or `off`
   until the indexer, treasury, and first reconciliation are healthy.
 - `NAK_SPEND_ROUTES=on` exposes the signed loopback-only `/spend/*` routes. It defaults

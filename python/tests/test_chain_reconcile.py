@@ -113,11 +113,22 @@ def _config(tmp_path, **changes):
 
 def _ledger(path, deposits=(("alice", VAULT, "deposit-a", 100),)):
     store = LedgerStore(path)
+    store._db.execute(
+        "CREATE TABLE chain_indexer_accounts "
+        "(token_account TEXT PRIMARY KEY, cursor TEXT, "
+        "paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1)), "
+        "updated_ts INTEGER NOT NULL)"
+    )
     for operator, token_account, ref, micro_usdc in deposits:
         store._db.execute(
             "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
             "VALUES (?, ?, 1)",
             (operator, token_account),
+        )
+        store._db.execute(
+            "INSERT OR IGNORE INTO chain_indexer_accounts"
+            "(token_account, cursor, updated_ts) VALUES (?, ?, 1)",
+            (token_account, ref),
         )
         store.deposit_batch(
             operator,
@@ -295,6 +306,31 @@ def test_repeated_indexer_lag_is_inconclusive_then_kills(tmp_path):
         assert report["outcome"] == "inconclusive"
         assert report["consecutive_inconclusive_runs"] == expected_count
         assert (tmp_path / "payout.off").exists() is (expected_count == 3)
+
+
+def test_deposit_deficit_with_vault_excess_is_mismatch_and_kills(tmp_path):
+    path = tmp_path / "deficit-plus-excess.sqlite"
+    with _ledger(path, (("alice", SECOND_ACCOUNT, "deposit-a", 100),)) as store:
+        store.begin_sweep(
+            "failed-sweep", "alice", SECOND_ACCOUNT, 100,
+            "failed-signature", "blockhash", 100,
+        )
+        store.fail_sweep("failed-sweep")
+    config = _config(tmp_path)
+    _write_key(config.signing_key)
+    rpc = FakeReconcileRPC({SECOND_ACCOUNT: 0, VAULT: 100})
+
+    envelope, _ = Reconciler(
+        path, rpc, config, notify=lambda *_: {"attempted": False}
+    ).run()
+
+    report = envelope["report"]
+    assert report["outcome"] == "mismatch"
+    assert report["snapshot"]["stable"] is True
+    assert config.kill_file.is_file()
+    assert report["alerts"][0]["event"] == "nak_reconcile_mismatch"
+    provenance = _check(report, "deposit_provenance")
+    assert any("exceed chain balance" in error for error in provenance["errors"])
 
 
 def test_missing_ledger_fails_closed_and_replaces_kill_symlink(tmp_path):

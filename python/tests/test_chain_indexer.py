@@ -185,10 +185,12 @@ def test_finalized_sweep_then_new_deposit_is_credited(recorded, tmp_path):
     with LedgerStore(tmp_path / "ledger.sqlite") as store:
         _register(store, recorded)
         account = recorded["addresses"]["deposit"]
+        indexer = DepositIndexer(store, rpc, _config(recorded))
+        assert [state.token_account for state in indexer._accounts()] == [account]
         store.deposit_batch("alice", account, [("old:0", 10 * RATE, 1)], 10 * RATE)
         store.begin_sweep("sweep", "alice", account, 10, "sweep-sig", "hash", 99)
         store.finalize_sweep("sweep")
-        assert DepositIndexer(store, rpc, _config(recorded)).poll_once() == 1
+        assert indexer.poll_once() == 1
         assert store.balance("alice") == 15 * RATE
         assert store._db.execute(
             "SELECT paused FROM chain_indexer_accounts WHERE token_account=?", (account,)
@@ -200,8 +202,9 @@ def test_sent_sweep_defers_account_without_pause_or_cursor_advance(recorded, tmp
     with LedgerStore(tmp_path / "ledger.sqlite") as store:
         _register(store, recorded)
         account = recorded["addresses"]["deposit"]
-        store.begin_sweep("sweep", "alice", account, 10, "sweep-sig", "hash", 99)
         indexer = DepositIndexer(store, rpc, _config(recorded))
+        assert [state.token_account for state in indexer._accounts()] == [account]
+        store.begin_sweep("sweep", "alice", account, 10, "sweep-sig", "hash", 99)
         assert indexer.poll_once() == 0
         state = store._db.execute(
             "SELECT paused, cursor FROM chain_indexer_accounts WHERE token_account=?",

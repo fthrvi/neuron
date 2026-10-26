@@ -566,6 +566,15 @@ def test_chain_sweep_state_machine_is_immutable_and_idempotent(tmp_path):
             "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
             "VALUES ('alice', 'token-a', 1)"
         )
+        store._db.execute(
+            "CREATE TABLE chain_indexer_accounts "
+            "(token_account TEXT PRIMARY KEY, cursor TEXT, "
+            "paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1)), "
+            "updated_ts INTEGER NOT NULL)"
+        )
+        store._db.execute(
+            "INSERT INTO chain_indexer_accounts VALUES ('token-a', 'sig-a', 0, 1)"
+        )
         assert store.begin_sweep(
             "sweep-a", "alice", "token-a", 10, "sig-a", "hash-a", 12
         ) == 10
@@ -603,6 +612,29 @@ def test_chain_sweep_state_machine_is_immutable_and_idempotent(tmp_path):
     with LedgerStore(path) as reopened:
         assert reopened.swept_total("token-a") == 10
         assert reopened.sweeps_in_flight() == []
+
+
+def test_begin_sweep_refuses_paused_account_in_persist_transaction(tmp_path):
+    with LedgerStore(tmp_path / "paused-sweep.sqlite") as store:
+        store._db.execute(
+            "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
+            "VALUES ('alice', 'token-a', 1)"
+        )
+        store._db.execute(
+            "CREATE TABLE chain_indexer_accounts "
+            "(token_account TEXT PRIMARY KEY, cursor TEXT, "
+            "paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1)), "
+            "updated_ts INTEGER NOT NULL)"
+        )
+        store._db.execute(
+            "INSERT INTO chain_indexer_accounts VALUES ('token-a', 'sig-a', 1, 1)"
+        )
+
+        with pytest.raises(LedgerError, match="paused"):
+            store.begin_sweep(
+                "sweep-a", "alice", "token-a", 10, "sig-a", "hash-a", 12
+            )
+        assert store._db.execute("SELECT COUNT(*) FROM chain_sweeps").fetchone()[0] == 0
 
 
 def test_deposit_token_accounts_are_unique(tmp_path):

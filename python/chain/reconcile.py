@@ -947,6 +947,12 @@ class Reconciler:
                 errors.append(
                     f"{address}: indexed net deposits {expected} exceed chain balance {on_chain}"
                 )
+        # Excess alone can be deposits the indexer has not reached yet.  A
+        # deficit is stable evidence of unexplained outflow, so another
+        # account's excess must not downgrade the whole snapshot to lag.
+        if errors and lag:
+            errors.extend(lag)
+            lag = []
         return errors, lag
 
     def _withdrawal_lifecycle(

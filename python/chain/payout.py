@@ -928,7 +928,11 @@ class PayoutEngine:
         }
         for row in self.store.sweep_accounts():
             account = str(row["token_account"])
-            if int(row["paused"]) or account in in_flight:
+            if (
+                not int(row["indexer_ready"])
+                or int(row["paused"])
+                or account in in_flight
+            ):
                 continue
             try:
                 snapshot = self.rpc.get_token_account(account)
@@ -946,6 +950,24 @@ class PayoutEngine:
                 if balance * RATE != indexed - swept * RATE:
                     LOG.info(
                         "sweep deferred for indexer lag operator=%s account=%s",
+                        row["operator"], account,
+                    )
+                    continue
+                signatures = self.rpc.get_signatures_for_address(account, limit=1)
+                newest = None
+                if signatures:
+                    first = signatures[0]
+                    if not isinstance(first, dict) or not isinstance(
+                        first.get("signature"), str
+                    ):
+                        raise PayoutError(
+                            "newest deposit-account signature is malformed"
+                        )
+                    newest = first["signature"]
+                if newest != row["cursor"]:
+                    LOG.info(
+                        "sweep deferred until indexer cursor catches up "
+                        "operator=%s account=%s",
                         row["operator"], account,
                     )
                     continue
