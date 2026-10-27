@@ -20,6 +20,13 @@ pub struct ConfigInitAccounts<'info> {
     pub authority: Signer<'info>,
     #[account(init, payer = authority, space = 8 + Config::INIT_SPACE, seeds = [CONFIG_SEED], bump)]
     pub config: Account<'info, Config>,
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = anchor_lang::solana_program::bpf_loader_upgradeable::ID,
+        constraint = program_data.upgrade_authority_address == Some(authority.key()) @ PayError::Unauthorized
+    )]
+    pub program_data: Account<'info, ProgramData>,
     /// CHECK: classic SPL mint owner and layout checked in the handler.
     pub mint: UncheckedAccount<'info>,
     /// CHECK: classic SPL token owner, layout, and mint checked in the handler.

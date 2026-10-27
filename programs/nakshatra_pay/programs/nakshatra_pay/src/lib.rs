@@ -12,6 +12,54 @@ pub use state::*;
 
 declare_id!("GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo");
 
+#[cfg(all(feature = "custom-entrypoint", not(feature = "cpi")))]
+anchor_lang::solana_program::entrypoint!(strict_entry);
+
+/// Anchor 1.2.0 accepts trailing bytes after deserializing instruction arguments.
+/// Reject them before dispatch so every public instruction has one canonical encoding.
+#[cfg(all(feature = "custom-entrypoint", not(feature = "cpi")))]
+fn strict_entry<'info>(
+    program_id: &'info Pubkey,
+    accounts: &'info [AccountInfo<'info>],
+    data: &'info [u8],
+) -> anchor_lang::solana_program::entrypoint::ProgramResult {
+    use anchor_lang::solana_program::program_error::ProgramError;
+    use anchor_lang::Discriminator;
+
+    let expected_len = if data.starts_with(instruction::ConfigInit::DISCRIMINATOR) {
+        Some(instruction::ConfigInit::DISCRIMINATOR.len() + 2)
+    } else if data.starts_with(instruction::ConfigPropose::DISCRIMINATOR) {
+        Some(instruction::ConfigPropose::DISCRIMINATOR.len() + 2)
+    } else if data.starts_with(instruction::ConfigApply::DISCRIMINATOR) {
+        Some(instruction::ConfigApply::DISCRIMINATOR.len())
+    } else if data.starts_with(instruction::ConfigCancel::DISCRIMINATOR) {
+        Some(instruction::ConfigCancel::DISCRIMINATOR.len())
+    } else if data.starts_with(instruction::ConfigProposeAuthority::DISCRIMINATOR) {
+        Some(instruction::ConfigProposeAuthority::DISCRIMINATOR.len() + 32)
+    } else if data.starts_with(instruction::ConfigAcceptAuthority::DISCRIMINATOR) {
+        Some(instruction::ConfigAcceptAuthority::DISCRIMINATOR.len())
+    } else if data.starts_with(instruction::EscrowInit::DISCRIMINATOR) {
+        Some(instruction::EscrowInit::DISCRIMINATOR.len())
+    } else if data.starts_with(instruction::EscrowDeposit::DISCRIMINATOR) {
+        Some(instruction::EscrowDeposit::DISCRIMINATOR.len() + 8)
+    } else if data.starts_with(instruction::EscrowWithdrawRequest::DISCRIMINATOR) {
+        Some(instruction::EscrowWithdrawRequest::DISCRIMINATOR.len() + 8)
+    } else if data.starts_with(instruction::EscrowWithdrawCancel::DISCRIMINATOR) {
+        Some(instruction::EscrowWithdrawCancel::DISCRIMINATOR.len())
+    } else if data.starts_with(instruction::EscrowWithdrawExecute::DISCRIMINATOR) {
+        Some(instruction::EscrowWithdrawExecute::DISCRIMINATOR.len())
+    } else if data.starts_with(instruction::EscrowClose::DISCRIMINATOR) {
+        Some(instruction::EscrowClose::DISCRIMINATOR.len())
+    } else {
+        None
+    };
+
+    if expected_len.is_some_and(|expected| data.len() != expected) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    entry(program_id, accounts, data)
+}
+
 #[program]
 pub mod nakshatra_pay {
     use super::*;

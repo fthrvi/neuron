@@ -1,8 +1,18 @@
-use std::str::FromStr;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::OnceLock,
+};
 
 use anchor_lang::{
     prelude::{Clock, Pubkey},
-    solana_program::{instruction::Instruction, program_pack::Pack, system_program},
+    solana_program::{
+        bpf_loader_upgradeable::{self, UpgradeableLoaderState},
+        instruction::Instruction,
+        program_pack::Pack,
+        system_program,
+    },
     AccountDeserialize, AccountSerialize, InstructionData, ToAccountMetas,
 };
 use anchor_spl::token::spl_token::{
@@ -21,6 +31,75 @@ use nakshatra_pay::{
 };
 
 const INITIAL: u64 = 1_000_000;
+const DONATION: u64 = 77_777;
+
+fn program_binary_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/deploy/nakshatra_pay.so")
+}
+
+fn newest_source_mtime(path: &Path) -> std::time::SystemTime {
+    fn visit(path: &Path, newest: &mut Option<std::time::SystemTime>) {
+        for entry in fs::read_dir(path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+        {
+            let entry = entry.expect("failed to read source directory entry").path();
+            if entry.is_dir() {
+                visit(&entry, newest);
+            } else {
+                let modified = fs::metadata(&entry)
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or_else(|error| {
+                        panic!("failed to inspect {}: {error}", entry.display())
+                    });
+                *newest = Some(newest.map_or(modified, |previous| previous.max(modified)));
+            }
+        }
+    }
+
+    let mut newest = None;
+    visit(path, &mut newest);
+    newest.expect("program source directory must contain at least one file")
+}
+
+fn assert_program_is_fresh() {
+    static CHECK: OnceLock<()> = OnceLock::new();
+    CHECK.get_or_init(|| {
+        let binary = program_binary_path();
+        let binary_mtime = fs::metadata(&binary)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or_else(|_| {
+                panic!("{} is missing; run `anchor build` first", binary.display())
+            });
+        let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert!(
+            binary_mtime >= newest_source_mtime(&source_dir),
+            "{} is older than program source; run `anchor build` first",
+            binary.display()
+        );
+    });
+}
+
+fn program_data_address() -> Pubkey {
+    Pubkey::find_program_address(&[nakshatra_pay::id().as_ref()], &bpf_loader_upgradeable::ID).0
+}
+
+fn set_program_upgrade_authority(svm: &mut LiteSVM, authority: Pubkey) {
+    let address = program_data_address();
+    let mut account = svm
+        .get_account(&address)
+        .expect("LiteSVM must create an upgradeable ProgramData account");
+    let metadata_len = UpgradeableLoaderState::size_of_programdata_metadata();
+    let clock: Clock = svm.get_sysvar();
+    bincode::serialize_into(
+        &mut account.data[..metadata_len],
+        &UpgradeableLoaderState::ProgramData {
+            slot: clock.slot,
+            upgrade_authority_address: Some(authority),
+        },
+    )
+    .expect("ProgramData metadata must serialize");
+    svm.set_account(address, account).unwrap();
+}
 
 fn event_authority() -> Pubkey {
     Pubkey::find_program_address(&[b"__event_authority"], &nakshatra_pay::id()).0
@@ -104,6 +183,7 @@ fn config_init_ix(
         nakshatra_pay::accounts::ConfigInitAccounts {
             authority,
             config,
+            program_data: program_data_address(),
             mint,
             fee_wallet,
             token_program: spl_token::ID,
@@ -124,6 +204,7 @@ struct Fixture {
     fee_wallet: Pubkey,
     next_fee_wallet: Pubkey,
     source: Pubkey,
+    donor_source: Pubkey,
     destination: Pubkey,
     other_destination: Pubkey,
     wrong_destination: Pubkey,
@@ -135,18 +216,16 @@ struct Fixture {
 
 impl Fixture {
     fn new(init_config: bool, init_escrow: bool) -> Self {
+        assert_program_is_fresh();
         let mut svm = LiteSVM::new();
-        svm.add_program(
-            nakshatra_pay::id(),
-            include_bytes!(concat!(
-                env!("CARGO_TARGET_TMPDIR"),
-                "/../deploy/nakshatra_pay.so"
-            )),
-        )
-        .unwrap();
         let authority = Keypair::new();
         let owner = Keypair::new();
         let other = Keypair::new();
+        let program_bytes =
+            fs::read(program_binary_path()).expect("program binary must be readable");
+        svm.add_program(nakshatra_pay::id(), &program_bytes)
+            .unwrap();
+        set_program_upgrade_authority(&mut svm, authority.pubkey());
         for key in [authority.pubkey(), owner.pubkey(), other.pubkey()] {
             svm.airdrop(&key, 10_000_000_000).unwrap();
         }
@@ -157,6 +236,7 @@ impl Fixture {
         let fee_wallet = Pubkey::new_unique();
         let next_fee_wallet = Pubkey::new_unique();
         let source = Pubkey::new_unique();
+        let donor_source = Pubkey::new_unique();
         let destination = Pubkey::new_unique();
         let other_destination = Pubkey::new_unique();
         let wrong_destination = Pubkey::new_unique();
@@ -164,6 +244,7 @@ impl Fixture {
         put_token(&mut svm, fee_wallet, mint, authority.pubkey(), 0);
         put_token(&mut svm, next_fee_wallet, mint, authority.pubkey(), 0);
         put_token(&mut svm, source, mint, owner.pubkey(), INITIAL);
+        put_token(&mut svm, donor_source, mint, other.pubkey(), DONATION);
         put_token(&mut svm, destination, mint, owner.pubkey(), 0);
         put_token(&mut svm, other_destination, mint, other.pubkey(), 0);
         put_token(&mut svm, wrong_destination, wrong_mint, owner.pubkey(), 0);
@@ -217,6 +298,7 @@ impl Fixture {
             fee_wallet,
             next_fee_wallet,
             source,
+            donor_source,
             destination,
             other_destination,
             wrong_destination,
@@ -239,6 +321,71 @@ impl Fixture {
                 source: self.source,
                 vault: self.vault,
                 token_program: spl_token::ID,
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    fn config_propose_ix(
+        &self,
+        authority: Pubkey,
+        fee_wallet: Pubkey,
+        fee_bps: u16,
+    ) -> Instruction {
+        Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::ConfigPropose { fee_bps }.data(),
+            nakshatra_pay::accounts::ConfigProposeAccounts {
+                authority,
+                config: self.config,
+                fee_wallet,
+                token_program: spl_token::ID,
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    fn config_apply_ix(&self, executor: Pubkey, fee_wallet: Pubkey) -> Instruction {
+        Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::ConfigApply {}.data(),
+            nakshatra_pay::accounts::ConfigApplyAccounts {
+                executor,
+                config: self.config,
+                fee_wallet,
+                token_program: spl_token::ID,
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    fn config_propose_authority_ix(&self, authority: Pubkey, new_authority: Pubkey) -> Instruction {
+        Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::ConfigProposeAuthority { new_authority }.data(),
+            nakshatra_pay::accounts::ConfigAuthorityAccounts {
+                authority,
+                config: self.config,
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    fn config_accept_authority_ix(&self, new_authority: Pubkey) -> Instruction {
+        Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::ConfigAcceptAuthority {}.data(),
+            nakshatra_pay::accounts::ConfigAcceptAuthorityAccounts {
+                new_authority,
+                config: self.config,
                 event_authority: event_authority(),
                 program: nakshatra_pay::id(),
             }
@@ -354,6 +501,17 @@ fn m0_init_limits_singleton_and_token_2022_rejection() {
     let mut f = Fixture::new(false, false);
     assert!(!send(
         &mut f.svm,
+        &f.other,
+        config_init_ix(
+            f.other.pubkey(),
+            f.config,
+            f.mint,
+            f.fee_wallet,
+            DEFAULT_FEE_BPS
+        )
+    ));
+    assert!(!send(
+        &mut f.svm,
         &f.authority,
         config_init_ix(
             f.authority.pubkey(),
@@ -397,6 +555,33 @@ fn m0_init_limits_singleton_and_token_2022_rejection() {
         &mut g.svm,
         &g.authority,
         config_init_ix(g.authority.pubkey(), g.config, mint_2022, wallet_2022, 300)
+    ));
+}
+
+#[test]
+fn strict_instruction_data_rejects_trailing_byte() {
+    let mut f = Fixture::new(false, false);
+    let mut ix = config_init_ix(
+        f.authority.pubkey(),
+        f.config,
+        f.mint,
+        f.fee_wallet,
+        DEFAULT_FEE_BPS,
+    );
+    ix.data.push(0);
+    assert!(!send(&mut f.svm, &f.authority, ix));
+    assert!(f.svm.get_account(&f.config).is_none());
+
+    assert!(send(
+        &mut f.svm,
+        &f.authority,
+        config_init_ix(
+            f.authority.pubkey(),
+            f.config,
+            f.mint,
+            f.fee_wallet,
+            DEFAULT_FEE_BPS
+        )
     ));
 }
 
@@ -669,18 +854,57 @@ fn m1_fake_config_owned_by_another_program_is_rejected() {
 }
 
 #[test]
-fn core_guarantee_owner_always_gets_every_token_out_without_a_nakshatra_signer() {
+fn core_guarantee_owner_exit_survives_hostile_config_changes_and_donation() {
     let mut f = Fixture::new(true, true);
+
+    let propose_config = f.config_propose_ix(f.authority.pubkey(), f.next_fee_wallet, FEE_BPS_MAX);
+    assert!(send(&mut f.svm, &f.authority, propose_config));
+    warp_seconds(&mut f.svm, CONFIG_DELAY_S - WITHDRAW_DELAY_S);
+
     assert!(owner_tx!(f, f.deposit_ix(INITIAL)));
     assert!(owner_tx!(
         f,
         f.request_ix(f.owner.pubkey(), f.escrow, f.vault, INITIAL)
     ));
+
+    let donation = token_instruction::transfer_checked(
+        &spl_token::ID,
+        &f.donor_source,
+        &f.mint,
+        &f.vault,
+        &f.other.pubkey(),
+        &[],
+        DONATION,
+        6,
+    )
+    .unwrap();
+    assert!(send(&mut f.svm, &f.other, donation));
+    assert_eq!(token_amount(&f.svm, f.vault), INITIAL + DONATION);
+
     warp_seconds(&mut f.svm, WITHDRAW_DELAY_S);
+    let apply_config = f.config_apply_ix(f.other.pubkey(), f.next_fee_wallet);
+    assert!(send(&mut f.svm, &f.other, apply_config));
+    let propose_authority = f.config_propose_authority_ix(f.authority.pubkey(), f.other.pubkey());
+    assert!(send(&mut f.svm, &f.authority, propose_authority));
+    let accept_authority = f.config_accept_authority_ix(f.other.pubkey());
+    assert!(send(&mut f.svm, &f.other, accept_authority));
+    let changed = read_config(&f.svm, f.config);
+    assert_eq!(changed.fee_bps, FEE_BPS_MAX);
+    assert_eq!(changed.fee_wallet, f.next_fee_wallet);
+    assert_eq!(changed.authority, f.other.pubkey());
+
     assert!(owner_tx!(
         f,
         f.execute_ix(f.owner.pubkey(), f.escrow, f.vault, f.destination)
     ));
     assert_eq!(token_amount(&f.svm, f.destination), INITIAL);
-    assert_eq!(token_amount(&f.svm, f.vault), 0);
+    assert_eq!(token_amount(&f.svm, f.vault), DONATION);
+
+    assert!(owner_tx!(
+        f,
+        f.close_ix(f.owner.pubkey(), f.escrow, f.vault, f.destination)
+    ));
+    assert_eq!(token_amount(&f.svm, f.destination), INITIAL + DONATION);
+    assert!(f.svm.get_account(&f.vault).is_none());
+    assert!(f.svm.get_account(&f.escrow).is_none());
 }
