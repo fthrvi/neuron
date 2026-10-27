@@ -29,6 +29,7 @@ SystemCallFilter=@system-service
 # Optional: NAK_PAYOUT_KILL_FILE=%h/.neuron/credits/payout.off
 # Optional: NAK_RECONCILE_SIGNING_KEY=%h/.nakshatra/keys/worker.ed25519
 # Optional: NAK_RECONCILE_REPORT_DIR=%h/.neuron/credits/reconcile
+# Optional: NAK_RECONCILE_GRANDFATHERED_HOLDS=%h/.config/nakshatra/reconcile-grandfathered-holds.txt
 # Optional: NAK_RECONCILE_SNAPSHOT_ATTEMPTS=3
 # Optional: NAK_RECONCILE_RETRY_DELAY_S=0.25
 # Optional: NAK_RECONCILE_INCONCLUSIVE_KILL_RUNS=3

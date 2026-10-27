@@ -105,6 +105,9 @@ DEFAULT_STORE = "~/.neuron/credits/ledger.sqlite"
 DEFAULT_REPORT_DIR = "~/.neuron/credits/reconcile"
 DEFAULT_KILL_FILE = "~/.neuron/credits/payout.off"
 DEFAULT_SIGNING_KEY = "~/.nakshatra/keys/worker.ed25519"
+DEFAULT_GRANDFATHERED_HOLDS_FILE = (
+    "~/.config/nakshatra/reconcile-grandfathered-holds.txt"
+)
 DEFAULT_BUZZ_HELPER = Path("/home/prithvi/trisul/infra/mesh-agent/buzz-say.sh")
 DEFAULT_SWEEP_STALE_BLOCKS = 300
 REPORT_METHOD = "REPORT"
@@ -133,6 +136,9 @@ class ReconcileConfig:
     report_dir: Path = Path(DEFAULT_REPORT_DIR).expanduser()
     kill_file: Path = Path(DEFAULT_KILL_FILE).expanduser()
     signing_key: Path = Path(DEFAULT_SIGNING_KEY).expanduser()
+    grandfathered_holds_file: Path = Path(
+        DEFAULT_GRANDFATHERED_HOLDS_FILE
+    ).expanduser()
     buzz_helper: Path | None = DEFAULT_BUZZ_HELPER
     snapshot_attempts: int = 3
     snapshot_retry_delay_s: float = 0.25
@@ -192,6 +198,12 @@ class ReconcileConfig:
             signing_key=_expanded(
                 os.environ.get("NAK_RECONCILE_SIGNING_KEY", DEFAULT_SIGNING_KEY)
             ),
+            grandfathered_holds_file=_expanded(
+                os.environ.get(
+                    "NAK_RECONCILE_GRANDFATHERED_HOLDS",
+                    DEFAULT_GRANDFATHERED_HOLDS_FILE,
+                )
+            ),
             buzz_helper=_expanded(helper) if helper else DEFAULT_BUZZ_HELPER,
             snapshot_attempts=int(os.environ.get("NAK_RECONCILE_SNAPSHOT_ATTEMPTS", "3")),
             snapshot_retry_delay_s=float(
@@ -245,6 +257,57 @@ def _load_signing_key(path: Path) -> ed25519.Ed25519PrivateKey:
         return ed25519.Ed25519PrivateKey.from_private_bytes(raw)
     except ValueError as exc:
         raise ReconcileError("report signing key is not a valid Ed25519 seed") from exc
+
+
+def _load_grandfathered_hold_ids(path: Path) -> frozenset[str]:
+    """Read an operator-pinned exception list without following links."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return frozenset()
+    except OSError as exc:
+        raise ReconcileError(
+            f"could not open grandfathered task hold file {path}: {exc}"
+        ) from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ReconcileError(
+                f"grandfathered task hold file is not regular: {path}"
+            )
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o022:
+            raise ReconcileError(
+                f"grandfathered task hold file mode is {mode:04o}; "
+                "group/world write access is forbidden"
+            )
+        raw = os.read(fd, 1_048_577)
+    finally:
+        os.close(fd)
+    if len(raw) > 1_048_576:
+        raise ReconcileError("grandfathered task hold file exceeds 1 MiB")
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ReconcileError(
+            "grandfathered task hold file must contain ASCII text"
+        ) from exc
+    hold_ids: set[str] = set()
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
+        hold_id = raw_line.split("#", 1)[0].strip()
+        if not hold_id:
+            continue
+        if len(hold_id) != 32 or any(
+            character not in "0123456789abcdef" for character in hold_id
+        ):
+            raise ReconcileError(
+                f"invalid hold id on line {line_number} of {path}"
+            )
+        hold_ids.add(hold_id)
+    return frozenset(hold_ids)
 
 
 def sign_report(report: dict[str, Any], key_path: Path) -> dict[str, Any]:
@@ -571,6 +634,12 @@ class Reconciler:
                         dict(row)
                         for row in db.execute(
                             "SELECT * FROM task_holds ORDER BY hold_id"
+                        )
+                    ],
+                    "task_earnings": [
+                        dict(row)
+                        for row in db.execute(
+                            "SELECT * FROM task_earnings ORDER BY hold_id"
                         )
                     ],
                     "economic_receipts": [
@@ -1222,7 +1291,10 @@ class Reconciler:
         return records, errors, amounts
 
     @staticmethod
-    def _spend_checks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
+    def _spend_checks(
+        ledger: dict[str, Any],
+        grandfathered_hold_ids: frozenset[str] = frozenset(),
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Independently reconcile N2 receipts, pricing, escrow, and maturity."""
         errors: dict[str, list[str]] = {
             "spend_usage_linkage": [],
@@ -1902,6 +1974,9 @@ class Reconciler:
             row["hold_id"]: row for row in ledger["task_holds"]
             if row["state"] == "paid"
         }
+        task_earnings = {
+            row["hold_id"]: row for row in ledger["task_earnings"]
+        }
         expected_task_ids = {
             f"task:{hold_id}" for hold_id in paid_task_holds
         }
@@ -1917,35 +1992,175 @@ class Reconciler:
             errors["economic_receipt_view"].append(
                 "task economic rows do not exactly and bidirectionally match paid holds"
             )
+        if set(task_earnings) != set(paid_task_holds):
+            errors["economic_receipt_view"].append(
+                "task earning rows do not exactly and bidirectionally match paid holds"
+            )
+
+        # Replay journal balances up to (but not including) each authorization
+        # debit. This is the historical funding rule used before task holds had
+        # an immutable funded snapshot: starter credit is spendable, but it is
+        # not deposit-backed funding.
+        running_task_balances: dict[str, int] = {}
+        starter_task_credits: dict[str, int] = {}
+        task_backed_before_seq: dict[int, int] = {}
+        for journal in ledger["journal"]:
+            account = str(journal["account"])
+            if journal["kind"] == "task_authorize_debit":
+                task_backed_before_seq[int(journal["seq"])] = (
+                    running_task_balances.get(account, 0)
+                    - starter_task_credits.get(account, 0)
+                )
+            running_task_balances[account] = (
+                running_task_balances.get(account, 0) + int(journal["amount"])
+            )
+            if journal["kind"] == "starter_receive":
+                starter_task_credits[account] = (
+                    starter_task_credits.get(account, 0) + int(journal["amount"])
+                )
+
+        accepted_grandfathers: dict[str, int] = {}
         for hold_id, hold in paid_task_holds.items():
             economic_id = f"task:{hold_id}"
+            authorization_id = f"task-authorize:{hold_id}"
             event_id = f"task-pay:{hold_id}"
             view = economic_rows.get(economic_id)
+            authorization_rows = journals_by_receipt.get(authorization_id, [])
+            authorization_debits = [
+                row for row in authorization_rows
+                if row["kind"] == "task_authorize_debit"
+            ]
+            authorization_credits = [
+                row for row in authorization_rows
+                if row["kind"] == "task_authorize_credit"
+            ]
+            authorization_detail = json.dumps(
+                {"hold_id": hold_id}, sort_keys=True, separators=(",", ":")
+            )
+            authorization_ok = (
+                len(authorization_rows) == 2
+                and len(authorization_debits) == 1
+                and len(authorization_credits) == 1
+                and authorization_debits[0]["account"] == hold["payer_account"]
+                and authorization_debits[0]["counterparty"] == hold["escrow_account"]
+                and int(authorization_debits[0]["amount"]) == -int(hold["amount"])
+                and int(authorization_debits[0]["ts"]) == int(hold["authorized_at"])
+                and authorization_debits[0]["detail"] == authorization_detail
+                and authorization_credits[0]["account"] == hold["escrow_account"]
+                and authorization_credits[0]["counterparty"] == hold["payer_account"]
+                and int(authorization_credits[0]["amount"]) == int(hold["amount"])
+                and int(authorization_credits[0]["ts"]) == int(hold["authorized_at"])
+                and authorization_credits[0]["detail"] == authorization_detail
+            )
+            reconstructed_funded: bool | None = None
+            if authorization_ok:
+                backed_before = task_backed_before_seq.get(
+                    int(authorization_debits[0]["seq"])
+                )
+                if backed_before is not None:
+                    reconstructed_funded = backed_before >= int(hold["amount"])
+            if reconstructed_funded is None:
+                authorization_ok = False
+                errors["economic_receipt_view"].append(
+                    f"{economic_id}: task authorization journal provenance is inconsistent"
+                )
+
+            stored_funded = int(hold["funded"])
+            listed = hold_id in grandfathered_hold_ids
+            grandfather_eligible = (
+                authorization_ok
+                and stored_funded == 1
+                and reconstructed_funded is False
+            )
+            if listed:
+                if grandfather_eligible:
+                    accepted_grandfathers[hold_id] = int(hold["amount"])
+                else:
+                    errors["economic_receipt_view"].append(
+                        f"{economic_id}: grandfather list entry is stale or not eligible"
+                    )
+            elif authorization_ok and stored_funded != int(reconstructed_funded):
+                errors["economic_receipt_view"].append(
+                    f"{economic_id}: stored task funding differs from authorization provenance"
+                )
+
+            earning = task_earnings.get(hold_id)
             event_rows = journals_by_receipt.get(event_id, [])
-            debits = [
-                row for row in event_rows if row["kind"] == "task_pay_debit"
-            ]
-            credits = [
-                row for row in event_rows if row["kind"] == "task_earn"
-            ]
             terminal = hold["terminal_at"]
+            debit = (
+                journals.get(int(earning["debit_journal_seq"]))
+                if earning is not None and earning["debit_journal_seq"] is not None
+                else None
+            )
+            credit = (
+                journals.get(int(earning["credit_journal_seq"]))
+                if earning is not None and earning["credit_journal_seq"] is not None
+                else None
+            )
+            valid_details = {
+                json.dumps(
+                    {"hold_id": hold_id}, sort_keys=True, separators=(",", ":")
+                ),
+                json.dumps(
+                    {"hold_id": hold_id, "paid_by_silence": True},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+            if hold["resolved_outcome"] == "pay":
+                valid_details.add(
+                    json.dumps(
+                        {
+                            "hold_id": hold_id,
+                            "resolved_by": "operator",
+                            "dispute_reason": hold["dispute_reason"],
+                            "resolution_reason": hold["resolution_reason"],
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            elif hold["disputed_at"] is not None:
+                valid_details.add(
+                    json.dumps(
+                        {
+                            "hold_id": hold_id,
+                            "dispute_backstop": True,
+                            "dispute_reason": hold["dispute_reason"],
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
             journal_pair_ok = (
-                terminal is not None
+                earning is not None
+                and terminal is not None
                 and len(event_rows) == 2
-                and len(debits) == 1
-                and len(credits) == 1
-                and debits[0]["account"] == hold["escrow_account"]
-                and debits[0]["counterparty"] == hold["worker_account"]
-                and int(debits[0]["amount"]) == -int(hold["amount"])
-                and int(debits[0]["ts"]) == int(terminal)
-                and credits[0]["account"] == hold["worker_account"]
-                and credits[0]["counterparty"] == hold["escrow_account"]
-                and int(credits[0]["amount"]) == int(hold["amount"])
-                and int(credits[0]["ts"]) == int(terminal)
+                and debit is not None
+                and credit is not None
+                and {int(row["seq"]) for row in event_rows}
+                    == {int(debit["seq"]), int(credit["seq"])}
+                and int(earning["earned_at"]) == int(terminal)
+                and int(earning["matures_at"]) == int(terminal) + HOLD_S
+                and balances.get(hold["escrow_account"], 0) == 0
+                and debit["kind"] == "task_pay_debit"
+                and debit["receipt_id"] == event_id
+                and debit["account"] == hold["escrow_account"]
+                and debit["counterparty"] == hold["worker_account"]
+                and int(debit["amount"]) == -int(hold["amount"])
+                and int(debit["ts"]) == int(terminal)
+                and debit["detail"] in valid_details
+                and credit["kind"] == "task_earn"
+                and credit["receipt_id"] == event_id
+                and credit["account"] == hold["worker_account"]
+                and credit["counterparty"] == hold["escrow_account"]
+                and int(credit["amount"]) == int(hold["amount"])
+                and int(credit["ts"]) == int(terminal)
+                and credit["detail"] == debit["detail"]
             )
             if not journal_pair_ok:
                 errors["economic_receipt_view"].append(
-                    f"{economic_id}: paid task hold lacks its exact payment journal pair"
+                    f"{economic_id}: paid task hold is not cashable from exact payment provenance"
                 )
             if view is None:
                 errors["economic_receipt_view"].append(
@@ -1967,16 +2182,30 @@ class Reconciler:
                 "eligible_at": None if maturity is None else maturity + 1,
                 "dispute_state": "none",
                 "debit_journal_seq": (
-                    int(debits[0]["seq"]) if journal_pair_ok else None
+                    int(earning["debit_journal_seq"])
+                    if earning is not None else None
                 ),
                 "credit_journal_seq": (
-                    int(credits[0]["seq"]) if journal_pair_ok else None
+                    int(earning["credit_journal_seq"])
+                    if earning is not None else None
                 ),
             }
             if any(view[field] != value for field, value in expected.items()):
                 errors["economic_receipt_view"].append(
                     f"{economic_id}: task economic projection differs from hold provenance"
                 )
+        for hold_id in sorted(grandfathered_hold_ids - set(paid_task_holds)):
+            errors["economic_receipt_view"].append(
+                f"task:{hold_id}: grandfather list entry has no paid task hold"
+            )
+        grandfathered_task_holds = {
+            "ids": sorted(accepted_grandfathers),
+            "amounts": [
+                {"hold_id": hold_id, "credits": accepted_grandfathers[hold_id]}
+                for hold_id in sorted(accepted_grandfathers)
+            ],
+            "total_credits": sum(accepted_grandfathers.values()),
+        }
         expected_economic_ids = expected_v2_ids | {
             f"v1:{row['seq']}"
             for row in ledger["journal"]
@@ -2221,13 +2450,14 @@ class Reconciler:
                 "errors": own_errors,
             }
             for check_id, own_errors in errors.items()
-        ]
+        ], grandfathered_task_holds
 
     def _build_report(
         self,
         ledger: dict[str, Any],
         chain: dict[str, Any],
         statuses: dict[str, dict[str, Any] | None],
+        grandfathered_hold_ids: frozenset[str],
         *,
         generated: int,
         attempt: int,
@@ -2266,6 +2496,9 @@ class Reconciler:
         if sweep_errors and lag:
             deposit_errors.extend(lag)
             lag = []
+        spend_checks, grandfathered_task_holds = self._spend_checks(
+            ledger, grandfathered_hold_ids
+        )
         balances = {row["id"]: int(row["balance"]) for row in ledger["accounts"]}
         treasury_balance = balances.get(TREASURY_ACCOUNT, 0)
         balance_sum = sum(balances.values())
@@ -2364,7 +2597,7 @@ class Reconciler:
                 "checked": len(finalized_proofs),
                 "failed": sum(not item["ok"] for item in finalized_proofs),
             },
-            *self._spend_checks(ledger),
+            *spend_checks,
         ]
         ok = all(check["ok"] for check in checks)
         report = {
@@ -2421,6 +2654,7 @@ class Reconciler:
                 "verified_credits": verified_swept_total,
                 "verification": "all finalized ledger and chain-finalized sent sweeps",
             },
+            "grandfathered_task_holds": grandfathered_task_holds,
             "alerts": [],
         }
         return report, lag
@@ -2428,6 +2662,9 @@ class Reconciler:
     def collect(self) -> dict[str, Any]:
         """Collect a stable proof without writing balances or operational files."""
         generated = int(self.now())
+        grandfathered_hold_ids = _load_grandfathered_hold_ids(
+            self.config.grandfathered_holds_file
+        )
         baseline = self._ledger_snapshot()
         self._pin_rpcs()
         reasons: list[str] = []
@@ -2460,6 +2697,7 @@ class Reconciler:
                     ledger,
                     after,
                     statuses,
+                    grandfathered_hold_ids,
                     generated=generated,
                     attempt=attempt,
                     before_slot=int(before["slot"]),
@@ -2488,6 +2726,7 @@ class Reconciler:
                 baseline,
                 after,
                 statuses,
+                grandfathered_hold_ids,
                 generated=generated,
                 attempt=self.config.snapshot_attempts,
                 before_slot=int(before["slot"]),
@@ -2626,6 +2865,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--report-dir", help="override signed report directory")
     parser.add_argument("--kill-file", help="override the S4 payout kill file")
     parser.add_argument("--signing-key", help="override the hub Ed25519 seed")
+    parser.add_argument(
+        "--grandfathered-holds-file",
+        help="operator-pinned list of grandfathered paid task hold ids",
+    )
     parser.add_argument("--verify-report", type=Path, help="verify a report and exit")
     expected = parser.add_mutually_exclusive_group()
     expected.add_argument(
@@ -2695,6 +2938,10 @@ def main(argv: list[str] | None = None) -> int:
             overrides["kill_file"] = _expanded(args.kill_file)
         if args.signing_key:
             overrides["signing_key"] = _expanded(args.signing_key)
+        if args.grandfathered_holds_file:
+            overrides["grandfathered_holds_file"] = _expanded(
+                args.grandfathered_holds_file
+            )
         if overrides:
             config = replace(config, **overrides)
         rpc = SolanaRPC(config.rpc_url)

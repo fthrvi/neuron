@@ -2,9 +2,11 @@
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import time
+from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -12,7 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from chain.reconcile import Reconciler  # noqa: E402
+from chain.reconcile import ReconcileError, Reconciler  # noqa: E402
 from core.ledger_store import (  # noqa: E402
     HOLD_S,
     CreditLimitError,
@@ -941,6 +943,227 @@ def test_tampered_task_economic_view_fails(
         assert any("task economic projection differs" in error for error in view["errors"])
     else:
         assert any("task economic rows do not exactly" in error for error in view["errors"])
+
+
+def _paid_task_id(path, funded):
+    with sqlite3.connect(path) as db:
+        return db.execute(
+            "SELECT hold_id FROM task_holds WHERE state='paid' AND funded=? ",
+            (funded,),
+        ).fetchone()[0]
+
+
+def _flip_task_funded(path, hold_id):
+    with sqlite3.connect(path) as db:
+        db.execute("DROP TRIGGER task_holds_snapshots_immutable")
+        db.execute(
+            "UPDATE task_holds SET funded=1-funded WHERE hold_id=?", (hold_id,)
+        )
+
+
+def _write_grandfather_file(config, contents):
+    config.grandfathered_holds_file.write_text(contents, encoding="ascii")
+    config.grandfathered_holds_file.chmod(0o600)
+
+
+def test_task_funded_flip_requires_explicit_grandfather(
+    tmp_path, legacy_task_reconcile_fixture
+):
+    hold_id = _paid_task_id(legacy_task_reconcile_fixture, 0)
+    _flip_task_funded(legacy_task_reconcile_fixture, hold_id)
+
+    report = Reconciler(
+        legacy_task_reconcile_fixture,
+        FakeReconcileRPC({VAULT: 100}),
+        _config(tmp_path),
+    ).collect()
+
+    view = _check(report, "economic_receipt_view")
+    assert report["outcome"] == "mismatch"
+    assert any("stored task funding differs" in error for error in view["errors"])
+
+
+def test_explicit_grandfather_is_reported_and_accepts_only_funded_migration(
+    tmp_path, legacy_task_reconcile_fixture
+):
+    hold_id = _paid_task_id(legacy_task_reconcile_fixture, 0)
+    _flip_task_funded(legacy_task_reconcile_fixture, hold_id)
+    config = _config(tmp_path)
+    _write_grandfather_file(
+        config, f"# migration exception\n{hold_id}  # verified hold\n"
+    )
+    _write_key(config.signing_key)
+
+    envelope, _ = Reconciler(
+        legacy_task_reconcile_fixture,
+        FakeReconcileRPC({VAULT: 100}),
+        config,
+        notify=lambda *_: {"attempted": False},
+    ).run()
+    report = envelope["report"]
+
+    assert report["outcome"] == "match", report
+    assert report["grandfathered_task_holds"] == {
+        "ids": [hold_id],
+        "amounts": [{"hold_id": hold_id, "credits": 80}],
+        "total_credits": 80,
+    }
+
+
+@pytest.mark.parametrize("entry", ["missing", "already_matches"])
+def test_stale_grandfather_entry_is_a_mismatch(
+    tmp_path, legacy_task_reconcile_fixture, entry
+):
+    if entry == "missing":
+        hold_id = "f" * 32
+    else:
+        hold_id = _paid_task_id(legacy_task_reconcile_fixture, 1)
+    config = _config(tmp_path)
+    _write_grandfather_file(config, f"{hold_id}\n")
+
+    report = Reconciler(
+        legacy_task_reconcile_fixture,
+        FakeReconcileRPC({VAULT: 100}),
+        config,
+    ).collect()
+
+    assert report["outcome"] == "mismatch"
+    assert any(
+        "grandfather list entry" in error
+        for error in _check(report, "economic_receipt_view")["errors"]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation", ["funded_flip", "payment_detail", "leftover_escrow"]
+)
+def test_task_cashability_tampering_is_a_mismatch(
+    tmp_path, legacy_task_reconcile_fixture, mutation
+):
+    with sqlite3.connect(legacy_task_reconcile_fixture) as db:
+        db.row_factory = sqlite3.Row
+        hold = db.execute(
+            "SELECT * FROM task_holds WHERE state='paid' AND funded=0"
+        ).fetchone()
+        if mutation == "funded_flip":
+            db.execute("DROP TRIGGER task_holds_snapshots_immutable")
+            db.execute(
+                "UPDATE task_holds SET funded=1 WHERE hold_id=?", (hold["hold_id"],)
+            )
+        elif mutation == "payment_detail":
+            db.execute(
+                "UPDATE journal SET detail=? WHERE receipt_id=?",
+                ('{"hold_id":"wrong"}', f"task-pay:{hold['hold_id']}"),
+            )
+        else:
+            db.execute(
+                "UPDATE accounts SET balance=balance+1 WHERE id=?",
+                (hold["escrow_account"],),
+            )
+            db.execute(
+                "UPDATE accounts SET balance=balance-1 WHERE id=?",
+                (hold["worker_account"],),
+            )
+
+    report = Reconciler(
+        legacy_task_reconcile_fixture,
+        FakeReconcileRPC({VAULT: 100}),
+        _config(tmp_path),
+    ).collect()
+    view = _check(report, "economic_receipt_view")
+    assert report["outcome"] == "mismatch"
+    assert view["ok"] is False
+    if mutation == "funded_flip":
+        assert any("stored task funding differs" in error for error in view["errors"])
+    else:
+        assert any("exact payment provenance" in error for error in view["errors"])
+
+
+def test_task_authorization_journal_is_verified(
+    tmp_path, legacy_task_reconcile_fixture
+):
+    hold_id = _paid_task_id(legacy_task_reconcile_fixture, 0)
+    with sqlite3.connect(legacy_task_reconcile_fixture) as db:
+        db.execute(
+            "UPDATE journal SET detail=? WHERE receipt_id=?",
+            ('{"hold_id":"wrong"}', f"task-authorize:{hold_id}"),
+        )
+
+    report = Reconciler(
+        legacy_task_reconcile_fixture,
+        FakeReconcileRPC({VAULT: 100}),
+        _config(tmp_path),
+    ).collect()
+    assert report["outcome"] == "mismatch"
+    assert any(
+        "authorization journal provenance" in error
+        for error in _check(report, "economic_receipt_view")["errors"]
+    )
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "world_writable"])
+def test_grandfather_file_must_be_operator_safe(
+    tmp_path, legacy_task_reconcile_fixture, unsafe
+):
+    config = _config(tmp_path)
+    target = tmp_path / "grandfather-target.txt"
+    target.write_text("# empty\n", encoding="ascii")
+    if unsafe == "symlink":
+        config.grandfathered_holds_file.symlink_to(target)
+    else:
+        config.grandfathered_holds_file.write_text("# empty\n", encoding="ascii")
+        config.grandfathered_holds_file.chmod(0o666)
+
+    with pytest.raises(ReconcileError, match="grandfathered task hold file"):
+        Reconciler(
+            legacy_task_reconcile_fixture,
+            FakeReconcileRPC({VAULT: 100}),
+            config,
+        ).collect()
+
+
+LIVE_LEDGER = Path(
+    "/tmp/claude-1000/-home-prithvi-trisul/"
+    "61bd987d-366b-47a9-a50b-3114778d4416/scratchpad/s9/live-copy.sqlite"
+)
+LIVE_GRANDFATHERED_TASK_HOLDS = [
+    "18651685cf2b43f297a6e23d0d41f19f",
+    "7e50341708194104a981e41c8669534d",
+    "9786afd19ca14d5fa2a55374cdbdfe12",
+    "dfdf065ca1d445689a4d83cf06846e6f",
+]
+
+
+@pytest.mark.skipif(not LIVE_LEDGER.is_file(), reason="review ledger is unavailable")
+def test_live_copy_requires_exact_grandfather_list(tmp_path):
+    copied = tmp_path / "live-copy.sqlite"
+    shutil.copy2(LIVE_LEDGER, copied)
+    config = _config(tmp_path)
+
+    without = Reconciler(
+        copied, FakeReconcileRPC({VAULT: 0}), config
+    ).collect()
+    assert without["outcome"] == "mismatch"
+    funding_errors = [
+        error for error in _check(without, "economic_receipt_view")["errors"]
+        if "stored task funding differs" in error
+    ]
+    assert len(funding_errors) == 4
+
+    _write_grandfather_file(
+        config, "\n".join(LIVE_GRANDFATHERED_TASK_HOLDS) + "\n"
+    )
+    with_exact = Reconciler(
+        copied, FakeReconcileRPC({VAULT: 0}), config
+    ).collect()
+    assert with_exact["outcome"] == "match", with_exact
+    section = with_exact["grandfathered_task_holds"]
+    assert section["ids"] == sorted(LIVE_GRANDFATHERED_TASK_HOLDS)
+    assert section["total_credits"] == 35_201_000
+
+    _write_grandfather_file(config, "f" * 32 + "\n")
+    wrong = Reconciler(copied, FakeReconcileRPC({VAULT: 0}), config).collect()
+    assert wrong["outcome"] == "mismatch"
 
 
 def test_legacy_funding_requires_exact_receipt_journal_pair(tmp_path):

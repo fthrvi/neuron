@@ -103,6 +103,7 @@ def _config(tmp_path, **changes):
         "report_dir": tmp_path / "reports",
         "kill_file": tmp_path / "payout.off",
         "signing_key": tmp_path / "worker.ed25519",
+        "grandfathered_holds_file": tmp_path / "grandfathered-holds.txt",
         "buzz_helper": None,
         "snapshot_attempts": 1,
         "snapshot_retry_delay_s": 0,
