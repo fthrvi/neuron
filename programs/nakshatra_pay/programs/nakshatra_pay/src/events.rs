@@ -164,3 +164,52 @@ pub struct ChannelClosed {
     pub released: u64,
     pub by: Pubkey,
 }
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskPaidHow {
+    Verified,
+    Silence,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskRefundedHow {
+    Failed,
+    Expired,
+}
+
+#[event]
+pub struct TaskOpened {
+    pub escrow: Pubkey,
+    pub task: Pubkey,
+    pub generation: u64,
+    pub worker: Pubkey,
+    pub verifier: Pubkey,
+    pub amount: u64,
+    pub deadline: i64,
+    pub task_hash: [u8; 32],
+    pub fee_bps_snapshot: u16,
+}
+
+#[event]
+pub struct TaskSubmitted {
+    pub task: Pubkey,
+    pub worker: Pubkey,
+    pub result_hash: [u8; 32],
+    pub submitted_at: i64,
+}
+
+#[event]
+pub struct TaskPaid {
+    pub task: Pubkey,
+    pub worker: Pubkey,
+    pub amount: u64,
+    pub fee: u64,
+    pub how: TaskPaidHow,
+}
+
+#[event]
+pub struct TaskRefunded {
+    pub task: Pubkey,
+    pub amount: u64,
+    pub how: TaskRefundedHow,
+}

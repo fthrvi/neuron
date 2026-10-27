@@ -68,6 +68,14 @@ fn strict_entry<'info>(
         Some(instruction::ChannelCloseRequest::DISCRIMINATOR.len())
     } else if data.starts_with(instruction::ChannelCloseFinalize::DISCRIMINATOR) {
         Some(instruction::ChannelCloseFinalize::DISCRIMINATOR.len())
+    } else if data.starts_with(instruction::TaskOpen::DISCRIMINATOR) {
+        Some(instruction::TaskOpen::DISCRIMINATOR.len() + 32 + 32 + 8 + 8 + 32)
+    } else if data.starts_with(instruction::TaskSubmit::DISCRIMINATOR) {
+        Some(instruction::TaskSubmit::DISCRIMINATOR.len() + 32)
+    } else if data.starts_with(instruction::TaskVerify::DISCRIMINATOR) {
+        Some(instruction::TaskVerify::DISCRIMINATOR.len() + 1)
+    } else if data.starts_with(instruction::TaskTimeout::DISCRIMINATOR) {
+        Some(instruction::TaskTimeout::DISCRIMINATOR.len())
     } else {
         None
     };
@@ -156,5 +164,24 @@ pub mod nakshatra_pay {
     }
     pub fn channel_close_finalize(ctx: Context<ChannelCloseFinalizeAccounts>) -> Result<()> {
         instructions::handle_channel_close_finalize(ctx)
+    }
+    pub fn task_open(
+        ctx: Context<TaskOpenAccounts>,
+        worker: Pubkey,
+        verifier: Pubkey,
+        amount: u64,
+        deadline: i64,
+        task_hash: [u8; 32],
+    ) -> Result<()> {
+        instructions::handle_task_open(ctx, worker, verifier, amount, deadline, task_hash)
+    }
+    pub fn task_submit(ctx: Context<TaskSubmitAccounts>, result_hash: [u8; 32]) -> Result<()> {
+        instructions::handle_task_submit(ctx, result_hash)
+    }
+    pub fn task_verify(ctx: Context<TaskSettleAccounts>, verdict: Verdict) -> Result<()> {
+        instructions::handle_task_verify(ctx, verdict)
+    }
+    pub fn task_timeout(ctx: Context<TaskSettleAccounts>) -> Result<()> {
+        instructions::handle_task_timeout(ctx)
     }
 }

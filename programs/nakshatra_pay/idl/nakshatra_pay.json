@@ -2226,6 +2226,567 @@
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "task_open",
+      "discriminator": [
+        224,
+        225,
+        18,
+        34,
+        158,
+        30,
+        147,
+        168
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "escrow",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.owner",
+                "account": "Escrow"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              }
+            ]
+          },
+          "relations": [
+            "escrow"
+          ]
+        },
+        {
+          "name": "delegate",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "task",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  97,
+                  115,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.generation",
+                "account": "Escrow"
+              },
+              {
+                "kind": "arg",
+                "path": "task_hash"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": [
+        {
+          "name": "worker",
+          "type": "pubkey"
+        },
+        {
+          "name": "verifier",
+          "type": "pubkey"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "deadline",
+          "type": "i64"
+        },
+        {
+          "name": "task_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "task_submit",
+      "discriminator": [
+        53,
+        6,
+        229,
+        188,
+        85,
+        35,
+        251,
+        190
+      ],
+      "accounts": [
+        {
+          "name": "worker",
+          "signer": true,
+          "relations": [
+            "task"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "escrow",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.owner",
+                "account": "Escrow"
+              }
+            ]
+          }
+        },
+        {
+          "name": "task",
+          "writable": true
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": [
+        {
+          "name": "result_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "task_timeout",
+      "discriminator": [
+        170,
+        200,
+        119,
+        193,
+        116,
+        105,
+        14,
+        120
+      ],
+      "accounts": [
+        {
+          "name": "executor",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "escrow",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.owner",
+                "account": "Escrow"
+              }
+            ]
+          }
+        },
+        {
+          "name": "delegate",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "rent_payer",
+          "writable": true
+        },
+        {
+          "name": "task",
+          "writable": true
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              }
+            ]
+          },
+          "relations": [
+            "escrow"
+          ]
+        },
+        {
+          "name": "worker_token",
+          "writable": true
+        },
+        {
+          "name": "fee_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              }
+            ]
+          }
+        },
+        {
+          "name": "instructions_sysvar",
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "task_verify",
+      "discriminator": [
+        48,
+        166,
+        118,
+        49,
+        253,
+        7,
+        171,
+        132
+      ],
+      "accounts": [
+        {
+          "name": "executor",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "escrow",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.owner",
+                "account": "Escrow"
+              }
+            ]
+          }
+        },
+        {
+          "name": "delegate",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "rent_payer",
+          "writable": true
+        },
+        {
+          "name": "task",
+          "writable": true
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              }
+            ]
+          },
+          "relations": [
+            "escrow"
+          ]
+        },
+        {
+          "name": "worker_token",
+          "writable": true
+        },
+        {
+          "name": "fee_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              }
+            ]
+          }
+        },
+        {
+          "name": "instructions_sysvar",
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": [
+        {
+          "name": "verdict",
+          "type": {
+            "defined": {
+              "name": "Verdict"
+            }
+          }
+        }
+      ]
     }
   ],
   "accounts": [
@@ -2292,6 +2853,19 @@
         52,
         54,
         244
+      ]
+    },
+    {
+      "name": "Task",
+      "discriminator": [
+        79,
+        34,
+        229,
+        55,
+        88,
+        90,
+        55,
+        84
       ]
     }
   ],
@@ -2531,6 +3105,58 @@
       ]
     },
     {
+      "name": "TaskOpened",
+      "discriminator": [
+        5,
+        219,
+        33,
+        229,
+        59,
+        0,
+        96,
+        190
+      ]
+    },
+    {
+      "name": "TaskPaid",
+      "discriminator": [
+        72,
+        20,
+        82,
+        55,
+        216,
+        110,
+        104,
+        174
+      ]
+    },
+    {
+      "name": "TaskRefunded",
+      "discriminator": [
+        49,
+        230,
+        123,
+        76,
+        62,
+        16,
+        104,
+        128
+      ]
+    },
+    {
+      "name": "TaskSubmitted",
+      "discriminator": [
+        39,
+        29,
+        92,
+        117,
+        184,
+        101,
+        14,
+        126
+      ]
+    },
+    {
       "name": "WithdrawCancelled",
       "discriminator": [
         162,
@@ -2699,7 +3325,7 @@
     {
       "code": 6025,
       "name": "DelegateDisabled",
-      "msg": "The delegate is disabled while existing channels are still open"
+      "msg": "The delegate is disabled while existing commitments are still open"
     },
     {
       "code": 6026,
@@ -2708,58 +3334,113 @@
     },
     {
       "code": 6027,
-      "name": "InsufficientCollateral",
-      "msg": "The escrow vault does not fully collateralize this channel"
+      "name": "DelegateTasksOpen",
+      "msg": "The delegate still has open tasks"
     },
     {
       "code": 6028,
+      "name": "InsufficientCollateral",
+      "msg": "The escrow vault does not fully collateralize this commitment"
+    },
+    {
+      "code": 6029,
       "name": "ChannelNotOpen",
       "msg": "The channel is not open"
     },
     {
-      "code": 6029,
+      "code": 6030,
       "name": "ChannelCloseElapsed",
       "msg": "The channel close grace period has elapsed"
     },
     {
-      "code": 6030,
+      "code": 6031,
       "name": "ChannelCloseNotElapsed",
       "msg": "The channel close grace period has not elapsed"
     },
     {
-      "code": 6031,
+      "code": 6032,
       "name": "VoucherNotIncreasing",
       "msg": "The voucher total must strictly increase"
     },
     {
-      "code": 6032,
+      "code": 6033,
       "name": "VoucherExceedsCap",
       "msg": "The voucher total exceeds the channel cap"
     },
     {
-      "code": 6033,
+      "code": 6034,
       "name": "InvalidEd25519Instruction",
       "msg": "The preceding instruction is not a valid Ed25519 verification"
     },
     {
-      "code": 6034,
+      "code": 6035,
       "name": "InvalidVoucherSigner",
       "msg": "The voucher signer is not authorized for this channel"
     },
     {
-      "code": 6035,
+      "code": 6036,
       "name": "InvalidVoucherMessage",
       "msg": "The signed voucher message does not match this redemption"
     },
     {
-      "code": 6036,
+      "code": 6037,
       "name": "RedeemViaCpi",
       "msg": "Channel redemption cannot be invoked through CPI"
     },
     {
-      "code": 6037,
+      "code": 6038,
       "name": "WrongDelegate",
       "msg": "The supplied delegate account does not match the channel"
+    },
+    {
+      "code": 6039,
+      "name": "DelegateGenerationMismatch",
+      "msg": "The delegate belongs to a different escrow generation"
+    },
+    {
+      "code": 6040,
+      "name": "InvalidTaskDeadline",
+      "msg": "The task deadline is outside the allowed range"
+    },
+    {
+      "code": 6041,
+      "name": "TaskNotOpen",
+      "msg": "The task is not open"
+    },
+    {
+      "code": 6042,
+      "name": "TaskNotSubmitted",
+      "msg": "The task has not been submitted"
+    },
+    {
+      "code": 6043,
+      "name": "TaskDeadlineElapsed",
+      "msg": "The task deadline has elapsed"
+    },
+    {
+      "code": 6044,
+      "name": "TaskTimeoutNotElapsed",
+      "msg": "The task is not yet eligible for timeout"
+    },
+    {
+      "code": 6045,
+      "name": "VerdictWindowElapsed",
+      "msg": "The verifier verdict window has elapsed"
+    },
+    {
+      "code": 6046,
+      "name": "InvalidVerifier",
+      "msg": "The verdict signer is not the task verifier"
+    },
+    {
+      "code": 6047,
+      "name": "InvalidVerdictMessage",
+      "msg": "The signed verdict message does not match this task"
+    },
+    {
+      "code": 6048,
+      "name": "VerifyViaCpi",
+      "msg": "Task verification cannot be invoked through CPI"
     }
   ],
   "types": [
@@ -3149,6 +3830,10 @@
             "type": "pubkey"
           },
           {
+            "name": "generation",
+            "type": "u64"
+          },
+          {
             "name": "cap_total",
             "type": "u64"
           },
@@ -3166,6 +3851,10 @@
           },
           {
             "name": "open_channels",
+            "type": "u32"
+          },
+          {
+            "name": "open_tasks",
             "type": "u32"
           },
           {
@@ -3486,6 +4175,276 @@
       }
     },
     {
+      "name": "Task",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "escrow",
+            "type": "pubkey"
+          },
+          {
+            "name": "generation",
+            "type": "u64"
+          },
+          {
+            "name": "worker",
+            "type": "pubkey"
+          },
+          {
+            "name": "verifier",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "deadline",
+            "type": "i64"
+          },
+          {
+            "name": "task_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "result_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "type": {
+              "defined": {
+                "name": "TaskStatus"
+              }
+            }
+          },
+          {
+            "name": "submitted_at",
+            "type": "i64"
+          },
+          {
+            "name": "delegate",
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "fee_bps_snapshot",
+            "type": "u16"
+          },
+          {
+            "name": "rent_payer",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskOpened",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "escrow",
+            "type": "pubkey"
+          },
+          {
+            "name": "task",
+            "type": "pubkey"
+          },
+          {
+            "name": "generation",
+            "type": "u64"
+          },
+          {
+            "name": "worker",
+            "type": "pubkey"
+          },
+          {
+            "name": "verifier",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "deadline",
+            "type": "i64"
+          },
+          {
+            "name": "task_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "fee_bps_snapshot",
+            "type": "u16"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskPaid",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "task",
+            "type": "pubkey"
+          },
+          {
+            "name": "worker",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "fee",
+            "type": "u64"
+          },
+          {
+            "name": "how",
+            "type": {
+              "defined": {
+                "name": "TaskPaidHow"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskPaidHow",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Verified"
+          },
+          {
+            "name": "Silence"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskRefunded",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "task",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "how",
+            "type": {
+              "defined": {
+                "name": "TaskRefundedHow"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskRefundedHow",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Failed"
+          },
+          {
+            "name": "Expired"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Open"
+          },
+          {
+            "name": "Submitted"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskSubmitted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "task",
+            "type": "pubkey"
+          },
+          {
+            "name": "worker",
+            "type": "pubkey"
+          },
+          {
+            "name": "result_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "submitted_at",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Verdict",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Pass"
+          },
+          {
+            "name": "Fail"
+          }
+        ]
+      }
+    },
+    {
       "name": "WithdrawCancelled",
       "type": {
         "kind": "struct",
@@ -3600,6 +4559,11 @@
       "name": "OWNER_STATE_SEED",
       "type": "bytes",
       "value": "[111, 119, 110, 101, 114, 95, 115, 116, 97, 116, 101]"
+    },
+    {
+      "name": "TASK_SEED",
+      "type": "bytes",
+      "value": "[116, 97, 115, 107]"
     },
     {
       "name": "VAULT_SEED",

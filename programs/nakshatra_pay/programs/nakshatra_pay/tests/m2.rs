@@ -26,7 +26,7 @@ use solana_transaction::versioned::VersionedTransaction;
 
 use nakshatra_pay::{
     constants::*,
-    state::{Channel, Delegate, Escrow},
+    state::{Channel, Delegate, Escrow, Task, Verdict},
 };
 
 const DEPOSIT: u64 = 1_000_000;
@@ -121,10 +121,7 @@ fn send_ixs(svm: &mut LiteSVM, payer: &Keypair, ixs: &[Instruction]) -> bool {
     let Ok(tx) = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[payer]) else {
         return false;
     };
-    match svm.send_transaction(tx) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    svm.send_transaction(tx).is_ok()
 }
 
 fn warp_seconds(svm: &mut LiteSVM, seconds: i64) {
@@ -203,12 +200,31 @@ fn read_channel(svm: &LiteSVM, key: Pubkey) -> Channel {
     Channel::try_deserialize(&mut svm.get_account(&key).unwrap().data.as_slice()).unwrap()
 }
 
+fn read_task(svm: &LiteSVM, key: Pubkey) -> Task {
+    Task::try_deserialize(&mut svm.get_account(&key).unwrap().data.as_slice()).unwrap()
+}
+
 fn voucher_message(program: Pubkey, channel: Pubkey, total: u64) -> [u8; VOUCHER_MESSAGE_LEN] {
     let mut message = [0u8; VOUCHER_MESSAGE_LEN];
     message[..16].copy_from_slice(VOUCHER_DOMAIN);
     message[16..48].copy_from_slice(program.as_ref());
     message[48..80].copy_from_slice(channel.as_ref());
     message[80..].copy_from_slice(&total.to_le_bytes());
+    message
+}
+
+fn verdict_message(
+    program: Pubkey,
+    task: Pubkey,
+    result_hash: [u8; 32],
+    verdict: Verdict,
+) -> [u8; VERDICT_MESSAGE_LEN] {
+    let mut message = [0u8; VERDICT_MESSAGE_LEN];
+    message[..16].copy_from_slice(VERDICT_DOMAIN);
+    message[16..48].copy_from_slice(program.as_ref());
+    message[48..80].copy_from_slice(task.as_ref());
+    message[80..112].copy_from_slice(&result_hash);
+    message[112] = verdict as u8;
     message
 }
 
@@ -450,6 +466,20 @@ impl Fixture {
         .0
     }
 
+    fn task_pda(&self, task_hash: [u8; 32]) -> Pubkey {
+        let generation = read_escrow(&self.svm, self.escrow).generation;
+        Pubkey::find_program_address(
+            &[
+                TASK_SEED,
+                self.escrow.as_ref(),
+                &generation.to_le_bytes(),
+                &task_hash,
+            ],
+            &nakshatra_pay::id(),
+        )
+        .0
+    }
+
     fn delegate_set_ix(
         &self,
         key: Pubkey,
@@ -671,6 +701,148 @@ impl Fixture {
             self.fee_vault,
         );
         send_ixs(&mut self.svm, tx_payer, &[ed, redeem])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn task_open_ix(
+        &self,
+        signer: Pubkey,
+        delegate: Option<Pubkey>,
+        worker: Pubkey,
+        verifier: Pubkey,
+        amount: u64,
+        deadline: i64,
+        task_hash: [u8; 32],
+    ) -> Instruction {
+        Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::TaskOpen {
+                worker,
+                verifier,
+                amount,
+                deadline,
+                task_hash,
+            }
+            .data(),
+            nakshatra_pay::accounts::TaskOpenAccounts {
+                signer,
+                config: self.config,
+                escrow: self.escrow,
+                vault: self.vault,
+                delegate,
+                task: self.task_pda(task_hash),
+                system_program: system_program::ID,
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    fn task_submit_ix(&self, worker: Pubkey, task: Pubkey, result_hash: [u8; 32]) -> Instruction {
+        Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::TaskSubmit { result_hash }.data(),
+            nakshatra_pay::accounts::TaskSubmitAccounts {
+                worker,
+                config: self.config,
+                escrow: self.escrow,
+                task,
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    fn task_verify_ix(
+        &self,
+        executor: Pubkey,
+        delegate: Option<Pubkey>,
+        rent_payer: Pubkey,
+        task: Pubkey,
+        verdict: Verdict,
+        worker_token: Pubkey,
+    ) -> Instruction {
+        Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::TaskVerify { verdict }.data(),
+            nakshatra_pay::accounts::TaskSettleAccounts {
+                executor,
+                config: self.config,
+                mint: self.mint,
+                escrow: self.escrow,
+                delegate,
+                rent_payer,
+                task,
+                vault: self.vault,
+                worker_token,
+                fee_vault: self.fee_vault,
+                instructions_sysvar: solana_instructions_sysvar::ID,
+                token_program: spl_token::ID,
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    fn task_timeout_ix(
+        &self,
+        executor: Pubkey,
+        delegate: Option<Pubkey>,
+        rent_payer: Pubkey,
+        task: Pubkey,
+        worker_token: Pubkey,
+    ) -> Instruction {
+        Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::TaskTimeout {}.data(),
+            nakshatra_pay::accounts::TaskSettleAccounts {
+                executor,
+                config: self.config,
+                mint: self.mint,
+                escrow: self.escrow,
+                delegate,
+                rent_payer,
+                task,
+                vault: self.vault,
+                worker_token,
+                fee_vault: self.fee_vault,
+                instructions_sysvar: solana_instructions_sysvar::ID,
+                token_program: spl_token::ID,
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_task_with(
+        &mut self,
+        tx_payer: &Keypair,
+        verifier: &Keypair,
+        delegate: Option<Pubkey>,
+        rent_payer: Pubkey,
+        task: Pubkey,
+        result_hash: [u8; 32],
+        verdict: Verdict,
+        worker_token: Pubkey,
+    ) -> bool {
+        let ed = ed25519_ix(
+            verifier,
+            &verdict_message(nakshatra_pay::id(), task, result_hash, verdict),
+        );
+        let verify = self.task_verify_ix(
+            tx_payer.pubkey(),
+            delegate,
+            rent_payer,
+            task,
+            verdict,
+            worker_token,
+        );
+        send_ixs(&mut self.svm, tx_payer, &[ed, verify])
     }
 
     fn escrow_close_ix(&self) -> Instruction {
@@ -911,7 +1083,11 @@ fn voucher_parser_and_cumulative_guards_reject_adversarial_inputs() {
         &f.other,
         &[other_program, redeem_100.clone()]
     ));
-    assert!(!send_ixs(&mut f.svm, &f.other, &[redeem_100.clone()]));
+    assert!(!send_ixs(
+        &mut f.svm,
+        &f.other,
+        std::slice::from_ref(&redeem_100)
+    ));
     let ed = ed25519_ix(&f.owner, &voucher_message(nakshatra_pay::id(), a, 100));
     let unrelated = system_instruction::transfer(&f.other.pubkey(), &f.owner.pubkey(), 1);
     assert!(!send_ixs(
@@ -1242,7 +1418,7 @@ fn worker_fee_wallet_close_deadline_and_strict_lengths_are_enforced() {
         instruction.data.push(0);
         f.svm.expire_blockhash();
         let message = Message::new_with_blockhash(
-            &[instruction.clone()],
+            std::slice::from_ref(instruction),
             Some(&f.owner.pubkey()),
             &f.svm.latest_blockhash(),
         );
@@ -1608,4 +1784,722 @@ fn cumulative_fee_rounding_is_split_invariant() {
     assert!(f.redeem_with(&worker, &owner, once, 100));
     assert_eq!(token_amount(&f.svm, f.fee_vault), 6);
     assert_eq!(token_amount(&f.svm, f.worker_token), 194);
+}
+
+#[test]
+fn tasks_owner_pass_and_fail_settle_exactly() {
+    let mut f = Fixture::new();
+    let now: Clock = f.svm.get_sysvar();
+    let pass_hash = [1u8; 32];
+    let pass_result = [2u8; 32];
+    let pass_task = f.task_pda(pass_hash);
+    assert!(tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.delegate.pubkey(),
+            10_001,
+            now.unix_timestamp + 1_000,
+            pass_hash
+        )
+    ));
+    let opened = read_task(&f.svm, pass_task);
+    assert_eq!(opened.verifier, f.delegate.pubkey());
+    assert_eq!(opened.fee_bps_snapshot, DEFAULT_FEE_BPS);
+    assert_eq!(read_escrow(&f.svm, f.escrow).open_tasks, 1);
+    assert!(tx!(
+        f,
+        worker,
+        f.task_submit_ix(f.worker.pubkey(), pass_task, pass_result)
+    ));
+    let submitted = read_task(&f.svm, pass_task);
+    assert_eq!(submitted.result_hash, pass_result);
+    let verifier = Keypair::try_from(f.delegate.to_bytes().as_slice()).unwrap();
+    let relayer = Keypair::try_from(f.other.to_bytes().as_slice()).unwrap();
+    assert!(f.verify_task_with(
+        &relayer,
+        &verifier,
+        None,
+        f.owner.pubkey(),
+        pass_task,
+        pass_result,
+        Verdict::Pass,
+        f.worker_token,
+    ));
+    assert!(f.svm.get_account(&pass_task).is_none());
+    assert_eq!(token_amount(&f.svm, f.worker_token), 9_701);
+    assert_eq!(token_amount(&f.svm, f.fee_vault), 300);
+
+    let fail_hash = [3u8; 32];
+    let fail_result = [4u8; 32];
+    let fail_task = f.task_pda(fail_hash);
+    let now: Clock = f.svm.get_sysvar();
+    assert!(tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.delegate.pubkey(),
+            500,
+            now.unix_timestamp + 1_000,
+            fail_hash
+        )
+    ));
+    assert!(tx!(
+        f,
+        worker,
+        f.task_submit_ix(f.worker.pubkey(), fail_task, fail_result)
+    ));
+    assert!(f.verify_task_with(
+        &relayer,
+        &verifier,
+        None,
+        f.owner.pubkey(),
+        fail_task,
+        fail_result,
+        Verdict::Fail,
+        f.wrong_worker_token,
+    ));
+    assert_eq!(token_amount(&f.svm, f.worker_token), 9_701);
+    assert_eq!(token_amount(&f.svm, f.fee_vault), 300);
+    let escrow = read_escrow(&f.svm, f.escrow);
+    assert_eq!((escrow.committed, escrow.open_tasks), (0, 0));
+}
+
+#[test]
+fn delegated_tasks_restore_refunds_but_consume_paid_spend() {
+    let mut f = Fixture::new();
+    let delegate_pda = f.delegate_pda(f.delegate.pubkey());
+    let now: Clock = f.svm.get_sysvar();
+    assert!(tx!(
+        f,
+        owner,
+        f.delegate_set_ix(
+            f.delegate.pubkey(),
+            3_000,
+            now.unix_timestamp + 1_000_000,
+            DELEGATE_OPEN_TASK
+        )
+    ));
+    let paid_hash = [10u8; 32];
+    let paid_result = [11u8; 32];
+    let paid_task = f.task_pda(paid_hash);
+    assert!(tx!(
+        f,
+        delegate,
+        f.task_open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.worker.pubkey(),
+            f.other.pubkey(),
+            1_000,
+            now.unix_timestamp + 10_000,
+            paid_hash
+        )
+    ));
+    let delegate = read_delegate(&f.svm, delegate_pda);
+    assert_eq!((delegate.spent, delegate.open_tasks), (1_000, 1));
+    assert!(tx!(f, owner, f.delegate_revoke_ix(f.delegate.pubkey())));
+    assert!(f.svm.get_account(&delegate_pda).is_some());
+    assert!(!tx!(
+        f,
+        other,
+        f.delegate_close_ix(f.other.pubkey(), f.delegate.pubkey())
+    ));
+    assert!(tx!(
+        f,
+        worker,
+        f.task_submit_ix(f.worker.pubkey(), paid_task, paid_result)
+    ));
+    warp_seconds(&mut f.svm, CLOSE_GRACE_S);
+    assert!(tx!(
+        f,
+        other,
+        f.task_timeout_ix(
+            f.other.pubkey(),
+            Some(delegate_pda),
+            f.delegate.pubkey(),
+            paid_task,
+            f.worker_token
+        )
+    ));
+    let delegate = read_delegate(&f.svm, delegate_pda);
+    assert_eq!((delegate.spent, delegate.open_tasks), (1_000, 0));
+    assert_eq!(token_amount(&f.svm, f.worker_token), 970);
+    assert_eq!(token_amount(&f.svm, f.fee_vault), 30);
+    assert!(tx!(
+        f,
+        other,
+        f.delegate_close_ix(f.other.pubkey(), f.delegate.pubkey())
+    ));
+
+    let now: Clock = f.svm.get_sysvar();
+    assert!(tx!(
+        f,
+        owner,
+        f.delegate_set_ix(
+            f.delegate.pubkey(),
+            700,
+            now.unix_timestamp + 1_000_000,
+            DELEGATE_OPEN_TASK
+        )
+    ));
+    let refund_hash = [12u8; 32];
+    let refund_task = f.task_pda(refund_hash);
+    assert!(!tx!(
+        f,
+        delegate,
+        f.task_open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.worker.pubkey(),
+            f.other.pubkey(),
+            701,
+            now.unix_timestamp + TASK_DEADLINE_MIN_S,
+            [13u8; 32]
+        )
+    ));
+    assert!(tx!(
+        f,
+        delegate,
+        f.task_open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.worker.pubkey(),
+            f.other.pubkey(),
+            700,
+            now.unix_timestamp + TASK_DEADLINE_MIN_S,
+            refund_hash
+        )
+    ));
+    assert!(!tx!(
+        f,
+        other,
+        f.task_timeout_ix(
+            f.other.pubkey(),
+            Some(delegate_pda),
+            f.delegate.pubkey(),
+            refund_task,
+            f.wrong_worker_token
+        )
+    ));
+    warp_seconds(&mut f.svm, TASK_DEADLINE_MIN_S + 1);
+    assert!(tx!(
+        f,
+        other,
+        f.task_timeout_ix(
+            f.other.pubkey(),
+            Some(delegate_pda),
+            f.delegate.pubkey(),
+            refund_task,
+            f.wrong_worker_token
+        )
+    ));
+    let delegate = read_delegate(&f.svm, delegate_pda);
+    assert_eq!((delegate.spent, delegate.open_tasks), (0, 0));
+}
+
+#[test]
+fn task_verdict_parser_rejects_substitution_cross_indexes_and_cpi() {
+    let mut f = Fixture::new();
+    let now: Clock = f.svm.get_sysvar();
+    let unsubmitted_hash = [19u8; 32];
+    let unsubmitted = f.task_pda(unsubmitted_hash);
+    assert!(tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.delegate.pubkey(),
+            100,
+            now.unix_timestamp + 10_000,
+            unsubmitted_hash
+        )
+    ));
+    let premature_ed = ed25519_ix(
+        &f.delegate,
+        &verdict_message(nakshatra_pay::id(), unsubmitted, [0u8; 32], Verdict::Pass),
+    );
+    let premature_verify = f.task_verify_ix(
+        f.other.pubkey(),
+        None,
+        f.owner.pubkey(),
+        unsubmitted,
+        Verdict::Pass,
+        f.worker_token,
+    );
+    assert!(!send_ixs(
+        &mut f.svm,
+        &f.other,
+        &[premature_ed, premature_verify]
+    ));
+    let task_hash = [20u8; 32];
+    let result_hash = [21u8; 32];
+    let task = f.task_pda(task_hash);
+    assert!(tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.delegate.pubkey(),
+            1_000,
+            now.unix_timestamp + 10_000,
+            task_hash
+        )
+    ));
+    assert!(tx!(
+        f,
+        worker,
+        f.task_submit_ix(f.worker.pubkey(), task, result_hash)
+    ));
+    let verify = f.task_verify_ix(
+        f.other.pubkey(),
+        None,
+        f.owner.pubkey(),
+        task,
+        Verdict::Pass,
+        f.worker_token,
+    );
+    let wrong_signer = ed25519_ix(
+        &f.other,
+        &verdict_message(nakshatra_pay::id(), task, result_hash, Verdict::Pass),
+    );
+    assert!(!send_ixs(
+        &mut f.svm,
+        &f.other,
+        &[wrong_signer, verify.clone()]
+    ));
+    let wrong_result = ed25519_ix(
+        &f.delegate,
+        &verdict_message(nakshatra_pay::id(), task, [99u8; 32], Verdict::Pass),
+    );
+    assert!(!send_ixs(
+        &mut f.svm,
+        &f.other,
+        &[wrong_result, verify.clone()]
+    ));
+    let wrong_program = ed25519_ix(
+        &f.delegate,
+        &verdict_message(Pubkey::new_unique(), task, result_hash, Verdict::Pass),
+    );
+    assert!(!send_ixs(
+        &mut f.svm,
+        &f.other,
+        &[wrong_program, verify.clone()]
+    ));
+    let wrong_task = ed25519_ix(
+        &f.delegate,
+        &verdict_message(
+            nakshatra_pay::id(),
+            Pubkey::new_unique(),
+            result_hash,
+            Verdict::Pass,
+        ),
+    );
+    assert!(!send_ixs(
+        &mut f.svm,
+        &f.other,
+        &[wrong_task, verify.clone()]
+    ));
+
+    let real = ed25519_ix(
+        &f.delegate,
+        &verdict_message(nakshatra_pay::id(), task, result_hash, Verdict::Pass),
+    );
+    let mut cross = real.clone();
+    cross.data.truncate(16);
+    for offset in [4usize, 8, 14] {
+        cross.data[offset..offset + 2].copy_from_slice(&0u16.to_le_bytes());
+    }
+    assert!(!send_ixs(
+        &mut f.svm,
+        &f.other,
+        &[real.clone(), cross, verify.clone()]
+    ));
+    let unrelated = system_instruction::transfer(&f.other.pubkey(), &f.owner.pubkey(), 1);
+    assert!(!send_ixs(
+        &mut f.svm,
+        &f.other,
+        &[real.clone(), unrelated, verify.clone()]
+    ));
+
+    let mut cpi_verify = verify.clone();
+    cpi_verify.program_id = CPI_PROGRAM_ID;
+    cpi_verify
+        .accounts
+        .push(AccountMeta::new_readonly(nakshatra_pay::id(), false));
+    assert!(!send_ixs(&mut f.svm, &f.other, &[real.clone(), cpi_verify]));
+    assert!(send_ixs(
+        &mut f.svm,
+        &f.other,
+        &[real.clone(), verify.clone()]
+    ));
+    assert!(!send_ixs(&mut f.svm, &f.other, &[real, verify]));
+}
+
+#[test]
+fn task_deadlines_collateral_worker_and_commitment_guards_hold() {
+    let mut f = Fixture::new();
+    let now: Clock = f.svm.get_sysvar();
+    assert!(!tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.delegate.pubkey(),
+            1,
+            now.unix_timestamp + TASK_DEADLINE_MIN_S - 1,
+            [30u8; 32]
+        )
+    ));
+    assert!(!tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.delegate.pubkey(),
+            1,
+            now.unix_timestamp + TASK_DEADLINE_MAX_S + 1,
+            [31u8; 32]
+        )
+    ));
+    assert!(!tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.delegate.pubkey(),
+            DEPOSIT + 1,
+            now.unix_timestamp + 1_000,
+            [32u8; 32]
+        )
+    ));
+
+    let task_hash = [33u8; 32];
+    let task = f.task_pda(task_hash);
+    let late_hash = [35u8; 32];
+    let late_task = f.task_pda(late_hash);
+    assert!(tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.delegate.pubkey(),
+            1,
+            now.unix_timestamp + TASK_DEADLINE_MIN_S,
+            late_hash
+        )
+    ));
+    assert!(tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.delegate.pubkey(),
+            400_000,
+            now.unix_timestamp + WITHDRAW_DELAY_S + 1_000,
+            task_hash
+        )
+    ));
+    assert!(!tx!(f, owner, f.escrow_close_ix()));
+    let request = Instruction::new_with_bytes(
+        nakshatra_pay::id(),
+        &nakshatra_pay::instruction::EscrowWithdrawRequest { amount: DEPOSIT }.data(),
+        nakshatra_pay::accounts::EscrowOwnerAccounts {
+            owner: f.owner.pubkey(),
+            config: f.config,
+            escrow: f.escrow,
+            vault: f.vault,
+            event_authority: event_authority(),
+            program: nakshatra_pay::id(),
+        }
+        .to_account_metas(None),
+    );
+    assert!(send_ixs(&mut f.svm, &f.owner, &[request]));
+    warp_seconds(&mut f.svm, WITHDRAW_DELAY_S);
+    let execute = Instruction::new_with_bytes(
+        nakshatra_pay::id(),
+        &nakshatra_pay::instruction::EscrowWithdrawExecute {}.data(),
+        nakshatra_pay::accounts::EscrowWithdrawExecuteAccounts {
+            owner: f.owner.pubkey(),
+            config: f.config,
+            mint: f.mint,
+            escrow: f.escrow,
+            vault: f.vault,
+            destination: f.owner_destination,
+            token_program: spl_token::ID,
+            event_authority: event_authority(),
+            program: nakshatra_pay::id(),
+        }
+        .to_account_metas(None),
+    );
+    assert!(!send_ixs(&mut f.svm, &f.owner, &[execute]));
+    assert!(!tx!(
+        f,
+        worker,
+        f.task_submit_ix(f.worker.pubkey(), late_task, [36u8; 32])
+    ));
+    assert!(tx!(
+        f,
+        other,
+        f.task_timeout_ix(
+            f.other.pubkey(),
+            None,
+            f.owner.pubkey(),
+            late_task,
+            f.wrong_worker_token
+        )
+    ));
+    assert!(!tx!(
+        f,
+        other,
+        f.task_submit_ix(f.other.pubkey(), task, [34u8; 32])
+    ));
+    assert!(!tx!(
+        f,
+        other,
+        f.task_timeout_ix(
+            f.other.pubkey(),
+            None,
+            f.owner.pubkey(),
+            task,
+            f.worker_token
+        )
+    ));
+    assert!(tx!(
+        f,
+        worker,
+        f.task_submit_ix(f.worker.pubkey(), task, [34u8; 32])
+    ));
+    let verifier = Keypair::try_from(f.delegate.to_bytes().as_slice()).unwrap();
+    let relayer = Keypair::try_from(f.other.to_bytes().as_slice()).unwrap();
+    assert!(!f.verify_task_with(
+        &relayer,
+        &verifier,
+        None,
+        f.owner.pubkey(),
+        task,
+        [34u8; 32],
+        Verdict::Pass,
+        f.wrong_worker_token,
+    ));
+    assert!(!tx!(
+        f,
+        other,
+        f.task_timeout_ix(
+            f.other.pubkey(),
+            None,
+            f.owner.pubkey(),
+            task,
+            f.worker_token
+        )
+    ));
+    warp_seconds(&mut f.svm, CLOSE_GRACE_S);
+    let late_ed = ed25519_ix(
+        &verifier,
+        &verdict_message(nakshatra_pay::id(), task, [34u8; 32], Verdict::Pass),
+    );
+    let late_verify = f.task_verify_ix(
+        f.other.pubkey(),
+        None,
+        f.owner.pubkey(),
+        task,
+        Verdict::Pass,
+        f.worker_token,
+    );
+    assert!(!send_ixs(&mut f.svm, &f.other, &[late_ed, late_verify]));
+    assert!(tx!(
+        f,
+        other,
+        f.task_timeout_ix(
+            f.other.pubkey(),
+            None,
+            f.owner.pubkey(),
+            task,
+            f.worker_token
+        )
+    ));
+    assert_eq!(token_amount(&f.svm, f.worker_token), 388_000);
+    assert_eq!(token_amount(&f.svm, f.fee_vault), 12_000);
+}
+
+#[test]
+fn task_generation_delegate_permissions_prefund_and_strict_lengths_hold() {
+    let mut f = Fixture::new();
+    let now: Clock = f.svm.get_sysvar();
+    let delegate_pda = f.delegate_pda(f.delegate.pubkey());
+    assert!(tx!(
+        f,
+        owner,
+        f.delegate_set_ix(
+            f.delegate.pubkey(),
+            100,
+            now.unix_timestamp + 1_000,
+            DELEGATE_OPEN_CHANNEL
+        )
+    ));
+    assert!(!tx!(
+        f,
+        delegate,
+        f.task_open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.worker.pubkey(),
+            f.other.pubkey(),
+            100,
+            now.unix_timestamp + 1_000,
+            [40u8; 32]
+        )
+    ));
+    warp_seconds(&mut f.svm, 1_000);
+    assert!(!tx!(
+        f,
+        delegate,
+        f.task_open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.worker.pubkey(),
+            f.other.pubkey(),
+            100,
+            now.unix_timestamp + 2_000,
+            [41u8; 32]
+        )
+    ));
+
+    let hash = [42u8; 32];
+    let old_task = f.task_pda(hash);
+    let now: Clock = f.svm.get_sysvar();
+    assert!(send_ixs(
+        &mut f.svm,
+        &f.other,
+        &[system_instruction::transfer(
+            &f.other.pubkey(),
+            &old_task,
+            1
+        )]
+    ));
+    assert!(tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.other.pubkey(),
+            100,
+            now.unix_timestamp + TASK_DEADLINE_MIN_S,
+            hash
+        )
+    ));
+    warp_seconds(&mut f.svm, TASK_DEADLINE_MIN_S + 1);
+    assert!(tx!(
+        f,
+        other,
+        f.task_timeout_ix(
+            f.other.pubkey(),
+            None,
+            f.owner.pubkey(),
+            old_task,
+            f.worker_token
+        )
+    ));
+
+    let mut strict = vec![
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.other.pubkey(),
+            1,
+            now.unix_timestamp + 10_000,
+            [43u8; 32],
+        ),
+        f.task_submit_ix(f.worker.pubkey(), old_task, [44u8; 32]),
+        f.task_verify_ix(
+            f.owner.pubkey(),
+            None,
+            f.owner.pubkey(),
+            old_task,
+            Verdict::Pass,
+            f.worker_token,
+        ),
+        f.task_timeout_ix(
+            f.owner.pubkey(),
+            None,
+            f.owner.pubkey(),
+            old_task,
+            f.worker_token,
+        ),
+    ];
+    for instruction in &mut strict {
+        instruction.data.push(0);
+        for account in &mut instruction.accounts {
+            account.is_signer = account.pubkey == f.owner.pubkey();
+        }
+        f.svm.expire_blockhash();
+        let message = Message::new_with_blockhash(
+            std::slice::from_ref(instruction),
+            Some(&f.owner.pubkey()),
+            &f.svm.latest_blockhash(),
+        );
+        let transaction =
+            VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&f.owner]).unwrap();
+        let failure = f.svm.send_transaction(transaction).unwrap_err();
+        assert_eq!(
+            format!("{:?}", failure.err),
+            "InstructionError(0, InvalidInstructionData)"
+        );
+    }
+
+    assert!(tx!(f, owner, f.escrow_close_ix()));
+    f.reinit_and_deposit(1_000);
+    let new_task = f.task_pda(hash);
+    assert_ne!(old_task, new_task);
+    let now: Clock = f.svm.get_sysvar();
+    assert!(!tx!(
+        f,
+        delegate,
+        f.task_open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.worker.pubkey(),
+            f.other.pubkey(),
+            1,
+            now.unix_timestamp + 1_000,
+            [45u8; 32]
+        )
+    ));
+    assert!(tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.other.pubkey(),
+            100,
+            now.unix_timestamp + 1_000,
+            hash
+        )
+    ));
+    assert_eq!(read_task(&f.svm, new_task).generation, 1);
 }

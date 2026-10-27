@@ -63,6 +63,7 @@ pub struct Delegate {
     pub expires_at: i64,
     pub flags: u8,
     pub open_channels: u32,
+    pub open_tasks: u32,
     pub disabled: bool,
     pub bump: u8,
 }
@@ -87,6 +88,37 @@ pub struct Channel {
     pub fee_bps_snapshot: u16,
     pub status: ChannelStatus,
     pub close_at: i64,
+    pub rent_payer: Pubkey,
+    pub bump: u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, InitSpace, PartialEq, Eq)]
+pub enum TaskStatus {
+    Open,
+    Submitted,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, InitSpace, PartialEq, Eq)]
+pub enum Verdict {
+    Pass,
+    Fail,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct Task {
+    pub escrow: Pubkey,
+    pub generation: u64,
+    pub worker: Pubkey,
+    pub verifier: Pubkey,
+    pub amount: u64,
+    pub deadline: i64,
+    pub task_hash: [u8; 32],
+    pub result_hash: [u8; 32],
+    pub status: TaskStatus,
+    pub submitted_at: i64,
+    pub delegate: Option<Pubkey>,
+    pub fee_bps_snapshot: u16,
     pub rent_payer: Pubkey,
     pub bump: u8,
 }

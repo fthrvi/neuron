@@ -25,12 +25,13 @@ performs actual Ed25519 signature and cross-instruction-offset verification with
 - The USDC mint freeze authority (Circle) can freeze any USDC token account, including an escrow vault.
 - Nothing in this program can prevent either authority from exercising those powers.
 
-## Withdrawal and channel commitments
+## Withdrawal, channel, and task commitments
 
 A pending six-hour withdrawal request does not reserve funds. Opening or funding a channel may
-commit balance that was uncommitted when the request was made. Withdrawal execution always checks
+commit balance that was uncommitted when the request was made. Opening a task does the same for its
+fixed amount. Withdrawal execution always checks
 the current `vault.amount - escrow.committed`, so such a request fails rather than consuming funds
-that secure an open channel.
+that secure an open channel or task.
 
 ## Replay-resistant channel identities
 
@@ -46,6 +47,18 @@ Revocation disables a delegate immediately and clamps its cap to its recorded sp
 record stays alive while any channel it opened remains live, so it cannot be replaced with a fresh
 zero-spend record and must be supplied when that channel is finalized. Once its open-channel count
 reaches zero, anyone may call `delegate_close`; rent always returns to the escrow owner.
+
+The same lifecycle applies to delegated tasks through a separate open-task count. A failed or
+expired task restores the delegate's spend; a paid task consumes it permanently.
+
+## Verified task settlement
+
+Task addresses use `['task', escrow, generation_u64_le, task_hash]`. The worker submits a result
+hash, then the named verifier can sign a fixed, domain-separated verdict over the program, task,
+result hash, and pass/fail byte. Anyone may relay that Ed25519 instruction immediately before
+`task_verify`. A pass pays the worker and a fail refunds the commitment. An open task expires just
+after its deadline; a submitted task pays by silence once `Config.close_grace_s` has elapsed.
+`close_grace_s` is intentionally reused as the verdict window and defaults to 86,400 seconds.
 
 ## Fee custody and rounding
 

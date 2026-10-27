@@ -13,7 +13,7 @@ use crate::{
     events::*,
     state::{
         Channel, ChannelStatus, Config, Delegate, Escrow, OwnerState, PendingConfig,
-        PendingWithdrawal,
+        PendingWithdrawal, Task, TaskStatus, Verdict,
     },
 };
 
@@ -655,6 +655,7 @@ pub fn handle_delegate_set(
         delegate.expires_at = expires_at;
         delegate.flags = flags;
         delegate.open_channels = 0;
+        delegate.open_tasks = 0;
         delegate.disabled = false;
         delegate.bump = ctx.bumps.delegate;
     } else {
@@ -673,8 +674,10 @@ pub fn handle_delegate_set(
                 PayError::DelegateGenerationMismatch
             );
             require!(delegate.open_channels == 0, PayError::DelegateChannelsOpen);
+            require!(delegate.open_tasks == 0, PayError::DelegateTasksOpen);
             delegate.generation = ctx.accounts.escrow.generation;
             delegate.spent = 0;
+            delegate.open_tasks = 0;
             delegate.disabled = false;
         }
     }
@@ -717,7 +720,7 @@ pub fn handle_delegate_revoke(ctx: Context<DelegateRevokeAccounts>, key: Pubkey)
         delegate: delegate_key,
         key
     });
-    if ctx.accounts.delegate.open_channels == 0 {
+    if ctx.accounts.delegate.open_channels == 0 && ctx.accounts.delegate.open_tasks == 0 {
         ctx.accounts
             .delegate
             .close(ctx.accounts.owner.to_account_info())?;
@@ -749,6 +752,10 @@ pub fn handle_delegate_close(ctx: Context<DelegateCloseAccounts>) -> Result<()> 
     require!(
         ctx.accounts.delegate.open_channels == 0,
         PayError::DelegateChannelsOpen
+    );
+    require!(
+        ctx.accounts.delegate.open_tasks == 0,
+        PayError::DelegateTasksOpen
     );
     emit_cpi!(DelegateClosed {
         escrow: ctx.accounts.escrow.key(),
@@ -785,12 +792,13 @@ pub fn handle_channel_open(
 ) -> Result<()> {
     require!(cap > 0, PayError::ZeroAmount);
     let now = Clock::get()?.unix_timestamp;
-    let delegate_key = authorize_channel_spend(
+    let delegate_key = authorize_spend(
         ctx.accounts.signer.key(),
         &ctx.accounts.escrow,
         ctx.accounts.delegate.as_mut(),
         cap,
         now,
+        DELEGATE_OPEN_CHANNEL,
     )?;
     if delegate_key.is_some() {
         let delegate = ctx
@@ -877,12 +885,13 @@ pub fn handle_channel_fund(ctx: Context<ChannelFundAccounts>, add: u64) -> Resul
         ctx.accounts.channel.voucher_signer,
         PayError::Unauthorized
     );
-    let delegate_key = authorize_channel_spend(
+    let delegate_key = authorize_spend(
         ctx.accounts.signer.key(),
         &ctx.accounts.escrow,
         ctx.accounts.delegate.as_mut(),
         add,
         Clock::get()?.unix_timestamp,
+        DELEGATE_OPEN_CHANNEL,
     )?;
     require!(
         delegate_key == ctx.accounts.channel.delegate,
@@ -1173,12 +1182,377 @@ pub fn handle_channel_close_finalize(ctx: Context<ChannelCloseFinalizeAccounts>)
     Ok(())
 }
 
-fn authorize_channel_spend(
+#[event_cpi]
+#[derive(Accounts)]
+#[instruction(worker: Pubkey, verifier: Pubkey, amount: u64, deadline: i64, task_hash: [u8; 32])]
+pub struct TaskOpenAccounts<'info> {
+    #[account(mut)]
+    pub signer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(mut, seeds = [ESCROW_SEED, config.key().as_ref(), escrow.owner.as_ref()], bump = escrow.bump, has_one = vault)]
+    pub escrow: Account<'info, Escrow>,
+    /// CHECK: canonical PDA; classic SPL layout, mint, and authority are checked in the handler.
+    #[account(seeds = [VAULT_SEED, escrow.key().as_ref()], bump = escrow.vault_bump)]
+    pub vault: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub delegate: Option<Account<'info, Delegate>>,
+    #[account(init, payer = signer, space = 8 + Task::INIT_SPACE, seeds = [TASK_SEED, escrow.key().as_ref(), &escrow.generation.to_le_bytes(), &task_hash], bump)]
+    pub task: Account<'info, Task>,
+    pub system_program: Program<'info, System>,
+}
+
+pub fn handle_task_open(
+    ctx: Context<TaskOpenAccounts>,
+    worker: Pubkey,
+    verifier: Pubkey,
+    amount: u64,
+    deadline: i64,
+    task_hash: [u8; 32],
+) -> Result<()> {
+    require!(amount > 0, PayError::ZeroAmount);
+    let now = Clock::get()?.unix_timestamp;
+    let earliest = now
+        .checked_add(TASK_DEADLINE_MIN_S)
+        .ok_or(PayError::ArithmeticOverflow)?;
+    let latest = now
+        .checked_add(TASK_DEADLINE_MAX_S)
+        .ok_or(PayError::ArithmeticOverflow)?;
+    require!(
+        deadline >= earliest && deadline <= latest,
+        PayError::InvalidTaskDeadline
+    );
+    let delegate_key = authorize_spend(
+        ctx.accounts.signer.key(),
+        &ctx.accounts.escrow,
+        ctx.accounts.delegate.as_mut(),
+        amount,
+        now,
+        DELEGATE_OPEN_TASK,
+    )?;
+    if delegate_key.is_some() {
+        let delegate = ctx
+            .accounts
+            .delegate
+            .as_mut()
+            .ok_or(PayError::WrongDelegate)?;
+        delegate.open_tasks = delegate
+            .open_tasks
+            .checked_add(1)
+            .ok_or(PayError::ArithmeticOverflow)?;
+    }
+    let vault = load_token(&ctx.accounts.vault)?;
+    require_token(&vault, ctx.accounts.config.mint, ctx.accounts.escrow.key())?;
+    let committed = ctx
+        .accounts
+        .escrow
+        .committed
+        .checked_add(amount)
+        .ok_or(PayError::ArithmeticOverflow)?;
+    require!(vault.amount >= committed, PayError::InsufficientCollateral);
+    ctx.accounts.escrow.committed = committed;
+    ctx.accounts.escrow.open_tasks = ctx
+        .accounts
+        .escrow
+        .open_tasks
+        .checked_add(1)
+        .ok_or(PayError::ArithmeticOverflow)?;
+    let task = &mut ctx.accounts.task;
+    task.escrow = ctx.accounts.escrow.key();
+    task.generation = ctx.accounts.escrow.generation;
+    task.worker = worker;
+    task.verifier = verifier;
+    task.amount = amount;
+    task.deadline = deadline;
+    task.task_hash = task_hash;
+    task.result_hash = [0; 32];
+    task.status = TaskStatus::Open;
+    task.submitted_at = 0;
+    task.delegate = delegate_key;
+    task.fee_bps_snapshot = ctx.accounts.config.fee_bps;
+    task.rent_payer = ctx.accounts.signer.key();
+    task.bump = ctx.bumps.task;
+    emit_cpi!(TaskOpened {
+        escrow: task.escrow,
+        task: task.key(),
+        generation: task.generation,
+        worker,
+        verifier,
+        amount,
+        deadline,
+        task_hash,
+        fee_bps_snapshot: task.fee_bps_snapshot
+    });
+    Ok(())
+}
+
+#[event_cpi]
+#[derive(Accounts)]
+pub struct TaskSubmitAccounts<'info> {
+    pub worker: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(seeds = [ESCROW_SEED, config.key().as_ref(), escrow.owner.as_ref()], bump = escrow.bump)]
+    pub escrow: Account<'info, Escrow>,
+    #[account(mut, seeds = [TASK_SEED, escrow.key().as_ref(), &task.generation.to_le_bytes(), &task.task_hash], bump = task.bump, constraint = task.escrow == escrow.key(), constraint = task.generation == escrow.generation, has_one = worker @ PayError::Unauthorized)]
+    pub task: Account<'info, Task>,
+}
+
+pub fn handle_task_submit(ctx: Context<TaskSubmitAccounts>, result_hash: [u8; 32]) -> Result<()> {
+    require!(
+        ctx.accounts.task.status == TaskStatus::Open,
+        PayError::TaskNotOpen
+    );
+    let now = Clock::get()?.unix_timestamp;
+    require!(
+        now <= ctx.accounts.task.deadline,
+        PayError::TaskDeadlineElapsed
+    );
+    ctx.accounts.task.status = TaskStatus::Submitted;
+    ctx.accounts.task.result_hash = result_hash;
+    ctx.accounts.task.submitted_at = now;
+    emit_cpi!(TaskSubmitted {
+        task: ctx.accounts.task.key(),
+        worker: ctx.accounts.worker.key(),
+        result_hash,
+        submitted_at: now
+    });
+    Ok(())
+}
+
+#[event_cpi]
+#[derive(Accounts)]
+pub struct TaskSettleAccounts<'info> {
+    pub executor: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    /// CHECK: pinned by config and classic SPL layout checked before a payment.
+    #[account(address = config.mint @ PayError::WrongMint)]
+    pub mint: UncheckedAccount<'info>,
+    #[account(mut, seeds = [ESCROW_SEED, config.key().as_ref(), escrow.owner.as_ref()], bump = escrow.bump, has_one = vault)]
+    pub escrow: Account<'info, Escrow>,
+    #[account(mut)]
+    pub delegate: Option<Account<'info, Delegate>>,
+    /// CHECK: receives task rent and is pinned to the recorded payer.
+    #[account(mut, address = task.rent_payer)]
+    pub rent_payer: UncheckedAccount<'info>,
+    #[account(mut, close = rent_payer, seeds = [TASK_SEED, escrow.key().as_ref(), &task.generation.to_le_bytes(), &task.task_hash], bump = task.bump, constraint = task.escrow == escrow.key(), constraint = task.generation == escrow.generation)]
+    pub task: Account<'info, Task>,
+    /// CHECK: canonical escrow vault; classic SPL layout checked before a payment.
+    #[account(mut, seeds = [VAULT_SEED, escrow.key().as_ref()], bump = escrow.vault_bump)]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: classic SPL layout, worker authority, and mint checked before a payment.
+    #[account(mut, constraint = worker_token.key() != vault.key() @ PayError::DuplicateTokenAccount, constraint = worker_token.key() != fee_vault.key() @ PayError::DuplicateTokenAccount)]
+    pub worker_token: UncheckedAccount<'info>,
+    /// CHECK: canonical fee PDA; classic SPL layout, mint, and config authority checked before a payment.
+    #[account(mut, seeds = [FEE_VAULT_SEED, config.key().as_ref()], bump = config.fee_vault_bump, constraint = fee_vault.key() != vault.key() @ PayError::DuplicateTokenAccount)]
+    pub fee_vault: UncheckedAccount<'info>,
+    /// CHECK: address pinned to the instructions sysvar; only read by task_verify.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
+    #[account(address = anchor_spl::token::ID @ PayError::InvalidTokenProgram)]
+    pub token_program: Program<'info, Token>,
+}
+
+pub fn handle_task_verify(ctx: Context<TaskSettleAccounts>, verdict: Verdict) -> Result<()> {
+    require!(get_stack_height() == 1, PayError::VerifyViaCpi);
+    require!(
+        ctx.accounts.task.status == TaskStatus::Submitted,
+        PayError::TaskNotSubmitted
+    );
+    let verdict_at = ctx
+        .accounts
+        .task
+        .submitted_at
+        .checked_add(ctx.accounts.config.close_grace_s)
+        .ok_or(PayError::ArithmeticOverflow)?;
+    require!(
+        Clock::get()?.unix_timestamp < verdict_at,
+        PayError::VerdictWindowElapsed
+    );
+    let (signer, message) =
+        parse_preceding_ed25519(&ctx.accounts.instructions_sysvar, VERDICT_MESSAGE_LEN)?;
+    require_keys_eq!(
+        signer,
+        ctx.accounts.task.verifier,
+        PayError::InvalidVerifier
+    );
+    let mut expected = [0u8; VERDICT_MESSAGE_LEN];
+    expected[..16].copy_from_slice(VERDICT_DOMAIN);
+    expected[16..48].copy_from_slice(crate::ID.as_ref());
+    expected[48..80].copy_from_slice(ctx.accounts.task.key().as_ref());
+    expected[80..112].copy_from_slice(&ctx.accounts.task.result_hash);
+    expected[112] = verdict as u8;
+    require!(message == expected, PayError::InvalidVerdictMessage);
+    match verdict {
+        Verdict::Pass => finish_task(ctx, true, Some(TaskPaidHow::Verified), None),
+        Verdict::Fail => finish_task(ctx, false, None, Some(TaskRefundedHow::Failed)),
+    }
+}
+
+pub fn handle_task_timeout(ctx: Context<TaskSettleAccounts>) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
+    match ctx.accounts.task.status {
+        TaskStatus::Open => {
+            require!(
+                now > ctx.accounts.task.deadline,
+                PayError::TaskTimeoutNotElapsed
+            );
+            finish_task(ctx, false, None, Some(TaskRefundedHow::Expired))
+        }
+        TaskStatus::Submitted => {
+            let verdict_at = ctx
+                .accounts
+                .task
+                .submitted_at
+                .checked_add(ctx.accounts.config.close_grace_s)
+                .ok_or(PayError::ArithmeticOverflow)?;
+            require!(now >= verdict_at, PayError::TaskTimeoutNotElapsed);
+            finish_task(ctx, true, Some(TaskPaidHow::Silence), None)
+        }
+    }
+}
+
+fn finish_task(
+    ctx: Context<TaskSettleAccounts>,
+    pay: bool,
+    paid_how: Option<TaskPaidHow>,
+    refunded_how: Option<TaskRefundedHow>,
+) -> Result<()> {
+    let amount = ctx.accounts.task.amount;
+    let task_key = ctx.accounts.task.key();
+    let worker = ctx.accounts.task.worker;
+    let fee = if pay {
+        let mint = load_mint(&ctx.accounts.mint)?;
+        let vault = load_token(&ctx.accounts.vault)?;
+        let worker_token = load_token(&ctx.accounts.worker_token)?;
+        let fee_vault = load_token(&ctx.accounts.fee_vault)?;
+        require_token(&vault, ctx.accounts.config.mint, ctx.accounts.escrow.key())?;
+        require_token(&worker_token, ctx.accounts.config.mint, worker)?;
+        require_token(
+            &fee_vault,
+            ctx.accounts.config.mint,
+            ctx.accounts.config.key(),
+        )?;
+        let fee = u64::try_from(
+            (amount as u128)
+                .checked_mul(ctx.accounts.task.fee_bps_snapshot as u128)
+                .ok_or(PayError::ArithmeticOverflow)?
+                / 10_000,
+        )
+        .map_err(|_| error!(PayError::ArithmeticOverflow))?;
+        let worker_amount = amount
+            .checked_sub(fee)
+            .ok_or(PayError::ArithmeticOverflow)?;
+        if fee > 0 {
+            transfer_from_vault_to(
+                &ctx.accounts.config,
+                &ctx.accounts.escrow,
+                &ctx.accounts.vault,
+                &ctx.accounts.fee_vault,
+                &ctx.accounts.mint,
+                &ctx.accounts.token_program,
+                fee,
+                mint.decimals,
+            )?;
+        }
+        if worker_amount > 0 {
+            transfer_from_vault_to(
+                &ctx.accounts.config,
+                &ctx.accounts.escrow,
+                &ctx.accounts.vault,
+                &ctx.accounts.worker_token,
+                &ctx.accounts.mint,
+                &ctx.accounts.token_program,
+                worker_amount,
+                mint.decimals,
+            )?;
+        }
+        fee
+    } else {
+        0
+    };
+    ctx.accounts.escrow.committed = ctx
+        .accounts
+        .escrow
+        .committed
+        .checked_sub(amount)
+        .ok_or(PayError::ArithmeticOverflow)?;
+    ctx.accounts.escrow.open_tasks = ctx
+        .accounts
+        .escrow
+        .open_tasks
+        .checked_sub(1)
+        .ok_or(PayError::ArithmeticOverflow)?;
+    update_task_delegate(
+        &ctx.accounts.escrow,
+        ctx.accounts.task.delegate,
+        ctx.accounts.delegate.as_mut(),
+        amount,
+        !pay,
+    )?;
+    if pay {
+        emit_cpi!(TaskPaid {
+            task: task_key,
+            worker,
+            amount,
+            fee,
+            how: paid_how.ok_or(PayError::ArithmeticOverflow)?
+        });
+    } else {
+        emit_cpi!(TaskRefunded {
+            task: task_key,
+            amount,
+            how: refunded_how.ok_or(PayError::ArithmeticOverflow)?
+        });
+    }
+    Ok(())
+}
+
+fn update_task_delegate(
+    escrow: &Account<'_, Escrow>,
+    task_delegate: Option<Pubkey>,
+    delegate: Option<&mut Account<'_, Delegate>>,
+    amount: u64,
+    restore_spent: bool,
+) -> Result<()> {
+    if let Some(delegate_key) = task_delegate {
+        let delegate = delegate.ok_or(PayError::WrongDelegate)?;
+        require_keys_eq!(delegate.key(), delegate_key, PayError::WrongDelegate);
+        require_keys_eq!(delegate.escrow, escrow.key(), PayError::WrongDelegate);
+        require!(
+            delegate.generation == escrow.generation,
+            PayError::DelegateGenerationMismatch
+        );
+        let (expected, bump) = Pubkey::find_program_address(
+            &[DELEGATE_SEED, escrow.key().as_ref(), delegate.key.as_ref()],
+            &crate::ID,
+        );
+        require_keys_eq!(expected, delegate.key(), PayError::WrongDelegate);
+        require!(delegate.bump == bump, PayError::WrongDelegate);
+        delegate.open_tasks = delegate
+            .open_tasks
+            .checked_sub(1)
+            .ok_or(PayError::ArithmeticOverflow)?;
+        if restore_spent {
+            delegate.spent = delegate
+                .spent
+                .checked_sub(amount)
+                .ok_or(PayError::ArithmeticOverflow)?;
+        }
+    } else {
+        require!(delegate.is_none(), PayError::WrongDelegate);
+    }
+    Ok(())
+}
+
+fn authorize_spend(
     signer: Pubkey,
     escrow: &Account<'_, Escrow>,
     delegate: Option<&mut Account<'_, Delegate>>,
     amount: u64,
     now: i64,
+    required_flag: u8,
 ) -> Result<Option<Pubkey>> {
     if signer == escrow.owner {
         require!(delegate.is_none(), PayError::WrongDelegate);
@@ -1209,7 +1583,7 @@ fn authorize_channel_spend(
     );
     require!(now < delegate.expires_at, PayError::DelegateExpired);
     require!(
-        delegate.flags & DELEGATE_OPEN_CHANNEL != 0,
+        delegate.flags & required_flag != 0,
         PayError::DelegateFlagMissing
     );
     delegate.spent = delegate
@@ -1229,6 +1603,28 @@ fn verify_voucher(
     owner: Pubkey,
     cumulative_total: u64,
 ) -> Result<()> {
+    let (signer, message) = parse_preceding_ed25519(instructions_sysvar, VOUCHER_MESSAGE_LEN)?;
+    require!(
+        signer == channel.voucher_signer || signer == owner,
+        PayError::InvalidVoucherSigner
+    );
+    let mut expected = [0u8; VOUCHER_MESSAGE_LEN];
+    expected[..16].copy_from_slice(VOUCHER_DOMAIN);
+    expected[16..48].copy_from_slice(crate::ID.as_ref());
+    expected[48..80].copy_from_slice(channel.key().as_ref());
+    expected[80..].copy_from_slice(&cumulative_total.to_le_bytes());
+    require!(message == expected, PayError::InvalidVoucherMessage);
+    Ok(())
+}
+
+/// Parse the immediately preceding, successfully executed Ed25519 precompile instruction.
+/// All data references must self-index, so a valid signature cannot borrow a key or message
+/// from a different instruction in the transaction.
+fn parse_preceding_ed25519(
+    instructions_sysvar: &UncheckedAccount<'_>,
+    expected_message_len: usize,
+) -> Result<(Pubkey, Vec<u8>)> {
+    require!(get_stack_height() == 1, PayError::InvalidEd25519Instruction);
     let ix = solana_instructions_sysvar::get_instruction_relative(
         -1,
         &instructions_sysvar.to_account_info(),
@@ -1258,7 +1654,7 @@ fn verify_voucher(
         PayError::InvalidEd25519Instruction
     );
     require!(
-        message_size == VOUCHER_MESSAGE_LEN,
+        message_size == expected_message_len,
         PayError::InvalidEd25519Instruction
     );
     require!(
@@ -1281,20 +1677,10 @@ fn verify_voucher(
     );
     let signer = Pubkey::try_from(&data[pubkey_offset..pubkey_offset + 32])
         .map_err(|_| error!(PayError::InvalidEd25519Instruction))?;
-    require!(
-        signer == channel.voucher_signer || signer == owner,
-        PayError::InvalidVoucherSigner
-    );
-    let mut expected = [0u8; VOUCHER_MESSAGE_LEN];
-    expected[..16].copy_from_slice(VOUCHER_DOMAIN);
-    expected[16..48].copy_from_slice(crate::ID.as_ref());
-    expected[48..80].copy_from_slice(channel.key().as_ref());
-    expected[80..].copy_from_slice(&cumulative_total.to_le_bytes());
-    require!(
-        data[message_offset..message_offset + message_size] == expected,
-        PayError::InvalidVoucherMessage
-    );
-    Ok(())
+    Ok((
+        signer,
+        data[message_offset..message_offset + message_size].to_vec(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

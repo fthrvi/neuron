@@ -52,11 +52,13 @@ pub enum PayError {
     DelegateFlagMissing,
     #[msg("The delegate cap would be exceeded")]
     DelegateCapExceeded,
-    #[msg("The delegate is disabled while existing channels are still open")]
+    #[msg("The delegate is disabled while existing commitments are still open")]
     DelegateDisabled,
     #[msg("The delegate still has open channels")]
     DelegateChannelsOpen,
-    #[msg("The escrow vault does not fully collateralize this channel")]
+    #[msg("The delegate still has open tasks")]
+    DelegateTasksOpen,
+    #[msg("The escrow vault does not fully collateralize this commitment")]
     InsufficientCollateral,
     #[msg("The channel is not open")]
     ChannelNotOpen,
@@ -80,4 +82,22 @@ pub enum PayError {
     WrongDelegate,
     #[msg("The delegate belongs to a different escrow generation")]
     DelegateGenerationMismatch,
+    #[msg("The task deadline is outside the allowed range")]
+    InvalidTaskDeadline,
+    #[msg("The task is not open")]
+    TaskNotOpen,
+    #[msg("The task has not been submitted")]
+    TaskNotSubmitted,
+    #[msg("The task deadline has elapsed")]
+    TaskDeadlineElapsed,
+    #[msg("The task is not yet eligible for timeout")]
+    TaskTimeoutNotElapsed,
+    #[msg("The verifier verdict window has elapsed")]
+    VerdictWindowElapsed,
+    #[msg("The verdict signer is not the task verifier")]
+    InvalidVerifier,
+    #[msg("The signed verdict message does not match this task")]
+    InvalidVerdictMessage,
+    #[msg("Task verification cannot be invoked through CPI")]
+    VerifyViaCpi,
 }
