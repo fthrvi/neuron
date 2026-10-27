@@ -273,6 +273,54 @@ def test_stale_in_flight_sweep_fails_check_and_fires_kill_alert(tmp_path):
     assert "chain_sweeps" in report["alerts"][0]["failed_checks"]
 
 
+@pytest.mark.parametrize(
+    ("status", "amounts", "transactions", "expected_error"),
+    [
+        (
+            {
+                "err": {"InstructionError": [0, "Custom"]},
+                "confirmationStatus": "finalized",
+            },
+            {VAULT: 0, SECOND_ACCOUNT: 100},
+            {},
+            "sent sweep sweep-stale finalized with an error",
+        ),
+        (
+            {"err": None, "confirmationStatus": "finalized"},
+            {VAULT: 100, SECOND_ACCOUNT: 0},
+            {
+                "sweep-signature": _sweep_transaction(
+                    SECOND_ACCOUNT, VAULT, 100
+                )
+            },
+            "stale in-flight sweep sweep-stale",
+        ),
+    ],
+)
+def test_finalized_sent_sweep_is_a_worker_health_mismatch(
+    tmp_path, status, amounts, transactions, expected_error
+):
+    path = tmp_path / "finalized-sent.sqlite"
+    with _ledger(path, (("alice", SECOND_ACCOUNT, "deposit-a", 100),)) as store:
+        store.begin_sweep(
+            "sweep-stale", "alice", SECOND_ACCOUNT, 100,
+            "sweep-signature", "blockhash", 100,
+        )
+    rpc = FakeReconcileRPC(
+        amounts,
+        statuses={"sweep-signature": status},
+        transactions=transactions,
+    )
+    rpc.height = 104
+
+    report = Reconciler(
+        path, rpc, _config(tmp_path, sweep_stale_blocks=3)
+    ).collect()
+
+    assert report["outcome"] == "mismatch"
+    assert expected_error in _check(report, "chain_sweeps")["errors"]
+
+
 def test_transient_chain_change_retries_without_mismatch(tmp_path):
     path = tmp_path / "ledger.sqlite"
     with _ledger(path):

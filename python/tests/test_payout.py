@@ -94,16 +94,18 @@ class FakeRPC:
             "amount": self.token_accounts.get(address, 0),
             "decimals": 6,
             "owner": TREASURY,
+            "slot": 100,
         }
         account.update(self.token_account_metadata.get(address, {}))
         return account
 
     def get_signatures_for_address(
-        self, address, *, before=None, until=None, limit=1000
+        self, address, *, before=None, until=None, limit=1000,
+        min_context_slot=None,
     ):
         assert before is None
         assert until is None
-        self.signature_address_calls.append((address, limit))
+        self.signature_address_calls.append((address, limit, min_context_slot))
         return self.account_signatures.get(
             address, [{"signature": f"deposit-{address}"}]
         )[:limit]
@@ -287,9 +289,55 @@ def test_sweep_skips_net_balance_match_when_indexer_cursor_is_behind(tmp_path):
         engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
 
         assert engine.poll_once() == 0
-        assert rpc.signature_address_calls == [(account, 1)]
+        assert rpc.signature_address_calls == [(account, 1, 100)]
         assert backend.sweeps == []
         assert store._db.execute("SELECT COUNT(*) FROM chain_sweeps").fetchone()[0] == 0
+
+
+def test_sweep_rechecks_balance_after_context_fenced_signature_history(tmp_path):
+    class ChangingBalanceRPC(FakeRPC):
+        def __init__(self):
+            super().__init__()
+            self.reads = iter([1_000_000, 1_000_001])
+
+        def get_token_account(self, address):
+            account = super().get_token_account(address)
+            account["amount"] = next(self.reads)
+            return account
+
+    rpc = ChangingBalanceRPC()
+    backend = FakeBackend(rpc)
+    account = BLOCKHASHES[0]
+    with LedgerStore(tmp_path / "balance-changed.sqlite") as store:
+        indexed_account(store, account, 1_000_000)
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+
+        assert engine.poll_once() == 0
+        assert rpc.signature_address_calls == [(account, 1, 100)]
+        assert backend.sweeps == []
+        assert rpc.broadcasts == []
+
+
+def test_sweep_fails_closed_when_rpc_cannot_honor_min_context_slot(tmp_path):
+    class UnfencedHistoryRPC(FakeRPC):
+        def get_signatures_for_address(
+            self, address, *, before=None, until=None, limit=1000,
+            min_context_slot=None,
+        ):
+            assert min_context_slot == 100
+            raise RPCError("minimum context slot is not reached")
+
+    rpc = UnfencedHistoryRPC()
+    backend = FakeBackend(rpc)
+    account = BLOCKHASHES[0]
+    with LedgerStore(tmp_path / "unsupported-context-fence.sqlite") as store:
+        indexed_account(store, account, 1_000_000)
+        rpc.token_accounts[account] = 1_000_000
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+
+        assert engine.poll_once() == 0
+        assert backend.sweeps == []
+        assert rpc.broadcasts == []
 
 
 def test_processed_sweep_failure_stays_sent_without_second_broadcast(tmp_path):
@@ -429,6 +477,48 @@ def test_sweep_crash_after_persist_is_not_rebuilt_or_double_sent(tmp_path):
         rpc.before_send = None
         assert engine.poll_once() == 0
         assert len(backend.sweeps) == 1
+        assert rpc.broadcasts == []
+
+
+@pytest.mark.parametrize(
+    ("guard", "status", "expected_state"),
+    [
+        ("funds_off", {"err": None, "confirmationStatus": "finalized"}, "finalized"),
+        (
+            "kill",
+            {
+                "err": {"InstructionError": [0, "Custom"]},
+                "confirmationStatus": "finalized",
+            },
+            "failed",
+        ),
+    ],
+)
+def test_sent_sweep_resolves_while_new_money_movement_is_disabled(
+    tmp_path, guard, status, expected_state
+):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    account = BLOCKHASHES[0]
+    with LedgerStore(tmp_path / f"resolve-{guard}.sqlite") as store:
+        indexed_account(store, account, 1_000_000)
+        store.begin_sweep(
+            "crash-after-broadcast", "alice", account, 1_000_000,
+            "sweep-signature-1", BLOCKHASHES[1], 12,
+        )
+        rpc.statuses["sweep-signature-1"] = status
+        cfg = config(tmp_path, enabled=guard != "funds_off")
+        if guard == "kill":
+            cfg.kill_file.touch()
+
+        engine = PayoutEngine(store, rpc, cfg, backend=backend)
+        assert engine.poll_once() == 1
+
+        assert store._db.execute(
+            "SELECT state FROM chain_sweeps WHERE id='crash-after-broadcast'"
+        ).fetchone()[0] == expected_state
+        assert backend.sweeps == []
+        assert backend.builds == []
         assert rpc.broadcasts == []
 
 

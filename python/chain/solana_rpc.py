@@ -144,12 +144,21 @@ class SolanaRPC:
         before: str | None = None,
         until: str | None = None,
         limit: int = 1000,
+        min_context_slot: int | None = None,
     ) -> list[dict[str, Any]]:
         options: dict[str, Any] = {"commitment": "finalized", "limit": limit}
         if before:
             options["before"] = before
         if until:
             options["until"] = until
+        if min_context_slot is not None:
+            if (
+                isinstance(min_context_slot, bool)
+                or not isinstance(min_context_slot, int)
+                or min_context_slot < 0
+            ):
+                raise ValueError("minimum context slot must be a non-negative integer")
+            options["minContextSlot"] = min_context_slot
         result = self.call("getSignaturesForAddress", [address, options])
         if not isinstance(result, list):
             raise RPCError("getSignaturesForAddress result is not a list")

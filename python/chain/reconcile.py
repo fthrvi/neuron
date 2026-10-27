@@ -833,25 +833,28 @@ class Reconciler:
             if state == "failed":
                 continue
             status = statuses.get(row["signature"])
-            chain_finalized = (
+            status_finalized = (
                 isinstance(status, dict)
                 and status.get("confirmationStatus") == "finalized"
+            )
+            chain_finalized = (
+                status_finalized
                 and status.get("err") is None
             )
-            if state == "sent" and not chain_finalized:
-                status_finalized = (
-                    isinstance(status, dict)
-                    and status.get("confirmationStatus") == "finalized"
-                )
-                if (
-                    not status_finalized
-                    and current_block_height is not None
+            if state == "sent":
+                stale = (
+                    current_block_height is not None
                     and current_block_height
                     > int(row["last_valid_block_height"])
                     + self.config.sweep_stale_blocks
-                ):
+                )
+                if status_finalized and status.get("err") is not None:
+                    errors.append(f"sent sweep {row['id']} finalized with an error")
+                    continue
+                if stale:
                     errors.append(f"stale in-flight sweep {row['id']}")
-                continue
+                if not chain_finalized:
+                    continue
             proof = self._sweep_transfer_proof(row, status)
             proofs.append(proof)
             if not proof["ok"]:

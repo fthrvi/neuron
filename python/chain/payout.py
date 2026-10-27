@@ -2,7 +2,7 @@
 """nak-treasury: the sole Solana treasury keyholder and payout worker.
 
 The process is fail-closed: only devnet or loopback localnet RPCs are accepted,
-``NAK_FUNDS`` defaults to ``off``, and the payout kill file prevents all work.
+``NAK_FUNDS`` defaults to ``off``, and the payout kill file prevents new work.
 Transactions are constructed, audited, and signed in-process.  The resulting
 signature and wire bytes are committed to SQLite before JSON-RPC broadcast.
 """
@@ -913,7 +913,7 @@ class PayoutEngine:
         )
         return 1
 
-    def _sweep_pass(self) -> int:
+    def _resolve_sweeps(self) -> int:
         changed = 0
         for sweep in self.store.sweeps_in_flight():
             try:
@@ -923,6 +923,10 @@ class PayoutEngine:
                     "sweep resolution failed operator=%s account=%s",
                     sweep["operator"], sweep["token_account"],
                 )
+        return changed
+
+    def _start_sweeps(self) -> int:
+        changed = 0
         in_flight = {
             row["token_account"] for row in self.store.sweeps_in_flight()
         }
@@ -953,7 +957,16 @@ class PayoutEngine:
                         row["operator"], account,
                     )
                     continue
-                signatures = self.rpc.get_signatures_for_address(account, limit=1)
+                context_slot = snapshot.get("slot")
+                if (
+                    isinstance(context_slot, bool)
+                    or not isinstance(context_slot, int)
+                    or context_slot < 0
+                ):
+                    raise PayoutError("deposit account balance has no valid context slot")
+                signatures = self.rpc.get_signatures_for_address(
+                    account, limit=1, min_context_slot=context_slot
+                )
                 newest = None
                 if signatures:
                     first = signatures[0]
@@ -964,6 +977,27 @@ class PayoutEngine:
                             "newest deposit-account signature is malformed"
                         )
                     newest = first["signature"]
+                confirmed_snapshot = self.rpc.get_token_account(account)
+                if (
+                    confirmed_snapshot.get("mint") != self.config.mint
+                    or int(confirmed_snapshot.get("decimals")) != USDC_DECIMALS
+                ):
+                    raise PayoutError("deposit account mint or decimals differ")
+                self._validate_sweep_source(row, confirmed_snapshot)
+                confirmed_slot = confirmed_snapshot.get("slot")
+                if (
+                    isinstance(confirmed_slot, bool)
+                    or not isinstance(confirmed_slot, int)
+                    or confirmed_slot < context_slot
+                ):
+                    raise PayoutError("deposit account balance context regressed")
+                if int(confirmed_snapshot["amount"]) != balance:
+                    LOG.info(
+                        "sweep deferred because balance changed during eligibility "
+                        "operator=%s account=%s",
+                        row["operator"], account,
+                    )
+                    continue
                 if newest != row["cursor"]:
                     LOG.info(
                         "sweep deferred until indexer cursor catches up "
@@ -979,6 +1013,12 @@ class PayoutEngine:
                     row["operator"], account,
                 )
         return changed
+
+    def _sweep_pass(self) -> int:
+        return (
+            PayoutEngine._resolve_sweeps(self)
+            + PayoutEngine._start_sweeps(self)
+        )
 
     def _build_and_send(self, row: dict[str, Any]) -> int:
         ata = self._ensure_recipient_ata(row["address"])
@@ -1064,9 +1104,12 @@ class PayoutEngine:
         return 0
 
     def poll_once(self) -> int:
+        # Resolution is bookkeeping only: it never signs or broadcasts.  It
+        # must keep converging after an operator disables new money movement.
+        changed = PayoutEngine._resolve_sweeps(self)
         if self.config.kill_file.exists():
             LOG.warning("payout kill file present: %s", self.config.kill_file)
-            return 0
+            return changed
 
         frozen_operators = self._frozen_operators()
         frozen_withdrawals = {
@@ -1080,7 +1123,7 @@ class PayoutEngine:
                 withdrawal_id,
             )
 
-        changed = self._approve_pending(frozen_operators)
+        changed += self._approve_pending(frozen_operators)
         if not self.config.enabled:
             for row in self.store.withdrawals(
                 "approved", "expired", exclude_operators=frozen_operators
@@ -1091,7 +1134,7 @@ class PayoutEngine:
             return changed
 
         # Internal consolidation is guarded like payouts, but has no cap or presence gate.
-        changed += PayoutEngine._sweep_pass(self)
+        changed += PayoutEngine._start_sweeps(self)
         changed += self._create_deposit_accounts()
         for row in self.store.withdrawals(
             "sent", exclude_operators=frozen_operators

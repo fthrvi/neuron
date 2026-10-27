@@ -72,6 +72,29 @@ def test_rpc_error_is_not_returned_as_a_result(monkeypatch):
         SolanaRPC("http://127.0.0.1:8899").call("getHealth", [])
 
 
+def test_signature_history_can_be_fenced_to_a_balance_context(monkeypatch):
+    seen = []
+
+    def urlopen(request, timeout):
+        seen.append(json.loads(request.data))
+        return _Response(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "result": [{"signature": "sig"}]}
+            ).encode()
+        )
+
+    monkeypatch.setattr(solana_rpc.urllib.request, "urlopen", urlopen)
+    client = SolanaRPC("http://127.0.0.1:8899")
+
+    assert client.get_signatures_for_address(
+        "account", limit=1, min_context_slot=99
+    ) == [{"signature": "sig"}]
+    assert seen[0]["params"] == [
+        "account",
+        {"commitment": "finalized", "limit": 1, "minContextSlot": 99},
+    ]
+
+
 def test_parses_token_account_raw_amount(monkeypatch):
     payload = {
         "jsonrpc": "2.0",
