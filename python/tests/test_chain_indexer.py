@@ -489,3 +489,24 @@ def test_user_unit_contains_required_supported_hardening():
     ):
         assert directive in unit
     assert "ExecStart=/usr/bin/python3 /home/" not in unit
+
+
+def test_treasury_unit_avoids_user_namespace_sandboxing():
+    unit = (
+        Path(__file__).parents[1] / "chain" / "systemd" / "nak-treasury.service"
+    ).read_text()
+    directives = {
+        line.split("=", 1)[0]
+        for line in unit.splitlines()
+        if line and not line.startswith("#") and "=" in line
+    }
+    # Each of these makes a user manager map root-owned trust pins to nobody.
+    for directive in ("PrivateTmp", "ProtectSystem", "ProtectHome", "ReadWritePaths"):
+        assert directive not in directives
+    for directive in (
+        "UMask=0077",
+        "NoNewPrivileges=yes",
+        "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
+        "SystemCallFilter=@system-service",
+    ):
+        assert directive in unit

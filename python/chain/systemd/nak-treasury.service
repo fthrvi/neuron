@@ -14,10 +14,10 @@ RestartSec=5
 UMask=0077
 NoNewPrivileges=yes
 # Treasury and generated account keypairs remain in process memory only.
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.neuron/credits %h/.neuron/vault
+# No mount sandboxing (PrivateTmp/ProtectSystem/ProtectHome/ReadWritePaths) here.
+# In a user manager those imply a user namespace, where the root-owned
+# /etc/prithvi-agent/receipt-signers.json appears owned by nobody. enclave_gate
+# then refuses every signer, so over-cap payouts can never request Face ID.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=yes
 RestrictRealtime=yes

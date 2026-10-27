@@ -12,7 +12,10 @@ repository.
 1. Install and configure `nak-indexer.service` first. It is read-only and must be healthy
    before money routes are exposed.
 2. Install `nak-treasury.service` with `NAK_FUNDS=off`. Confirm its vault, mint, sweep
-   minimum, caps, and kill-file path before turning funds on.
+   minimum, caps, and kill-file path before turning funds on. Do not add mount sandboxing
+   (`PrivateTmp`, `ProtectSystem`, `ProtectHome`, `ReadWritePaths`) to this user unit: it puts
+   the worker in a user namespace where the root-owned approver pin reads as owned by
+   `nobody`, so every Face ID request is refused and over-cap payouts wait forever.
 3. Install `nak-reconcile.service` and `nak-reconcile.timer` last. Run the service once by
    hand, verify the signed report, then enable the daily timer.
 
