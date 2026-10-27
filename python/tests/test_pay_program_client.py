@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import struct
+import subprocess
+import sys
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -132,19 +136,172 @@ def test_voucher_sign_verify_round_trip_and_tamper_rejection() -> None:
     assert not client.verify_voucher(public, altered, client.PROGRAM_ID, channel, 987_654)
 
 
-def test_voucher_book_is_monotonic_and_supports_full_u64(tmp_path) -> None:
+def test_voucher_book_is_monotonic_and_supports_full_u64(tmp_path, monkeypatch) -> None:
     channel = client.IDL["address"]
-    first = bytes(range(64))
-    second = bytes(reversed(range(64)))
-    with client.VoucherBook(tmp_path / "vouchers.sqlite") as book:
+    program = client.PROGRAM_ID
+    signer = Ed25519PrivateKey.generate()
+    signer_public = signer.public_key().public_bytes_raw()
+    other_signer = Ed25519PrivateKey.generate()
+    other_public = other_signer.public_key().public_bytes_raw()
+    wrong_key = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+    wrong_address = "11111111111111111111111111111111"
+    database = tmp_path / "vouchers.sqlite"
+    first_total = 2**64 - 2
+    first = client.sign_voucher(signer, program, channel, first_total)
+    second = client.sign_voucher(signer, program, channel, 2**64 - 1)
+
+    with client.VoucherBook(database) as book:
         assert book.latest(channel) is None
-        assert book.store(channel, 2**64 - 2, first).total == 2**64 - 2
-        assert book.store(channel, 2**64 - 1, second).signature == second
+
+        rejected = (
+            (channel, first_total, bytes(64), signer_public, program),
+            (channel, first_total, first, wrong_key, program),
+            (wrong_address, first_total, first, signer_public, program),
+            (channel, first_total, first, signer_public, wrong_address),
+            (channel, 2**64 - 1, bytes(64), signer_public, program),
+        )
+        for target_channel, total, signature, public, target_program in rejected:
+            with pytest.raises(ValueError, match="invalid voucher signature"):
+                book.store(
+                    target_channel,
+                    total,
+                    signature,
+                    signer=public,
+                    program=target_program,
+                )
+        assert book.latest(channel) is None
+
+        assert book.store(
+            channel, first_total, first, signer=signer_public, program=program
+        ).total == first_total
+        # Exact replay is idempotent.
+        assert book.store(
+            channel, first_total, first, signer=signer_public, program=program
+        ).signature == first
+
+        different_signer_signature = client.sign_voucher(
+            other_signer, program, channel, 2**64 - 1
+        )
+        with pytest.raises(ValueError, match="pinned"):
+            book.store(
+                channel,
+                2**64 - 1,
+                different_signer_signature,
+                signer=other_public,
+                program=program,
+            )
+        different_program_signature = client.sign_voucher(
+            signer, wrong_address, channel, 2**64 - 1
+        )
+        with pytest.raises(ValueError, match="pinned"):
+            book.store(
+                channel,
+                2**64 - 1,
+                different_program_signature,
+                signer=signer_public,
+                program=wrong_address,
+            )
+        lower = client.sign_voucher(signer, program, channel, first_total - 1)
         with pytest.raises(ValueError, match="below stored total"):
-            book.store(channel, 2**64 - 2, first)
+            book.store(
+                channel,
+                first_total - 1,
+                lower,
+                signer=signer_public,
+                program=program,
+            )
+        altered = bytearray(first)
+        altered[0] ^= 1
+        with monkeypatch.context() as patch:
+            # Ed25519 has a unique valid signature for this key/message.  Bypass
+            # only cryptographic verification to exercise the equal-total guard.
+            patch.setattr(client, "verify_voucher", lambda *args: True)
+            with pytest.raises(ValueError, match="different signature"):
+                book.store(
+                    channel,
+                    first_total,
+                    altered,
+                    signer=signer_public,
+                    program=program,
+                )
+        assert book.store(
+            channel, 2**64 - 1, second, signer=signer_public, program=program
+        ).signature == second
         assert book.latest(channel) == client.VoucherRecord(
             channel, 2**64 - 1, second
         )
+        for suffix in ("", "-wal", "-shm"):
+            path = type(database)(f"{database}{suffix}")
+            assert path.is_file()
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def _mutate_instruction_arg(idl: dict) -> None:
+    instruction = next(item for item in idl["instructions"] if item["name"] == "config_init")
+    instruction["args"][0]["type"] = "u32"
+
+
+def _mutate_account_flag(idl: dict) -> None:
+    instruction = next(item for item in idl["instructions"] if item["name"] == "config_init")
+    instruction["accounts"][0]["signer"] = not instruction["accounts"][0].get(
+        "signer", False
+    )
+
+
+def _mutate_enum_order(idl: dict) -> None:
+    enum = next(item for item in idl["types"] if item["name"] == "Verdict")
+    enum["type"]["variants"].reverse()
+
+
+@pytest.mark.parametrize(
+    "mutate", [_mutate_instruction_arg, _mutate_account_flag, _mutate_enum_order]
+)
+def test_import_rejects_idl_wire_format_drift(tmp_path, mutate) -> None:
+    idl = json.loads(client.IDL_PATH.read_text(encoding="utf-8"))
+    mutate(idl)
+    changed = tmp_path / "changed-idl.json"
+    changed.write_text(json.dumps(idl), encoding="utf-8")
+    env = os.environ.copy()
+    env["NAKSHATRA_PAY_IDL_PATH"] = str(changed)
+    result = subprocess.run(
+        [sys.executable, "-c", "import python.chain.program_client"],
+        cwd=client.IDL_PATH.parents[3],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "nakshatra_pay IDL" in result.stderr
+
+
+def test_program_id_can_be_overridden_by_environment(tmp_path) -> None:
+    copied_idl = tmp_path / "nakshatra_pay.json"
+    copied_idl.write_text(client.IDL_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    override = "11111111111111111111111111111111"
+    env = os.environ.copy()
+    env["NAKSHATRA_PAY_IDL_PATH"] = str(copied_idl)
+    env["NAKSHATRA_PAY_PROGRAM_ID"] = override
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from python.chain.program_client import IDL_PATH, PROGRAM_ID; "
+            "print(IDL_PATH); print(PROGRAM_ID)",
+        ],
+        cwd=client.IDL_PATH.parents[3],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert result.stdout.splitlines() == [str(copied_idl), override]
+
+
+@requires_solders
+def test_pubkey_rejects_integers() -> None:
+    with pytest.raises(ValueError, match="cannot be an integer"):
+        client._pubkey(32)
 
 
 @requires_solders

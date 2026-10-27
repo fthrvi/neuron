@@ -47,12 +47,14 @@ def _port_block() -> int:
     pytest.skip("could not reserve a validator port range outside 8800-8999")
 
 
-def _wait_for_validator(rpc: SolanaRPC, process: subprocess.Popen[str]) -> None:
+def _wait_for_validator(
+    rpc: SolanaRPC, process: subprocess.Popen[str], log_path: Path
+) -> None:
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            _, stderr = process.communicate(timeout=1)
-            pytest.skip(f"local validator could not start: {stderr[-2000:]}")
+            output = log_path.read_text(encoding="utf-8", errors="replace")
+            pytest.skip(f"local validator could not start: {output[-2000:]}")
         try:
             if rpc.call("getHealth", []) == "ok" and rpc.call("getSlot", []) >= 2:
                 return
@@ -232,6 +234,8 @@ def test_pay_program_real_validator_end_to_end(tmp_path: Path) -> None:
     env["HOME"] = str(home)
     for name in ("SOLANA_URL", "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         env.pop(name, None)
+    validator_log_path = tmp_path / "validator.log"
+    validator_log = validator_log_path.open("w", encoding="utf-8")
     process = subprocess.Popen(
         [
             validator,
@@ -259,12 +263,12 @@ def test_pay_program_real_validator_end_to_end(tmp_path: Path) -> None:
         ],
         env=env,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=validator_log,
+        stderr=subprocess.STDOUT,
     )
     try:
         rpc = SolanaRPC(rpc_url, timeout=3)
-        _wait_for_validator(rpc, process)
+        _wait_for_validator(rpc, process, validator_log_path)
 
         # Owner and delegate pay rent for the accounts they create, per the program rules.
         _send(
@@ -417,7 +421,13 @@ def test_pay_program_real_validator_end_to_end(tmp_path: Path) -> None:
             signed = []
             for total in (101, 201, 333):
                 signature = pay.sign_voucher(delegate_key, pay.PROGRAM_ID, channel, total)
-                vouchers.store(channel, total, signature)
+                vouchers.store(
+                    channel,
+                    total,
+                    signature,
+                    signer=delegate_key.pubkey(),
+                    program=pay.PROGRAM_ID,
+                )
                 signed.append((total, signature))
             assert vouchers.latest(channel).total == 333
 
@@ -672,3 +682,4 @@ def test_pay_program_real_validator_end_to_end(tmp_path: Path) -> None:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+        validator_log.close()

@@ -6,13 +6,16 @@ does not load wallet files, broadcast transactions, or run a background process.
 
 The committed Anchor IDL is checked at import time.  Explicit builders below use
 that checked account metadata for their account order and signer/write flags, while
-their argument codecs are independently described by :data:`_ARG_LAYOUTS`.
+their argument codecs are independently described by :data:`_ARG_LAYOUTS`.  Set
+``NAKSHATRA_PAY_IDL_PATH`` or ``NAKSHATRA_PAY_PROGRAM_ID`` for an explicit
+deployment; defaults remain the repository IDL and its localnet program address.
 """
 from __future__ import annotations
 
 import base64
 import hashlib
 import json
+import os
 import sqlite3
 import struct
 import tomllib
@@ -37,33 +40,38 @@ except ImportError:  # pragma: no cover - permits direct import from python/chai
     from solana_rpc import RPCError, decode_base58  # type: ignore
 
 
-IDL_PATH = (
+_DEFAULT_IDL_PATH = (
     Path(__file__).resolve().parents[2]
     / "programs"
     / "nakshatra_pay"
     / "idl"
     / "nakshatra_pay.json"
 )
-ANCHOR_TOML_PATH = IDL_PATH.parents[1] / "Anchor.toml"
+IDL_PATH = Path(os.environ.get("NAKSHATRA_PAY_IDL_PATH", _DEFAULT_IDL_PATH)).expanduser()
+ANCHOR_TOML_PATH = _DEFAULT_IDL_PATH.parents[1] / "Anchor.toml"
 with IDL_PATH.open("r", encoding="utf-8") as _idl_file:
     IDL: dict[str, Any] = json.load(_idl_file)
-with ANCHOR_TOML_PATH.open("rb") as _anchor_file:
-    _anchor = tomllib.load(_anchor_file)
-try:
-    _anchor_program_id = _anchor["programs"]["localnet"]["nakshatra_pay"]
-except (KeyError, TypeError) as exc:
-    raise RuntimeError(f"nakshatra_pay is missing from {ANCHOR_TOML_PATH}") from exc
-if _anchor_program_id != IDL.get("address"):
-    raise RuntimeError(
-        f"program id mismatch: IDL has {IDL.get('address')!r}, "
-        f"Anchor.toml has {_anchor_program_id!r}"
-    )
+if IDL_PATH.resolve() == _DEFAULT_IDL_PATH.resolve():
+    with ANCHOR_TOML_PATH.open("rb") as _anchor_file:
+        _anchor = tomllib.load(_anchor_file)
+    try:
+        _anchor_program_id = _anchor["programs"]["localnet"]["nakshatra_pay"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(f"nakshatra_pay is missing from {ANCHOR_TOML_PATH}") from exc
+    if _anchor_program_id != IDL.get("address"):
+        raise RuntimeError(
+            f"program id mismatch: IDL has {IDL.get('address')!r}, "
+            f"Anchor.toml has {_anchor_program_id!r}"
+        )
+
 
 def _constant_pubkey(value: str) -> Any:
     return value if Pubkey is None else Pubkey.from_string(value)
 
 
-PROGRAM_ID = _constant_pubkey(IDL["address"])
+PROGRAM_ID = _constant_pubkey(
+    os.environ.get("NAKSHATRA_PAY_PROGRAM_ID", IDL["address"])
+)
 SYSTEM_PROGRAM_ID = _constant_pubkey("11111111111111111111111111111111")
 TOKEN_PROGRAM_ID = _constant_pubkey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 ED25519_PROGRAM_ID = _constant_pubkey("Ed25519SigVerify111111111111111111111111111")
@@ -97,6 +105,8 @@ def _pubkey(value: PubkeyLike, name: str = "public key") -> Pubkey:
     if isinstance(value, Pubkey):
         return value
     try:
+        if isinstance(value, (bool, int)):
+            raise TypeError(f"{name} cannot be an integer")
         if isinstance(value, str):
             return Pubkey.from_string(value)
         raw = bytes(value)
@@ -111,6 +121,8 @@ def _pubkey_bytes(value: Any, name: str = "public key") -> bytes:
     if Pubkey is not None and isinstance(value, Pubkey):
         return bytes(value)
     try:
+        if isinstance(value, (bool, int)):
+            raise TypeError(f"{name} cannot be an integer")
         raw = decode_base58(value) if isinstance(value, str) else bytes(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid {name}: {exc}") from exc
@@ -275,6 +287,17 @@ _EXPECTED_INSTRUCTION_FINGERPRINT = (
     "162545c34ac7bf4435392840e8a0f59d9ef7f90b0afac8cc484961a5777ebccd"
 )
 
+# Borsh enum encodings are their zero-based variant positions.  Keep every IDL
+# enum here, including event-only enums, so reordering one cannot silently alter
+# the wire format used by this client or by consumers of decoded events.
+_EXPECTED_ENUM_VARIANTS: dict[str, tuple[str, ...]] = {
+    "ChannelStatus": ("Open", "Closing"),
+    "TaskPaidHow": ("Verified", "Silence"),
+    "TaskRefundedHow": ("Failed", "Expired"),
+    "TaskStatus": ("Open", "Submitted"),
+    "Verdict": ("Pass", "Fail"),
+}
+
 
 def _idl_arg_kind(value: Any) -> str:
     if isinstance(value, str):
@@ -334,6 +357,19 @@ def _verify_idl() -> dict[str, dict[str, Any]]:
         for account in item.get("accounts", []):
             if not isinstance(account.get("name"), str):
                 raise RuntimeError(f"invalid account metadata for {name}")
+
+    enum_variants: dict[str, tuple[str, ...]] = {}
+    for item in IDL.get("types", []):
+        type_spec = item.get("type", {})
+        if type_spec.get("kind") == "enum":
+            enum_variants[item.get("name")] = tuple(
+                variant.get("name") for variant in type_spec.get("variants", [])
+            )
+    if enum_variants != _EXPECTED_ENUM_VARIANTS:
+        raise RuntimeError(
+            "nakshatra_pay IDL enum encoding changed: "
+            f"IDL={enum_variants!r}, expected={_EXPECTED_ENUM_VARIANTS!r}"
+        )
     return by_name
 
 
@@ -619,15 +655,39 @@ class VoucherBook:
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.execute(
-            "CREATE TABLE IF NOT EXISTS vouchers (channel TEXT PRIMARY KEY, total TEXT NOT NULL, signature BLOB NOT NULL)"
-        )
+        previous_umask = os.umask(0o077)
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+            self._secure_files()
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA synchronous=FULL")
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS vouchers ("
+                "channel TEXT PRIMARY KEY, total TEXT NOT NULL, signature BLOB NOT NULL, "
+                "signer TEXT NOT NULL, program TEXT NOT NULL)"
+            )
+            columns = {
+                row[1] for row in self._db.execute("PRAGMA table_info(vouchers)")
+            }
+            # Preserve readability of databases made by the earlier client.  Their
+            # unauthenticated rows deliberately cannot be updated (see store()).
+            if "signer" not in columns:
+                self._db.execute("ALTER TABLE vouchers ADD COLUMN signer TEXT")
+            if "program" not in columns:
+                self._db.execute("ALTER TABLE vouchers ADD COLUMN program TEXT")
+            self._secure_files()
+        finally:
+            os.umask(previous_umask)
+
+    def _secure_files(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{self.path}{suffix}")
+            if candidate.exists():
+                candidate.chmod(0o600)
 
     def close(self) -> None:
+        self._secure_files()
         self._db.close()
 
     def __enter__(self) -> "VoucherBook":
@@ -645,30 +705,73 @@ class VoucherBook:
             return None
         return VoucherRecord(channel_text, int(row[0]), bytes(row[1]))
 
-    def store(self, channel: PubkeyLike, total: int, signature: bytes) -> VoucherRecord:
+    def store(
+        self,
+        channel: PubkeyLike,
+        total: int,
+        signature: bytes,
+        *,
+        signer: PubkeyLike,
+        program: PubkeyLike,
+    ) -> VoucherRecord:
         channel_text = _pubkey_text(channel, "channel")
         amount = _u64(total, "total")
         signature_bytes = bytes(signature)
         if len(signature_bytes) != 64:
             raise ValueError("voucher signature must contain exactly 64 bytes")
+        signer_text = _pubkey_text(signer, "voucher signer")
+        program_text = _pubkey_text(program, "program id")
+        if not verify_voucher(
+            signer_text, signature_bytes, program_text, channel_text, amount
+        ):
+            raise ValueError("invalid voucher signature")
         self._db.execute("BEGIN IMMEDIATE")
         try:
             row = self._db.execute(
-                "SELECT total FROM vouchers WHERE channel = ?", (channel_text,)
+                "SELECT total, signature, signer, program FROM vouchers WHERE channel = ?",
+                (channel_text,),
             ).fetchone()
-            if row is not None and amount < int(row[0]):
-                raise ValueError(
-                    f"voucher total {amount} is below stored total {int(row[0])}"
+            if row is not None:
+                stored_total = int(row[0])
+                if row[2] is None or row[3] is None:
+                    raise ValueError(
+                        "stored voucher predates signer/program verification; recreate the book"
+                    )
+                if row[2] != signer_text or row[3] != program_text:
+                    raise ValueError("voucher signer or program differs from the pinned value")
+                if amount < stored_total:
+                    raise ValueError(
+                        f"voucher total {amount} is below stored total {stored_total}"
+                    )
+                if amount == stored_total:
+                    if bytes(row[1]) != signature_bytes:
+                        raise ValueError(
+                            "voucher at the stored total has a different signature"
+                        )
+                    self._db.execute("COMMIT")
+                    return VoucherRecord(channel_text, amount, signature_bytes)
+                self._db.execute(
+                    "UPDATE vouchers SET total = ?, signature = ? WHERE channel = ?",
+                    (str(amount), signature_bytes, channel_text),
                 )
-            self._db.execute(
-                "INSERT INTO vouchers(channel, total, signature) VALUES (?, ?, ?) "
-                "ON CONFLICT(channel) DO UPDATE SET total=excluded.total, signature=excluded.signature",
-                (channel_text, str(amount), signature_bytes),
-            )
+            else:
+                self._db.execute(
+                    "INSERT INTO vouchers(channel, total, signature, signer, program) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        channel_text,
+                        str(amount),
+                        signature_bytes,
+                        signer_text,
+                        program_text,
+                    ),
+                )
             self._db.execute("COMMIT")
         except BaseException:
             self._db.execute("ROLLBACK")
             raise
+        finally:
+            self._secure_files()
         return VoucherRecord(channel_text, amount, signature_bytes)
 
 
