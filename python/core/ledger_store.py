@@ -3486,6 +3486,78 @@ class LedgerStore:
                 ).fetchone()[0]
             )
 
+    def withdraw_auto_approve(
+        self,
+        withdrawal_id: str,
+        approval_ref: str,
+        *,
+        approved_since: int,
+        auto_cap: int,
+        day_cap: int,
+    ) -> bool:
+        """Approve only if every automatic cap still holds under the write lock.
+
+        The aggregate read and approval transition intentionally share one
+        ``BEGIN IMMEDIATE`` transaction.  Separate payout workers therefore
+        cannot both observe the same remaining daily allowance.
+        """
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        approval_ref = _identifier(approval_ref, "approval_ref")
+        if approval_ref.startswith("human:"):
+            raise LedgerValueError("automatic approval_ref cannot be human")
+        if (
+            isinstance(approved_since, bool)
+            or not isinstance(approved_since, int)
+            or approved_since < 0
+        ):
+            raise LedgerValueError("approved_since must be a non-negative integer")
+        auto_cap = _amount(auto_cap)
+        day_cap = _amount(day_cap)
+        now = self._now()
+
+        def operation(db: sqlite3.Connection) -> bool:
+            row = db.execute(
+                "SELECT amount, state, approval_ref FROM withdrawals WHERE id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if row is None:
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} does not exist"
+                )
+            if row["state"] in {"approved", "expired"} and (
+                row["approval_ref"] == approval_ref
+            ):
+                return True
+            if row["state"] not in {"pending", "expired"}:
+                return False
+            amount = int(row["amount"])
+            if amount > auto_cap:
+                return False
+            approved_total = int(
+                db.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM withdrawals "
+                    "WHERE approval_ts IS NOT NULL AND approval_ts>=?",
+                    (approved_since,),
+                ).fetchone()[0]
+            )
+            if approved_total + amount > day_cap:
+                return False
+            next_state = "expired" if row["state"] == "expired" else "approved"
+            db.execute(
+                "UPDATE withdrawals SET state=?, approval_ref=?, approval_ts=?, "
+                "approval_expires_ts=NULL, approved_withdrawal_id=NULL, "
+                "approved_amount=NULL, approved_address=NULL, updated_ts=? "
+                "WHERE id=?",
+                (next_state, approval_ref, now, now, withdrawal_id),
+            )
+            db.execute(
+                "DELETE FROM withdrawal_presence_requests WHERE withdrawal_id=?",
+                (withdrawal_id,),
+            )
+            return True
+
+        return self._tx(operation)
+
     def withdraw_approve(
         self,
         withdrawal_id: str,
@@ -3763,7 +3835,7 @@ class LedgerStore:
 
         def operation(db: sqlite3.Connection) -> dict[str, Any]:
             row = db.execute(
-                "SELECT request_id FROM withdrawal_presence_requests "
+                "SELECT request_id, expires_ts FROM withdrawal_presence_requests "
                 "WHERE withdrawal_id=?",
                 (withdrawal_id,),
             ).fetchone()
@@ -3771,10 +3843,11 @@ class LedgerStore:
                 raise WithdrawalStateError("presence request does not exist")
             if row["request_id"] not in (None, request_id):
                 raise WithdrawalStateError("presence request already has another broker id")
+            clamped_expires_ts = min(expires_ts, int(row["expires_ts"]))
             db.execute(
                 "UPDATE withdrawal_presence_requests SET request_id=?, expires_ts=?, "
                 "updated_ts=? WHERE withdrawal_id=?",
-                (request_id, expires_ts, now, withdrawal_id),
+                (request_id, clamped_expires_ts, now, withdrawal_id),
             )
             return dict(
                 db.execute(

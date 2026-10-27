@@ -718,6 +718,71 @@ def test_auto_cap_day_cap_and_injected_presence(tmp_path):
         assert [call[0] for call in presence_calls] == ["second"]
 
 
+def test_concurrent_engines_atomically_claim_daily_auto_approval(tmp_path):
+    path = tmp_path / "auto-cap-race.sqlite"
+    barrier = threading.Barrier(2)
+
+    class RacingStore(LedgerStore):
+        def withdraw_auto_approve(self, *args, **kwargs):
+            barrier.wait(timeout=5)
+            return super().withdraw_auto_approve(*args, **kwargs)
+
+    with LedgerStore(path) as seed:
+        held(seed, credits(3), "first", "alice")
+        held(seed, credits(3), "second", "bob")
+
+    stores = [RacingStore(path), RacingStore(path)]
+    shared = {"prepared": 0, "enqueued": 0, "checked": 0}
+    engines = [
+        PayoutEngine(
+            store,
+            FakeRPC(),
+            config(tmp_path, auto_cap=credits(5), day_cap=credits(5)),
+            backend=FakeBackend(FakeRPC()),
+            presence=AsyncPresence(shared),
+        )
+        for store in stores
+    ]
+    rows = [
+        stores[0].withdrawals("pending")[0],
+        stores[1].withdrawals("pending")[1],
+    ]
+    errors = []
+
+    def approve(engine, pending):
+        try:
+            engine._approve_one(pending)
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=approve, args=pair)
+        for pair in zip(engines, rows)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    try:
+        assert errors == []
+        assert all(not thread.is_alive() for thread in threads)
+        states = [
+            row(stores[0], withdrawal_id)
+            for withdrawal_id in ("first", "second")
+        ]
+        assert sum(
+            item["approval_ref"] == "auto:devnet-caps-v1" for item in states
+        ) == 1
+        human_needed = [
+            item for item in states if item["approval_ref"] != "auto:devnet-caps-v1"
+        ]
+        assert len(human_needed) == 1
+        assert stores[0].withdrawal_presence(human_needed[0]["id"]) is not None
+    finally:
+        for store in stores:
+            store.close()
+
+
 class AsyncPresence:
     def __init__(self, shared, result=None):
         self.shared = shared
@@ -876,6 +941,41 @@ def test_expired_human_approval_is_re_requested_after_restart_without_send(tmp_p
         assert rpc.broadcasts == []
 
 
+def test_broker_expiry_cannot_extend_persisted_local_deadline(tmp_path):
+    clock = [100]
+    shared = {"prepared": 0, "enqueued": 0, "checked": 0}
+
+    class ExtendingBrokerPresence(AsyncPresence):
+        def prepare(self, record, description, wait_s):
+            prepared = super().prepare(record, description, wait_s)
+            prepared["expires_ts"] = clock[0] + 5
+            return prepared
+
+        def enqueue(self, request, wait_s):
+            enqueued = super().enqueue(request, wait_s)
+            enqueued["expires_ts"] = 4_000_000_000
+            return enqueued
+
+    with LedgerStore(
+        tmp_path / "clamped-expiry.sqlite", clock=lambda: clock[0]
+    ) as store:
+        held(store, credits(6))
+        engine = PayoutEngine(
+            store,
+            FakeRPC(),
+            config(tmp_path),
+            backend=FakeBackend(FakeRPC()),
+            presence=ExtendingBrokerPresence(shared),
+            now=lambda: clock[0],
+        )
+
+        engine.poll_once()
+
+        request = store.withdrawal_presence("withdrawal-1")
+        assert request["request_id"] == "request:withdrawal-1"
+        assert request["expires_ts"] == 105
+
+
 def test_signed_broker_result_survives_crash_before_verification(tmp_path):
     path = tmp_path / "one-shot-result.sqlite"
     shared = {"prepared": 0, "enqueued": 0, "fetched": 0, "verified": 0}
@@ -986,10 +1086,12 @@ def test_enqueue_cas_elects_only_one_engine_to_prompt(tmp_path):
 
 def test_storage_transition_failure_isolated_from_rest_of_pass(tmp_path, caplog):
     class OneBrokenTransitionStore(LedgerStore):
-        def withdraw_approve(self, withdrawal_id, approval_ref, **kwargs):
+        def withdraw_auto_approve(self, withdrawal_id, approval_ref, **kwargs):
             if withdrawal_id == "a-broken":
                 raise sqlite3.OperationalError("injected transition failure")
-            return super().withdraw_approve(withdrawal_id, approval_ref, **kwargs)
+            return super().withdraw_auto_approve(
+                withdrawal_id, approval_ref, **kwargs
+            )
 
     rpc = FakeRPC()
     backend = FakeBackend(rpc)
@@ -1171,6 +1273,77 @@ def test_dry_run_never_loads_signer_or_broadcasts(tmp_path):
         engine.poll_once()
         assert row(store)["state"] == "approved"
         assert loaded == []
+        assert rpc.broadcasts == []
+
+
+def test_new_broadcast_rechecks_approval_after_slow_safety_gate(tmp_path):
+    clock = [100]
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    with LedgerStore(
+        tmp_path / "slow-gate-new.sqlite", clock=lambda: clock[0]
+    ) as store:
+        held(store, credits(6))
+        store.withdraw_approve(
+            "withdrawal-1",
+            "human:test",
+            expires_ts=101,
+            approved_withdrawal_id="withdrawal-1",
+            approved_amount=credits(6),
+            approved_address=RECIPIENT,
+        )
+        engine = PayoutEngine(
+            store, rpc, config(tmp_path), backend=backend, now=lambda: clock[0]
+        )
+        gate_calls = 0
+
+        def slow_second_gate():
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 2:
+                clock[0] = 102
+
+        engine._may_act = slow_second_gate
+
+        assert engine._build_and_send(row(store)) == 1
+        assert gate_calls == 2
+        assert row(store)["state"] == "sent"
+        assert rpc.broadcasts == []
+
+
+def test_rebroadcast_rechecks_approval_after_slow_safety_gate(tmp_path):
+    clock = [100]
+    rpc = FakeRPC()
+    with LedgerStore(
+        tmp_path / "slow-gate-rebroadcast.sqlite", clock=lambda: clock[0]
+    ) as store:
+        held(store, credits(6))
+        store.withdraw_approve(
+            "withdrawal-1",
+            "human:test",
+            expires_ts=101,
+            approved_withdrawal_id="withdrawal-1",
+            approved_amount=credits(6),
+            approved_address=RECIPIENT,
+        )
+        store.withdraw_mark_sent(
+            "withdrawal-1", "signature-1", BLOCKHASHES[0], 12, "wire-1"
+        )
+        rpc.wire_signatures["wire-1"] = "signature-1"
+        engine = PayoutEngine(
+            store,
+            rpc,
+            config(tmp_path),
+            backend=FakeBackend(rpc),
+            now=lambda: clock[0],
+        )
+
+        def slow_gate():
+            clock[0] = 102
+
+        engine._may_act = slow_gate
+
+        assert engine._advance_sent(row(store)) == 0
         assert rpc.broadcasts == []
 
 

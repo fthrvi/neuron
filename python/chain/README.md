@@ -133,16 +133,19 @@ list should only ever shrink.
 - Withdrawals above the automatic/day caps use the existing write-gate presence flow, but
   the treasury worker never waits synchronously for Face ID. It durably records the exact
   withdrawal id, amount, address, challenge, broker request, and expiry, then checks that
-  same request on later passes. A transactional election permits only one worker to enqueue
-  the request. Because the broker result is one-shot, the raw signed response is committed
-  before verification and is re-verified from that durable copy after a restart. Restarts
-  therefore neither prompt twice nor lose an answer consumed just before a crash. Only a
-  locally verified, unexpired answer matching the withdrawal id, amount, and address can
-  approve the withdrawal. Those bindings and the exact approval expiry remain on the
-  withdrawal; the worker rechecks them immediately before signing and broadcasting, and an
-  expired approval returns through the normal fresh-approval path. Denial, expiry, malformed
-  approval, broker/configuration errors, and storage-transition errors all fail closed for
-  that withdrawal. Other withdrawals, sweeps, and account creation continue in the pass.
+  same request on later passes. Broker-reported expiry can shorten, but never extend, the
+  persisted local deadline. A transactional election permits only one worker to enqueue the
+  request. Automatic-cap eligibility and approval are likewise one write transaction, so
+  concurrent workers cannot both consume the same daily allowance. Because the broker result
+  is one-shot, the raw signed response is committed before verification and is re-verified
+  from that durable copy after a restart. Restarts therefore neither prompt twice nor lose an
+  answer consumed just before a crash. Only a locally verified, unexpired answer matching the
+  withdrawal id, amount, and address can approve the withdrawal. Those bindings and the exact
+  approval expiry remain on the withdrawal; the worker rechecks them after the final mutable
+  safety gate and immediately before each broadcast or rebroadcast. An expired approval
+  returns through the normal fresh-approval path. Denial, expiry, malformed approval,
+  broker/configuration errors, and storage-transition errors all fail closed for that
+  withdrawal. Other withdrawals, sweeps, and account creation continue in the pass.
 
 The reconcile alert path calls Trisul's existing
 `/home/prithvi/trisul/infra/mesh-agent/buzz-say.sh` helper when present. That helper reuses

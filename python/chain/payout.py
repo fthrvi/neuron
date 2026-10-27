@@ -681,7 +681,9 @@ class WriteGatePresence:
                 return {
                     **request,
                     "request_id": candidate["request_id"],
-                    "expires_ts": int(candidate["expires"]),
+                    "expires_ts": min(
+                        int(request["expires_ts"]), int(candidate["expires"])
+                    ),
                 }
         if not request.get("_allow_new_enqueue"):
             return request
@@ -706,7 +708,10 @@ class WriteGatePresence:
         return {
             **request,
             "request_id": request_id,
-            "expires_ts": int(enqueued.get("expires", request["expires_ts"])),
+            "expires_ts": min(
+                int(request["expires_ts"]),
+                int(enqueued.get("expires", request["expires_ts"])),
+            ),
         }
 
     @staticmethod
@@ -955,13 +960,13 @@ class PayoutEngine:
         if int(row["presence_attempts"]) >= 2:
             self.store.withdraw_release(row["id"])
             return 1
-        today = self.store.approved_withdrawal_total_since(self._midnight_utc())
-        automatic = (
-            int(row["amount"]) <= self.config.auto_cap
-            and today + int(row["amount"]) <= self.config.day_cap
-        )
-        if automatic:
-            self.store.withdraw_approve(row["id"], "auto:devnet-caps-v1")
+        if self.store.withdraw_auto_approve(
+            row["id"],
+            "auto:devnet-caps-v1",
+            approved_since=self._midnight_utc(),
+            auto_cap=self.config.auto_cap,
+            day_cap=self.config.day_cap,
+        ):
             return 1
         if not self.config.enabled:
             LOG.info("DRY-RUN human approval required for %s", row["id"])
@@ -1381,15 +1386,15 @@ class PayoutEngine:
         try:
             # Signing can straddle the approval deadline. Never send a newly
             # signed transaction after its exact authorization has expired.
+            self._may_act()
             if not self.store.withdrawal_approval_valid(
-                row["id"], int(self.now())
+                row["id"], int(getattr(self, "now", time.time)())
             ):
                 LOG.warning(
                     "withdrawal %s approval expired after signing; not broadcast",
                     row["id"],
                 )
                 return 1
-            self._may_act()
             returned = self.rpc.send_transaction(signed.wire_b64)
             if returned != signed.signature:
                 raise PayoutError("RPC returned a signature different from the signed transaction")
@@ -1455,6 +1460,15 @@ class PayoutEngine:
         # A crash may have happened after the durable mark and before broadcast.
         try:
             self._may_act()
+            if not self.store.withdrawal_approval_valid(
+                row["id"], int(getattr(self, "now", time.time)())
+            ):
+                LOG.info(
+                    "withdrawal %s rebroadcast withheld because its approval "
+                    "expired or changed during the safety check",
+                    row["id"],
+                )
+                return 0
             returned = self.rpc.send_transaction(row["tx_wire"])
             if returned != row["tx_sig"]:
                 raise PayoutError("RPC returned a signature different from the stored transaction")
