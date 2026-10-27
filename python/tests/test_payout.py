@@ -1,8 +1,11 @@
 """Unit tests for the fail-closed treasury payout state machine."""
 import base64
+import json
 import os
+import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -820,6 +823,198 @@ def test_pending_presence_survives_restart_without_second_request(tmp_path):
         assert reopened.withdrawal_presence("withdrawal-1") is None
         assert shared == {"prepared": 1, "enqueued": 1, "checked": 1}
         assert len(backend.builds) == 1
+
+
+def test_expired_human_approval_is_re_requested_after_restart_without_send(tmp_path):
+    path = tmp_path / "approval-expiry.sqlite"
+    clock = [100]
+    shared = {"prepared": 0, "enqueued": 0, "checked": 0}
+    rpc = FakeRPC()
+
+    class ExpiringPresence(AsyncPresence):
+        def prepare(self, record, description, wait_s):
+            prepared = super().prepare(record, description, wait_s)
+            prepared["expires_ts"] = clock[0] + 5
+            return prepared
+
+    class CrashBeforeSign(FakeBackend):
+        def build_transfer(self, *_args):
+            raise RuntimeError("crash before signing")
+
+    with LedgerStore(path, clock=lambda: clock[0]) as store:
+        held(store, credits(6))
+        presence = ExpiringPresence(shared, ("approved", {}))
+        engine = PayoutEngine(
+            store, rpc, config(tmp_path), backend=CrashBeforeSign(rpc),
+            presence=presence, now=lambda: clock[0],
+        )
+        engine.poll_once()
+        engine.poll_once()
+        approved = row(store)
+        assert approved["state"] == "approved"
+        assert approved["approval_expires_ts"] == 105
+        assert approved["approved_withdrawal_id"] == "withdrawal-1"
+        assert approved["approved_amount"] == credits(6)
+        assert approved["approved_address"] == RECIPIENT
+        assert rpc.broadcasts == []
+
+    clock[0] = 106
+    backend = FakeBackend(rpc)
+    with LedgerStore(path, clock=lambda: clock[0]) as reopened:
+        restarted = PayoutEngine(
+            reopened, rpc, config(tmp_path), backend=backend,
+            presence=ExpiringPresence(shared), now=lambda: clock[0],
+        )
+        restarted.poll_once()
+        assert row(reopened)["state"] == "pending"
+        assert row(reopened)["approval_ref"] is None
+        assert reopened.withdrawal_presence("withdrawal-1") is not None
+        assert rpc.broadcasts == []
+        assert backend.builds == []
+        assert shared["prepared"] == 2
+        assert shared["enqueued"] == 2
+        assert rpc.broadcasts == []
+
+
+def test_signed_broker_result_survives_crash_before_verification(tmp_path):
+    path = tmp_path / "one-shot-result.sqlite"
+    shared = {"prepared": 0, "enqueued": 0, "fetched": 0, "verified": 0}
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+
+    class RawPresence(AsyncPresence):
+        def fetch(self, request):
+            self.shared["fetched"] += 1
+            return {
+                "status": "signed",
+                "signature": "raw-signature",
+                "signer": "test-owner",
+            }
+
+        def verify(self, request, result):
+            self.shared["verified"] += 1
+            assert result["signature"] == "raw-signature"
+            return "approved", {
+                "withdrawal_id": request["withdrawal_id"],
+                "amount": int(request["amount"]),
+                "address": request["address"],
+                "signature": result["signature"],
+            }
+
+    class CrashAfterResultStore(LedgerStore):
+        crashed = False
+
+        def withdraw_presence_store_result(self, withdrawal_id, result):
+            stored = super().withdraw_presence_store_result(withdrawal_id, result)
+            if not self.crashed:
+                self.crashed = True
+                raise RuntimeError("crash after broker GET")
+            return stored
+
+    presence = RawPresence(shared)
+    with CrashAfterResultStore(path) as store:
+        held(store, credits(6))
+        engine = PayoutEngine(
+            store, rpc, config(tmp_path), backend=backend, presence=presence
+        )
+        engine.poll_once()
+        engine.poll_once()
+        request = store.withdrawal_presence("withdrawal-1")
+        assert json.loads(request["broker_result_json"])["signature"] == "raw-signature"
+        assert row(store)["state"] == "pending"
+        assert shared["fetched"] == 1
+        assert shared["verified"] == 0
+
+    with LedgerStore(path) as reopened:
+        restarted = PayoutEngine(
+            reopened, rpc, config(tmp_path), backend=backend, presence=presence
+        )
+        restarted.poll_once()
+        assert row(reopened)["state"] == "sent"
+        assert shared["fetched"] == 1
+        assert shared["verified"] == 1
+        assert rpc.broadcasts == ["wire-1"]
+
+
+def test_enqueue_cas_elects_only_one_engine_to_prompt(tmp_path):
+    path = tmp_path / "enqueue-election.sqlite"
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    shared = {"prepared": 0, "enqueued": 0, "checked": 0}
+
+    class RacingPresence(AsyncPresence):
+        def prepare(self, record, description, wait_s):
+            prepared = super().prepare(record, description, wait_s)
+            barrier.wait(timeout=5)
+            return prepared
+
+        def enqueue(self, request, wait_s):
+            with lock:
+                return super().enqueue(request, wait_s)
+
+    with LedgerStore(path) as seed:
+        held(seed, credits(6))
+    stores = [LedgerStore(path), LedgerStore(path)]
+    engines = [
+        PayoutEngine(
+            store, FakeRPC(), config(tmp_path), backend=FakeBackend(FakeRPC()),
+            presence=RacingPresence(shared),
+        )
+        for store in stores
+    ]
+    errors = []
+
+    def run(engine):
+        try:
+            engine._approve_pending(set())
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(engine,)) for engine in engines]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    try:
+        assert errors == []
+        assert all(not thread.is_alive() for thread in threads)
+        assert shared["enqueued"] == 1
+    finally:
+        for store in stores:
+            store.close()
+
+
+def test_storage_transition_failure_isolated_from_rest_of_pass(tmp_path, caplog):
+    class OneBrokenTransitionStore(LedgerStore):
+        def withdraw_approve(self, withdrawal_id, approval_ref, **kwargs):
+            if withdrawal_id == "a-broken":
+                raise sqlite3.OperationalError("injected transition failure")
+            return super().withdraw_approve(withdrawal_id, approval_ref, **kwargs)
+
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    sweep_account = BLOCKHASHES[1]
+    with OneBrokenTransitionStore(tmp_path / "isolated-transition.sqlite") as store:
+        held(store, credits(1), "a-broken", "alice")
+        held(store, credits(1), "b-good", "bob")
+        indexed_account(store, sweep_account, 1_000_000, "carol")
+        rpc.token_accounts[sweep_account] = 1_000_000
+        assert store.queue_deposit_account("dave") is True
+        engine = PayoutEngine(store, rpc, config(tmp_path), backend=backend)
+
+        with caplog.at_level("ERROR", logger="nak-treasury"):
+            engine.poll_once()
+
+        assert row(store, "a-broken")["state"] == "pending"
+        assert row(store, "b-good")["state"] == "sent"
+        assert store._db.execute(
+            "SELECT state FROM chain_sweeps WHERE token_account=?",
+            (sweep_account,),
+        ).fetchone()[0] == "sent"
+        assert store._db.execute(
+            "SELECT token_account FROM deposit_accounts WHERE operator='dave'"
+        ).fetchone()[0] == BLOCKHASHES[0]
+        assert "injected transition failure" in caplog.text
 
 
 @pytest.mark.parametrize(

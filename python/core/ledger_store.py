@@ -392,6 +392,16 @@ class LedgerStore:
                     ('pending','approved','sent','finalized','released','expired')),
                 tx_sig TEXT UNIQUE,
                 approval_ref TEXT,
+                approval_ts INTEGER,
+                approval_expires_ts INTEGER,
+                approved_withdrawal_id TEXT,
+                approved_amount INTEGER,
+                approved_address TEXT,
+                presence_attempts INTEGER NOT NULL DEFAULT 0,
+                expiry_count INTEGER NOT NULL DEFAULT 0,
+                blockhash TEXT,
+                last_valid_block_height INTEGER,
+                tx_wire TEXT,
                 created_ts INTEGER NOT NULL CHECK(typeof(created_ts) = 'integer'),
                 updated_ts INTEGER NOT NULL CHECK(typeof(updated_ts) = 'integer')
             );
@@ -434,6 +444,7 @@ class LedgerStore:
                 request_id TEXT UNIQUE,
                 enqueue_attempted INTEGER NOT NULL DEFAULT 0
                     CHECK(enqueue_attempted IN (0, 1)),
+                broker_result_json TEXT,
                 expires_ts INTEGER NOT NULL
                     CHECK(typeof(expires_ts) = 'integer' AND expires_ts >= 0),
                 created_ts INTEGER NOT NULL CHECK(typeof(created_ts) = 'integer'),
@@ -1288,6 +1299,10 @@ class LedgerStore:
         }
         for name, definition in (
             ("approval_ts", "INTEGER"),
+            ("approval_expires_ts", "INTEGER"),
+            ("approved_withdrawal_id", "TEXT"),
+            ("approved_amount", "INTEGER"),
+            ("approved_address", "TEXT"),
             ("presence_attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("expiry_count", "INTEGER NOT NULL DEFAULT 0"),
             ("blockhash", "TEXT"),
@@ -1298,6 +1313,17 @@ class LedgerStore:
                 self._db.execute(
                     f"ALTER TABLE withdrawals ADD COLUMN {name} {definition}"
                 )
+        presence_columns = {
+            str(row[1])
+            for row in self._db.execute(
+                "PRAGMA table_info(withdrawal_presence_requests)"
+            )
+        }
+        if "broker_result_json" not in presence_columns:
+            self._db.execute(
+                "ALTER TABLE withdrawal_presence_requests "
+                "ADD COLUMN broker_result_json TEXT"
+            )
 
     def _migrate_task_holds_for_disputes(self) -> None:
         """Rebuild the task table when its schema predates disputes or funding.
@@ -3460,31 +3486,85 @@ class LedgerStore:
                 ).fetchone()[0]
             )
 
-    def withdraw_approve(self, withdrawal_id: str, approval_ref: str) -> int:
-        """Move one pending hold to approved, preserving the approval reference."""
+    def withdraw_approve(
+        self,
+        withdrawal_id: str,
+        approval_ref: str,
+        *,
+        expires_ts: int | None = None,
+        approved_withdrawal_id: str | None = None,
+        approved_amount: int | None = None,
+        approved_address: str | None = None,
+    ) -> int:
+        """Approve a hold and durably retain every human-approval binding."""
         withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
         approval_ref = _identifier(approval_ref, "approval_ref")
-        now = int(time.time())
+        human = approval_ref.startswith("human:")
+        if human:
+            approved_withdrawal_id = _identifier(
+                approved_withdrawal_id, "approved_withdrawal_id"
+            )
+            approved_amount = _amount(approved_amount)
+            approved_address = _identifier(approved_address, "approved_address")
+            if (
+                isinstance(expires_ts, bool)
+                or not isinstance(expires_ts, int)
+                or expires_ts < 0
+                or expires_ts > 2 ** 63 - 1
+            ):
+                raise LedgerValueError("expires_ts is invalid")
+        elif any(
+            value is not None
+            for value in (
+                expires_ts,
+                approved_withdrawal_id,
+                approved_amount,
+                approved_address,
+            )
+        ):
+            raise LedgerValueError("automatic approval cannot carry human bindings")
+        now = self._now()
 
         def operation(db: sqlite3.Connection) -> int:
             row = db.execute(
-                "SELECT amount, state, approval_ref FROM withdrawals WHERE id=?",
+                "SELECT amount, address, state, approval_ref, approval_expires_ts, "
+                "approved_withdrawal_id, approved_amount, approved_address "
+                "FROM withdrawals WHERE id=?",
                 (withdrawal_id,),
             ).fetchone()
             if row is None:
                 raise WithdrawalStateError(
                     f"withdrawal {withdrawal_id!r} does not exist"
                 )
-            if row["state"] == "approved" and row["approval_ref"] == approval_ref:
+            if row["state"] in {"approved", "expired"} and (
+                row["approval_ref"] == approval_ref
+                and row["approval_expires_ts"] == expires_ts
+                and row["approved_withdrawal_id"] == approved_withdrawal_id
+                and row["approved_amount"] == approved_amount
+                and row["approved_address"] == approved_address
+            ):
                 return int(row["amount"])
-            if row["state"] != "pending":
+            if row["state"] not in {"pending", "expired"}:
                 raise WithdrawalStateError(
                     f"withdrawal {withdrawal_id!r} is {row['state']} and cannot approve"
                 )
+            if human and (
+                approved_withdrawal_id != withdrawal_id
+                or int(approved_amount) != int(row["amount"])
+                or approved_address != row["address"]
+                or int(expires_ts) < now
+            ):
+                raise WithdrawalStateError("human approval does not match withdrawal")
+            next_state = "expired" if row["state"] == "expired" else "approved"
             db.execute(
-                "UPDATE withdrawals SET state='approved', approval_ref=?, "
-                "approval_ts=?, updated_ts=? WHERE id=?",
-                (approval_ref, now, now, withdrawal_id),
+                "UPDATE withdrawals SET state=?, approval_ref=?, approval_ts=?, "
+                "approval_expires_ts=?, approved_withdrawal_id=?, approved_amount=?, "
+                "approved_address=?, updated_ts=? WHERE id=?",
+                (
+                    next_state, approval_ref, now, expires_ts,
+                    approved_withdrawal_id, approved_amount, approved_address,
+                    now, withdrawal_id,
+                ),
             )
             db.execute(
                 "DELETE FROM withdrawal_presence_requests WHERE withdrawal_id=?",
@@ -3494,17 +3574,87 @@ class LedgerStore:
 
         return self._tx(operation)
 
+    def withdraw_require_fresh_approval(
+        self, withdrawal_id: str, now: int
+    ) -> bool:
+        """Clear an expired/invalid human approval without releasing its hold."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        if isinstance(now, bool) or not isinstance(now, int) or now < 0:
+            raise LedgerValueError("now must be a non-negative integer")
+
+        def operation(db: sqlite3.Connection) -> bool:
+            row = db.execute(
+                "SELECT id, amount, address, state, approval_ref, "
+                "approval_expires_ts, approved_withdrawal_id, approved_amount, "
+                "approved_address FROM withdrawals WHERE id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if row is None:
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} does not exist"
+                )
+            if row["state"] not in {"approved", "expired"}:
+                return False
+            if not str(row["approval_ref"] or "").startswith("human:"):
+                return False
+            valid = (
+                row["approved_withdrawal_id"] == row["id"]
+                and row["approved_amount"] == row["amount"]
+                and row["approved_address"] == row["address"]
+                and isinstance(row["approval_expires_ts"], int)
+                and now <= int(row["approval_expires_ts"])
+            )
+            if valid:
+                return False
+            next_state = "pending" if row["state"] == "approved" else "expired"
+            db.execute(
+                "UPDATE withdrawals SET state=?, approval_ref=NULL, approval_ts=NULL, "
+                "approval_expires_ts=NULL, approved_withdrawal_id=NULL, "
+                "approved_amount=NULL, approved_address=NULL, updated_ts=? WHERE id=?",
+                (next_state, self._now(), withdrawal_id),
+            )
+            return True
+
+        return self._tx(operation)
+
+    def withdrawal_approval_valid(self, withdrawal_id: str, now: int) -> bool:
+        """Re-read and validate the approval immediately before a money action."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        if isinstance(now, bool) or not isinstance(now, int) or now < 0:
+            raise LedgerValueError("now must be a non-negative integer")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT id, amount, address, state, approval_ref, "
+                "approval_expires_ts, approved_withdrawal_id, approved_amount, "
+                "approved_address FROM withdrawals WHERE id=?",
+                (withdrawal_id,),
+            ).fetchone()
+        if row is None or row["state"] not in {"approved", "expired", "sent"}:
+            return False
+        reference = str(row["approval_ref"] or "")
+        if not reference:
+            return False
+        if not reference.startswith("human:"):
+            return True
+        return bool(
+            row["approved_withdrawal_id"] == row["id"]
+            and row["approved_amount"] == row["amount"]
+            and row["approved_address"] == row["address"]
+            and isinstance(row["approval_expires_ts"], int)
+            and now <= int(row["approval_expires_ts"])
+        )
+
     def withdraw_presence_attempt(self, withdrawal_id: str) -> int:
         """Count one unanswered/declined human approval request."""
         withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
-        now = int(time.time())
+        now = self._now()
 
         def operation(db: sqlite3.Connection) -> int:
             row = db.execute(
                 "SELECT state, presence_attempts FROM withdrawals WHERE id=?",
                 (withdrawal_id,),
             ).fetchone()
-            if row is None or row["state"] != "pending":
+            if row is None or row["state"] not in {"pending", "expired"}:
                 state = "missing" if row is None else row["state"]
                 raise WithdrawalStateError(
                     f"withdrawal {withdrawal_id!r} is {state} and cannot record presence"
@@ -3548,14 +3698,14 @@ class LedgerStore:
             or expires_ts > 2 ** 63 - 1
         ):
             raise LedgerValueError("expires_ts is invalid")
-        now = int(time.time())
+        now = self._now()
 
         def operation(db: sqlite3.Connection) -> dict[str, Any]:
             withdrawal = db.execute(
                 "SELECT amount, address, state FROM withdrawals WHERE id=?",
                 (withdrawal_id,),
             ).fetchone()
-            if withdrawal is None or withdrawal["state"] != "pending":
+            if withdrawal is None or withdrawal["state"] not in {"pending", "expired"}:
                 state = "missing" if withdrawal is None else withdrawal["state"]
                 raise WithdrawalStateError(
                     f"withdrawal {withdrawal_id!r} is {state} and cannot request presence"
@@ -3637,30 +3787,65 @@ class LedgerStore:
 
     def withdraw_presence_mark_enqueue_attempted(
         self, withdrawal_id: str
-    ) -> dict[str, Any]:
-        """Fence the one allowed broker POST before making the network call."""
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically elect exactly one caller to make the broker POST."""
         withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
-        now = int(time.time())
+        now = self._now()
 
-        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+        def operation(db: sqlite3.Connection) -> tuple[dict[str, Any], bool]:
             row = db.execute(
                 "SELECT * FROM withdrawal_presence_requests WHERE withdrawal_id=?",
                 (withdrawal_id,),
             ).fetchone()
             if row is None:
                 raise WithdrawalStateError("presence request does not exist")
-            if not int(row["enqueue_attempted"]):
-                db.execute(
-                    "UPDATE withdrawal_presence_requests SET enqueue_attempted=1, "
-                    "updated_ts=? WHERE withdrawal_id=?",
-                    (now, withdrawal_id),
-                )
-            return dict(
+            won = db.execute(
+                "UPDATE withdrawal_presence_requests SET enqueue_attempted=1, "
+                "updated_ts=? WHERE withdrawal_id=? AND enqueue_attempted=0",
+                (now, withdrawal_id),
+            ).rowcount == 1
+            current = dict(
                 db.execute(
                     "SELECT * FROM withdrawal_presence_requests WHERE withdrawal_id=?",
                     (withdrawal_id,),
                 ).fetchone()
             )
+            return current, won
+
+        return self._tx(operation)
+
+    def withdraw_presence_store_result(
+        self, withdrawal_id: str, result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Durably save the broker's one-shot signed response before verification."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        if not isinstance(result, Mapping):
+            raise LedgerValueError("broker result must be an object")
+        try:
+            encoded = json.dumps(
+                dict(result), sort_keys=True, separators=(",", ":"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise LedgerValueError("broker result is not JSON serializable") from exc
+        now = self._now()
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            row = db.execute(
+                "SELECT broker_result_json FROM withdrawal_presence_requests "
+                "WHERE withdrawal_id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if row is None:
+                raise WithdrawalStateError("presence request does not exist")
+            if row["broker_result_json"] not in (None, encoded):
+                raise WithdrawalStateError("presence request already has another result")
+            if row["broker_result_json"] is None:
+                db.execute(
+                    "UPDATE withdrawal_presence_requests SET broker_result_json=?, "
+                    "updated_ts=? WHERE withdrawal_id=?",
+                    (encoded, now, withdrawal_id),
+                )
+            return json.loads(encoded)
 
         return self._tx(operation)
 

@@ -1593,13 +1593,35 @@ class Reconciler:
             attempt_states = [attempt["state"] for attempt in own_attempts]
             state = row["state"]
             approval_absent = (
-                row.get("approval_ref") is None and row.get("approval_ts") is None
+                row.get("approval_ref") is None
+                and row.get("approval_ts") is None
+                and row.get("approval_expires_ts") is None
+                and row.get("approved_withdrawal_id") is None
+                and row.get("approved_amount") is None
+                and row.get("approved_address") is None
             )
             approval_present = (
                 isinstance(row.get("approval_ref"), str)
                 and bool(row["approval_ref"])
                 and isinstance(row.get("approval_ts"), int)
             )
+            if approval_present and str(row["approval_ref"]).startswith("human:"):
+                approval_present = (
+                    isinstance(row.get("approval_expires_ts"), int)
+                    and row.get("approved_withdrawal_id") == withdrawal_id
+                    and row.get("approved_amount") == amount
+                    and row.get("approved_address") == row["address"]
+                )
+            elif approval_present:
+                approval_present = all(
+                    row.get(field) is None
+                    for field in (
+                        "approval_expires_ts",
+                        "approved_withdrawal_id",
+                        "approved_amount",
+                        "approved_address",
+                    )
+                )
             transaction_absent = all(
                 row.get(field) is None
                 for field in (

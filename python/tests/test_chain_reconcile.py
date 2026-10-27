@@ -414,7 +414,11 @@ def test_all_withdrawal_states_require_exact_hold_lifecycle(tmp_path, corruption
     with _ledger(path) as store:
         store.withdraw_hold("alice", amount, OWNER, "withdrawal-a")
         if corruption == "approved_without_hold":
-            store.withdraw_approve("withdrawal-a", "human:test")
+            store.withdraw_approve(
+                "withdrawal-a", "human:test", expires_ts=4_000_000_000,
+                approved_withdrawal_id="withdrawal-a", approved_amount=amount,
+                approved_address=OWNER,
+            )
         else:
             store.withdraw_release("withdrawal-a")
         # Preserve zero-sum while recreating the reviewer's corrupted state.
@@ -452,7 +456,11 @@ def test_pending_approved_sent_expired_released_lifecycle_states(tmp_path):
             assert _check(report, "withdrawal_lifecycle")["ok"] is True
 
         assert_match()
-        store.withdraw_approve("withdrawal-a", "human:test")
+        store.withdraw_approve(
+            "withdrawal-a", "human:test", expires_ts=4_000_000_000,
+            approved_withdrawal_id="withdrawal-a", approved_amount=amount,
+            approved_address=OWNER,
+        )
         assert_match()
         store.withdraw_mark_sent(
             "withdrawal-a", "signature-a", "blockhash-a", 1000, "wire-a"

@@ -86,6 +86,10 @@ class PayoutError(RuntimeError):
     """A payout operation was refused or could not be built safely."""
 
 
+class SafetyGateError(PayoutError):
+    """A mutable global safety gate stopped all money movement in this pass."""
+
+
 def _credits_for_usdc(value: str | Decimal, name: str) -> int:
     try:
         amount = Decimal(value)
@@ -681,7 +685,7 @@ class WriteGatePresence:
                 }
         if not request.get("_allow_new_enqueue"):
             return request
-        if int(time.time()) >= int(request["expires_ts"]):
+        if int(time.time()) > int(request["expires_ts"]):
             return request
         enqueued = write_gate._broker_call(
             "POST",
@@ -706,34 +710,49 @@ class WriteGatePresence:
         }
 
     @staticmethod
-    def check(request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """Perform one broker read and locally verify any returned signature."""
-        if int(time.time()) >= int(request["expires_ts"]):
-            return "expired", {"error": "presence request expired"}
+    def recover(request: dict[str, Any], wait_s: int) -> dict[str, Any]:
+        """Recover an elected caller's ambiguous POST without issuing another."""
+        return WriteGatePresence.enqueue(
+            {**request, "_allow_new_enqueue": False}, wait_s
+        )
+
+    @staticmethod
+    def fetch(request: dict[str, Any]) -> dict[str, Any]:
+        """Read the broker result once; the caller persists it before verification."""
+        if int(time.time()) > int(request["expires_ts"]):
+            return {"status": "expired", "error": "presence request expired"}
         request_id = request.get("request_id")
         if not request_id:
-            return "pending", {}
+            return {"status": "pending"}
         write_gate = _write_gate()
-        result = write_gate._broker_call(
+        return write_gate._broker_call(
             "GET", f"/result?request_id={request_id}"
         )
+
+    @staticmethod
+    def verify(
+        request: dict[str, Any], result: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]]:
+        """Re-verify a raw persisted result without trusting broker state."""
         status = result.get("status")
         if status == "pending":
             return "pending", result
+        if status == "expired":
+            return "expired", result
         if status == "declined":
             return "denied", result
         if status != "signed" or not result.get("signature"):
             # unknown/consumed is ambiguous until the locally recorded request
             # expires.  Ambiguity can never approve or trigger a second request.
             return "pending", result
-        if int(time.time()) >= int(request["expires_ts"]):
+        if int(time.time()) > int(request["expires_ts"]):
             return "expired", {"error": "approval arrived after expiry"}
-        verified = write_gate.eg.verify_and_consume(
+        write_gate = _write_gate()
+        verified = write_gate.eg.verify_signature_only(
             request["keyid"],
-            request["nonce"],
+            request["challenge"],
             result["signature"],
             signer_keyid=result.get("signer"),
-            description=request["description"],
         )
         if not verified.get("ok"):
             return "denied", {
@@ -776,15 +795,26 @@ class _ImmediatePresence:
     def enqueue(request: dict[str, Any], _wait_s: int) -> dict[str, Any]:
         return {**request, "request_id": f"injected:{request['withdrawal_id']}"}
 
-    def check(self, request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def fetch(self, request: dict[str, Any]) -> dict[str, Any]:
         ok, detail = self.results.pop(str(request["withdrawal_id"]))
         if not ok:
-            return "denied", detail if isinstance(detail, dict) else {}
+            return {
+                "status": "declined",
+                **(detail if isinstance(detail, dict) else {}),
+            }
         granted = dict(detail) if isinstance(detail, dict) else {}
         granted.setdefault("withdrawal_id", request["withdrawal_id"])
         granted.setdefault("amount", int(request["amount"]))
         granted.setdefault("address", request["address"])
-        return "approved", granted
+        return {"status": "signed", "granted": granted}
+
+    @staticmethod
+    def verify(
+        _request: dict[str, Any], result: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]]:
+        if result.get("status") == "signed":
+            return "approved", dict(result.get("granted") or {})
+        return "denied", result
 
 
 class PayoutEngine:
@@ -827,20 +857,22 @@ class PayoutEngine:
     def _may_act(self) -> None:
         """Recheck every mutable safety gate immediately before an RPC write."""
         if not self.config.enabled:
-            raise PayoutError("NAK_FUNDS is disabled")
+            raise SafetyGateError("NAK_FUNDS is disabled")
         if (
             self.config.require_live_funds_env
             and os.environ.get("NAK_FUNDS", "off") != "on"
         ):
-            raise PayoutError("NAK_FUNDS is no longer on")
+            raise SafetyGateError("NAK_FUNDS is no longer on")
         if self.config.kill_file.exists():
-            raise PayoutError(f"payout kill file present: {self.config.kill_file}")
+            raise SafetyGateError(
+                f"payout kill file present: {self.config.kill_file}"
+            )
         expected = (
             self.config.devnet_genesis if self.config.cluster == "devnet" else None
         )
         genesis = DepositIndexer._pin_rpc(self.rpc, expected, "payout action")
         if genesis == MAINNET_GENESIS_HASH or genesis != self.genesis_hash:
-            raise PayoutError("payout RPC genesis changed or is mainnet-beta")
+            raise SafetyGateError("payout RPC genesis changed or is mainnet-beta")
 
     @staticmethod
     def _description(row: dict[str, Any]) -> str:
@@ -887,128 +919,169 @@ class PayoutEngine:
     def _approve_pending(self, frozen_operators: set[str]) -> int:
         changed = 0
         for row in self.store.withdrawals(
-            "pending", exclude_operators=frozen_operators
+            "pending", "expired", exclude_operators=frozen_operators
         ):
-            if int(row["presence_attempts"]) >= 2:
-                self.store.withdraw_release(row["id"])
-                changed += 1
+            if row["state"] == "expired" and row.get("approval_ref"):
                 continue
-            today = self.store.approved_withdrawal_total_since(self._midnight_utc())
-            automatic = (
-                int(row["amount"]) <= self.config.auto_cap
-                and today + int(row["amount"]) <= self.config.day_cap
-            )
-            if automatic:
-                self.store.withdraw_approve(row["id"], "auto:devnet-caps-v1")
-                changed += 1
-                continue
-            if not self.config.enabled:
-                LOG.info("DRY-RUN human approval required for %s", row["id"])
-                continue
-            request = self.store.withdrawal_presence(row["id"])
-            freshly_prepared = request is None
-            if request is None:
-                try:
-                    prepared = self.presence.prepare(
-                        row, self._description(row), self.config.presence_wait_s
-                    )
-                    request = self.store.withdraw_begin_presence(
-                        row["id"],
-                        int(row["amount"]),
-                        str(row["address"]),
-                        prepared["keyid"],
-                        prepared["nonce"],
-                        prepared["challenge"],
-                        prepared["description"],
-                        int(prepared["expires_ts"]),
+            try:
+                changed += self._approve_one(row)
+            except Exception:
+                LOG.exception(
+                    "withdrawal approval step failed withdrawal=%s", row["id"]
+                )
+        return changed
+
+    def _refresh_approval_lifetimes(self) -> int:
+        """Return stale human approvals to the ordinary approval path."""
+        changed = 0
+        for row in self.store.withdrawals("approved", "expired"):
+            try:
+                if self.store.withdraw_require_fresh_approval(
+                    row["id"], int(getattr(self, "now", time.time)())
+                ):
+                    LOG.info(
+                        "withdrawal %s requires a fresh human approval", row["id"]
                     )
                     changed += 1
-                except Exception:
-                    LOG.exception(
-                        "presence request failed withdrawal=%s", row["id"]
-                    )
-                    continue
-            if (
-                request["withdrawal_id"] != row["id"]
-                or int(request["amount"]) != int(row["amount"])
-                or request["address"] != row["address"]
-                or request["description"] != self._description(row)
-            ):
-                LOG.error("presence binding mismatch withdrawal=%s", row["id"])
-                attempts = self.store.withdraw_presence_attempt(row["id"])
-                if attempts >= 2:
-                    self.store.withdraw_release(row["id"])
-                changed += 1
-                continue
-            if int(self.now()) >= int(request["expires_ts"]):
-                attempts = self.store.withdraw_presence_attempt(row["id"])
-                if attempts >= 2:
-                    self.store.withdraw_release(row["id"])
-                changed += 1
-                continue
-            try:
-                allow_new_enqueue = not bool(request["enqueue_attempted"])
-                if allow_new_enqueue:
-                    request = self.store.withdraw_presence_mark_enqueue_attempted(
-                        row["id"]
-                    )
-                enqueued = self.presence.enqueue(
-                    {**request, "_allow_new_enqueue": allow_new_enqueue},
-                    self.config.presence_wait_s,
-                )
-                if enqueued.get("request_id") and not request.get("request_id"):
-                    request = self.store.withdraw_presence_enqueued(
-                        row["id"],
-                        str(enqueued["request_id"]),
-                        int(enqueued["expires_ts"]),
-                    )
-                else:
-                    request = enqueued
             except Exception:
                 LOG.exception(
-                    "presence enqueue failed withdrawal=%s", row["id"]
+                    "withdrawal approval lifetime check failed withdrawal=%s",
+                    row["id"],
                 )
-                continue
-            if freshly_prepared and not getattr(self.presence, "immediate", False):
-                continue
-            try:
-                status, granted = self.presence.check(request)
-            except Exception:
-                LOG.exception(
-                    "presence check failed withdrawal=%s", row["id"]
-                )
-                continue
-            if status == "pending":
-                continue
-            matching = (
-                isinstance(granted, dict)
-                and granted.get("withdrawal_id") == row["id"]
-                and granted.get("amount") == int(row["amount"])
-                and granted.get("address") == row["address"]
-            )
-            if status == "approved" and matching:
-                if isinstance(granted, dict):
-                    reference = (
-                        granted.get("challenge")
-                        or granted.get("signature")
-                        or granted.get("signer")
-                        or "presence"
-                    )
-                else:
-                    reference = "presence"
-                self.store.withdraw_approve(row["id"], f"human:{reference}")
-                changed += 1
-            else:
-                if status == "approved":
-                    LOG.error(
-                        "presence approval binding mismatch withdrawal=%s",
-                        row["id"],
-                    )
-                attempts = self.store.withdraw_presence_attempt(row["id"])
-                if attempts >= 2:
-                    self.store.withdraw_release(row["id"])
-                changed += 1
         return changed
+
+    def _approve_one(self, row: dict[str, Any]) -> int:
+        changed = 0
+        if int(row["presence_attempts"]) >= 2:
+            self.store.withdraw_release(row["id"])
+            return 1
+        today = self.store.approved_withdrawal_total_since(self._midnight_utc())
+        automatic = (
+            int(row["amount"]) <= self.config.auto_cap
+            and today + int(row["amount"]) <= self.config.day_cap
+        )
+        if automatic:
+            self.store.withdraw_approve(row["id"], "auto:devnet-caps-v1")
+            return 1
+        if not self.config.enabled:
+            LOG.info("DRY-RUN human approval required for %s", row["id"])
+            return 0
+        request = self.store.withdrawal_presence(row["id"])
+        freshly_prepared = request is None
+        if request is None:
+            prepared = self.presence.prepare(
+                row, self._description(row), self.config.presence_wait_s
+            )
+            request = self.store.withdraw_begin_presence(
+                row["id"],
+                int(row["amount"]),
+                str(row["address"]),
+                prepared["keyid"],
+                prepared["nonce"],
+                prepared["challenge"],
+                prepared["description"],
+                int(prepared["expires_ts"]),
+            )
+            changed += 1
+        if (
+            request["withdrawal_id"] != row["id"]
+            or int(request["amount"]) != int(row["amount"])
+            or request["address"] != row["address"]
+            or request["description"] != self._description(row)
+        ):
+            LOG.error("presence binding mismatch withdrawal=%s", row["id"])
+            attempts = self.store.withdraw_presence_attempt(row["id"])
+            if attempts >= 2:
+                self.store.withdraw_release(row["id"])
+            return changed + 1
+        if int(self.now()) > int(request["expires_ts"]):
+            attempts = self.store.withdraw_presence_attempt(row["id"])
+            if attempts >= 2:
+                self.store.withdraw_release(row["id"])
+            return changed + 1
+        allow_new_enqueue = False
+        if not bool(request["enqueue_attempted"]):
+            request, allow_new_enqueue = (
+                self.store.withdraw_presence_mark_enqueue_attempted(row["id"])
+            )
+        if request.get("request_id"):
+            enqueued = request
+        elif allow_new_enqueue:
+            enqueued = self.presence.enqueue(
+                {**request, "_allow_new_enqueue": True},
+                self.config.presence_wait_s,
+            )
+        elif hasattr(self.presence, "recover"):
+            enqueued = self.presence.recover(
+                request, self.config.presence_wait_s
+            )
+        else:
+            enqueued = request
+        if enqueued.get("request_id") and not request.get("request_id"):
+            request = self.store.withdraw_presence_enqueued(
+                row["id"],
+                str(enqueued["request_id"]),
+                int(enqueued["expires_ts"]),
+            )
+        else:
+            request = enqueued
+        if freshly_prepared and not getattr(self.presence, "immediate", False):
+            return changed
+
+        stored_result = request.get("broker_result_json")
+        if stored_result is not None:
+            result = json.loads(stored_result)
+        elif hasattr(self.presence, "fetch"):
+            result = self.presence.fetch(request)
+            if result.get("status") == "signed":
+                # /result is one-shot. This durable write must precede every
+                # signature check and approval state transition.
+                result = self.store.withdraw_presence_store_result(
+                    row["id"], result
+                )
+        else:
+            # Compatibility for deterministic adapters from before the split
+            # fetch/verify interface. Production WriteGatePresence never uses it.
+            status, granted = self.presence.check(request)
+            result = {"status": status, "granted": granted}
+
+        if hasattr(self.presence, "verify"):
+            status, granted = self.presence.verify(request, result)
+        else:
+            status = str(result.get("status"))
+            granted = dict(result.get("granted") or {})
+        if status == "pending":
+            return changed
+        matching = (
+            isinstance(granted, dict)
+            and granted.get("withdrawal_id") == row["id"]
+            and granted.get("amount") == int(row["amount"])
+            and granted.get("address") == row["address"]
+        )
+        if status == "approved" and matching:
+            reference = (
+                granted.get("challenge")
+                or granted.get("signature")
+                or granted.get("signer")
+                or "presence"
+            )
+            self.store.withdraw_approve(
+                row["id"],
+                f"human:{reference}",
+                expires_ts=int(request["expires_ts"]),
+                approved_withdrawal_id=str(request["withdrawal_id"]),
+                approved_amount=int(request["amount"]),
+                approved_address=str(request["address"]),
+            )
+            return changed + 1
+        if status == "approved":
+            LOG.error(
+                "presence approval binding mismatch withdrawal=%s", row["id"]
+            )
+        attempts = self.store.withdraw_presence_attempt(row["id"])
+        if attempts >= 2:
+            self.store.withdraw_release(row["id"])
+        return changed + 1
 
     def _create_deposit_accounts(self) -> int:
         changed = 0
@@ -1269,11 +1342,27 @@ class PayoutEngine:
         )
 
     def _build_and_send(self, row: dict[str, Any]) -> int:
+        now = int(self.now())
+        if self.store.withdraw_require_fresh_approval(row["id"], now):
+            LOG.info("withdrawal %s requires a fresh human approval", row["id"])
+            return 1
+        if not self.store.withdrawal_approval_valid(row["id"], now):
+            LOG.error("withdrawal %s has no valid bound approval", row["id"])
+            return 0
         ata = self._ensure_recipient_ata(row["address"])
         latest = self.rpc.get_latest_blockhash()
         micro_usdc, remainder = divmod(int(row["amount"]), RATE)
         if remainder:
             raise PayoutError("withdrawal credits are not an exact micro-USDC amount")
+        # Check both the mutable process gates and the durable human approval
+        # immediately before the treasury key is asked to sign.
+        self._may_act()
+        now = int(self.now())
+        if self.store.withdraw_require_fresh_approval(row["id"], now):
+            LOG.info("withdrawal %s approval expired before signing", row["id"])
+            return 1
+        if not self.store.withdrawal_approval_valid(row["id"], now):
+            return 0
         signed = self._backend().build_transfer(
             row["address"],
             ata,
@@ -1290,6 +1379,16 @@ class PayoutEngine:
             signed.wire_b64,
         )
         try:
+            # Signing can straddle the approval deadline. Never send a newly
+            # signed transaction after its exact authorization has expired.
+            if not self.store.withdrawal_approval_valid(
+                row["id"], int(self.now())
+            ):
+                LOG.warning(
+                    "withdrawal %s approval expired after signing; not broadcast",
+                    row["id"],
+                )
+                return 1
             self._may_act()
             returned = self.rpc.send_transaction(signed.wire_b64)
             if returned != signed.signature:
@@ -1324,6 +1423,9 @@ class PayoutEngine:
             status = self.rpc.get_signature_status(row["tx_sig"])
             if status is None:
                 self.store.withdraw_mark_expired(row["id"])
+                self.store.withdraw_require_fresh_approval(
+                    row["id"], int(getattr(self, "now", time.time)())
+                )
                 return 1
             if status.get("err") is not None:
                 if status.get("confirmationStatus") == "finalized":
@@ -1338,6 +1440,15 @@ class PayoutEngine:
             # Status tracking above still runs; only a (re)broadcast moves value out.
             LOG.info(
                 "withdrawal %s rebroadcast skipped because its roster key is suspended",
+                row["id"],
+            )
+            return 0
+        if not self.store.withdrawal_approval_valid(
+            row["id"], int(getattr(self, "now", time.time)())
+        ):
+            LOG.info(
+                "withdrawal %s rebroadcast withheld until its signed transaction "
+                "expires; human approval is no longer valid",
                 row["id"],
             )
             return 0
@@ -1371,8 +1482,9 @@ class PayoutEngine:
                 withdrawal_id,
             )
 
-        changed += self._approve_pending(frozen_operators)
+        changed += PayoutEngine._refresh_approval_lifetimes(self)
         if not self.config.enabled:
+            changed += self._approve_pending(frozen_operators)
             for row in self.store.withdrawals(
                 "approved", "expired", exclude_operators=frozen_operators
             ):
@@ -1387,21 +1499,45 @@ class PayoutEngine:
         for row in self.store.withdrawals(
             "sent", exclude_operators=frozen_operators
         ):
-            changed += self._advance_sent(
-                row, frozen=str(row["operator"]) in frozen_operators
-            )
+            try:
+                changed += self._advance_sent(
+                    row, frozen=str(row["operator"]) in frozen_operators
+                )
+            except SafetyGateError:
+                raise
+            except Exception:
+                LOG.exception(
+                    "withdrawal sent step failed withdrawal=%s", row["id"]
+                )
+        # Sent attempts are resolved first so a transaction that aged out while
+        # the daemon was down can re-enter the normal approval path this pass.
+        changed += self._approve_pending(frozen_operators)
         for row in self.store.withdrawals(
             "expired", exclude_operators=frozen_operators
         ):
-            if int(row["expiry_count"]) >= MAX_EXPIRIES:
-                self.store.withdraw_release(row["id"])
-                changed += 1
-            else:
-                changed += self._build_and_send(row)
+            try:
+                if int(row["expiry_count"]) >= MAX_EXPIRIES:
+                    self.store.withdraw_release(row["id"])
+                    changed += 1
+                else:
+                    changed += self._build_and_send(row)
+            except SafetyGateError:
+                raise
+            except Exception:
+                LOG.exception(
+                    "withdrawal retry step failed withdrawal=%s", row["id"]
+                )
         for row in self.store.withdrawals(
             "approved", exclude_operators=frozen_operators
         ):
-            changed += self._build_and_send(row)
+            try:
+                changed += self._build_and_send(row)
+            except SafetyGateError:
+                raise
+            except Exception:
+                LOG.exception(
+                    "withdrawal send step failed withdrawal=%s", row["id"]
+                )
         return changed
 
 
