@@ -259,15 +259,37 @@ def _load_signing_key(path: Path) -> ed25519.Ed25519PrivateKey:
         raise ReconcileError("report signing key is not a valid Ed25519 seed") from exc
 
 
-def _load_grandfathered_hold_ids(path: Path) -> frozenset[str]:
+@dataclass(frozen=True)
+class GrandfatheredHold:
+    hold_id: str
+    amount: int
+    payer_account: str
+    worker_account: str
+
+
+def _load_grandfathered_holds(path: Path) -> dict[str, GrandfatheredHold]:
     """Read an operator-pinned exception list without following links."""
+    try:
+        parent = path.parent.stat()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise ReconcileError(
+            f"could not inspect grandfathered task hold directory {path.parent}: {exc}"
+        ) from exc
+    parent_mode = stat.S_IMODE(parent.st_mode)
+    if not stat.S_ISDIR(parent.st_mode) or parent_mode & 0o022:
+        raise ReconcileError(
+            f"grandfathered task hold directory mode is {parent_mode:04o}; "
+            "a real, non-group/world-writable directory is required"
+        )
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
-        return frozenset()
+        return {}
     except OSError as exc:
         raise ReconcileError(
             f"could not open grandfathered task hold file {path}: {exc}"
@@ -284,6 +306,11 @@ def _load_grandfathered_hold_ids(path: Path) -> frozenset[str]:
                 f"grandfathered task hold file mode is {mode:04o}; "
                 "group/world write access is forbidden"
             )
+        if info.st_uid != os.getuid():
+            raise ReconcileError(
+                f"grandfathered task hold file is owned by uid {info.st_uid}; "
+                f"expected current uid {os.getuid()}"
+            )
         raw = os.read(fd, 1_048_577)
     finally:
         os.close(fd)
@@ -295,19 +322,459 @@ def _load_grandfathered_hold_ids(path: Path) -> frozenset[str]:
         raise ReconcileError(
             "grandfathered task hold file must contain ASCII text"
         ) from exc
-    hold_ids: set[str] = set()
+    holds: dict[str, GrandfatheredHold] = {}
     for line_number, raw_line in enumerate(text.splitlines(), 1):
-        hold_id = raw_line.split("#", 1)[0].strip()
-        if not hold_id:
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
             continue
+        fields = line.split()
+        if len(fields) != 4:
+            raise ReconcileError(
+                f"invalid grandfathered hold on line {line_number} of {path}; "
+                "expected: hold_id amount payer_account worker_account"
+            )
+        hold_id, raw_amount, payer_account, worker_account = fields
         if len(hold_id) != 32 or any(
             character not in "0123456789abcdef" for character in hold_id
         ):
             raise ReconcileError(
                 f"invalid hold id on line {line_number} of {path}"
             )
-        hold_ids.add(hold_id)
-    return frozenset(hold_ids)
+        try:
+            amount = int(raw_amount)
+        except ValueError as exc:
+            raise ReconcileError(
+                f"invalid amount on line {line_number} of {path}"
+            ) from exc
+        if amount <= 0 or str(amount) != raw_amount:
+            raise ReconcileError(
+                f"invalid amount on line {line_number} of {path}"
+            )
+        entry = GrandfatheredHold(
+            hold_id, amount, payer_account, worker_account
+        )
+        if hold_id in holds:
+            raise ReconcileError(
+                f"duplicate hold id on line {line_number} of {path}"
+            )
+        holds[hold_id] = entry
+    return holds
+
+
+def _replay_funding_backed_balance(
+    ledger: dict[str, Any], operator: str, authorization_seq: int,
+    authorized_at: int,
+) -> int:
+    """Replay the store's funding-backed balance immediately before one debit.
+
+    This intentionally uses only raw ledger tables and journal ordering.  It does
+    not use ``economic_receipts`` or any LedgerStore calculation, keeping the
+    reconciliation proof independent from the implementation it audits.
+    """
+    prior = [
+        row for row in ledger["journal"]
+        if int(row["seq"]) < authorization_seq
+    ]
+    by_seq = {int(row["seq"]): row for row in prior}
+
+    def detail(row: dict[str, Any]) -> dict[str, Any]:
+        try:
+            value = json.loads(row["detail"])
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    balance = sum(
+        int(row["amount"]) for row in prior if row["account"] == operator
+    )
+
+    deposit_journals = {
+        (detail(row).get("ref"), row["account"], int(row["amount"]))
+        for row in prior if row["kind"] == "deposit"
+    }
+    deposited = sum(
+        int(row["amount"])
+        for row in ledger["chain_refs"]
+        if row["kind"] == "deposit"
+        and row["account"] == operator
+        and (row["ref"], row["account"], int(row["amount"])) in deposit_journals
+    )
+
+    withdrawal_events: dict[str, set[str]] = {}
+    for row in prior:
+        if row["kind"] not in {"withdraw_hold", "withdraw", "withdraw_release"}:
+            continue
+        withdrawal_id = detail(row).get("withdrawal_id")
+        if isinstance(withdrawal_id, str):
+            withdrawal_events.setdefault(withdrawal_id, set()).add(str(row["kind"]))
+    withdrawn = 0
+    held = 0
+    for row in ledger["withdrawals"]:
+        if row["operator"] != operator:
+            continue
+        events = withdrawal_events.get(str(row["id"]), set())
+        if "withdraw_hold" not in events:
+            continue
+        if "withdraw" in events:
+            withdrawn += int(row["amount"])
+        elif "withdraw_release" not in events:
+            held += int(row["amount"])
+
+    journals_by_receipt: dict[str | None, list[dict[str, Any]]] = {}
+    for row in prior:
+        journals_by_receipt.setdefault(row["receipt_id"], []).append(row)
+
+    legacy_projection = {
+        row["receipt_id"]: int(row["funded"])
+        for row in ledger["legacy_funding_projection"]
+    }
+    legacy_earnings = 0
+    legacy_spending = 0
+    for receipt in ledger["receipts"]:
+        receipt_id = receipt["receipt_id"]
+        rows = journals_by_receipt.get(receipt_id, [])
+        earns = [row for row in rows if row["kind"] == "earn"]
+        spends = [row for row in rows if row["kind"] == "spend"]
+        disputed = any(
+            row["kind"] in {"dispute_clawback", "dispute_refund"}
+            for row in rows
+        )
+        charged = int(receipt["charged"])
+        exact_spend = (
+            (charged == 0 and not spends)
+            or (
+                len(spends) == 1
+                and spends[0]["account"] == receipt["requester"]
+                and spends[0]["counterparty"] is None
+                and int(spends[0]["amount"]) == -charged
+                and int(spends[0]["ts"]) == int(receipt["created_at"])
+            )
+        )
+        if (
+            receipt["state"] == "legacy_unsigned"
+            or legacy_projection.get(receipt_id) != 1
+            or disputed
+            or not exact_spend
+        ):
+            continue
+        if receipt["requester"] == operator:
+            legacy_spending += charged
+        legacy_earnings += sum(
+            int(row["amount"])
+            for row in earns
+            if row["account"] == operator
+            and int(row["amount"]) > 0
+            and authorized_at > int(row["ts"]) + HOLD_S
+        )
+
+    spend_holds = {row["hold_id"]: row for row in ledger["spend_holds"]}
+    spend_disputed_before: set[str] = set()
+    for row in prior:
+        if row["kind"] in {"spend_dispute_clawback", "spend_dispute_refund"}:
+            hold_id = detail(row).get("hold_id")
+            if isinstance(hold_id, str):
+                spend_disputed_before.add(hold_id)
+
+    def spend_terminal_before(hold: dict[str, Any]) -> bool:
+        terminal = hold["terminal_at"]
+        if terminal is None:
+            return False
+        if int(terminal) < authorized_at:
+            return True
+        hold_id = str(hold["hold_id"])
+        if any(
+            isinstance(row["receipt_id"], str)
+            and row["receipt_id"].startswith(f"spend-release:{hold_id}:")
+            for row in prior
+        ):
+            return True
+        return any(
+            row["hold_id"] == hold_id
+            and bool(row["final"])
+            and int(row["accepted_at"]) == int(terminal)
+            and (
+                row["credit_journal_seq"] is None
+                or int(row["credit_journal_seq"]) < authorization_seq
+            )
+            for row in ledger["spend_usage_receipts"]
+        )
+
+    v2_earnings = 0
+    spend_spending = 0
+    spend_economic = {
+        row["receipt_id"]: row for row in ledger["spend_economic_receipts"]
+    }
+    usage = {row["receipt_id"]: row for row in ledger["spend_usage_receipts"]}
+    workers = {
+        (row["hold_id"], row["worker_keyid"]): row
+        for row in ledger["spend_hold_workers"]
+    }
+    for hold_id, hold in spend_holds.items():
+        auth_rows = journals_by_receipt.get(f"spend-authorize:{hold_id}", [])
+        if (
+            hold["payer_account_at_authorize"] != operator
+            or int(hold["funded"]) != 1
+            or not any(row["kind"] == "spend_authorize_debit" for row in auth_rows)
+            or hold_id in spend_disputed_before
+        ):
+            continue
+        accepted = sum(
+            int(row["amount"])
+            for row in ledger["spend_economic_receipts"]
+            if row["hold_id"] == hold_id
+            and row["credit_journal_seq"] is not None
+            and int(row["credit_journal_seq"]) < authorization_seq
+        )
+        spend_spending += accepted if spend_terminal_before(hold) else int(hold["max_cost"])
+
+    for receipt_id, economic in spend_economic.items():
+        stored = usage.get(receipt_id)
+        if stored is None or int(stored["accepted_delta"]) <= 0:
+            continue
+        hold = spend_holds.get(stored["hold_id"])
+        worker = workers.get((stored["hold_id"], stored["worker_keyid"]))
+        debit_seq = stored["debit_journal_seq"]
+        credit_seq = stored["credit_journal_seq"]
+        if (
+            hold is None or worker is None or int(hold["funded"]) != 1
+            or stored["hold_id"] in spend_disputed_before
+            or not spend_terminal_before(hold)
+            or hold["terminal_at"] is None
+            or authorized_at <= int(hold["terminal_at"]) + HOLD_S
+            or debit_seq is None or credit_seq is None
+            or int(debit_seq) not in by_seq or int(credit_seq) not in by_seq
+        ):
+            continue
+        try:
+            receipt = json.loads(stored["receipt_json"])
+            if not isinstance(receipt, dict) or set(receipt) != SPEND_USAGE_FIELDS:
+                continue
+            canonical = json.dumps(
+                receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
+            unsigned = {key: value for key, value in receipt.items() if key != "receipt_id"}
+            expected_id = "sha256:" + hashlib.sha256(
+                SPEND_RECEIPT_DOMAIN
+                + json.dumps(
+                    unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                ).encode()
+            ).hexdigest()
+            if (
+                canonical != stored["receipt_json"]
+                or receipt["receipt_id"] != receipt_id
+                or expected_id != receipt_id
+            ):
+                continue
+            ed25519.Ed25519PublicKey.from_public_bytes(
+                bytes.fromhex(str(stored["worker_keyid"]))
+            ).verify(bytes.fromhex(str(stored["signature"])), canonical.encode())
+        except Exception:
+            continue
+        immutable = {
+            "v": 2,
+            "kind": "nakshatra-worker-usage",
+            "hold_id": stored["hold_id"],
+            "claim_response_sha256": worker["claim_response_sha256"],
+            "payer_keyid": hold["payer_keyid"],
+            "payer_account_at_authorize": hold["payer_account_at_authorize"],
+            "worker_keyid": stored["worker_keyid"],
+            "worker_account_at_authorize": worker["worker_account_at_authorize"],
+            "billable": bool(worker["billable"]),
+            "session_id": hold["session_id"],
+            "model_id": hold["model_id"],
+            "billing_mode": hold["billing_mode"],
+            "layer_start": int(worker["layer_start"]),
+            "layer_end": int(worker["layer_end"]),
+        }
+        columns = {
+            "sequence": receipt.get("sequence"),
+            "cumulative_prompt_tokens": receipt.get("cumulative_prompt_tokens"),
+            "cumulative_generated_tokens": receipt.get("cumulative_generated_tokens"),
+            "cumulative_token_layers": receipt.get("cumulative_token_layers"),
+            "cumulative_cost": receipt.get("cumulative_cost"),
+            "final": int(bool(receipt.get("final"))),
+        }
+        if (
+            any(receipt.get(field) != value for field, value in immutable.items())
+            or any(stored[field] != value for field, value in columns.items())
+        ):
+            continue
+        try:
+            sequence = int(receipt["sequence"])
+            prompt = int(receipt["cumulative_prompt_tokens"])
+            generated = int(receipt["cumulative_generated_tokens"])
+            token_layers = (prompt + generated) * int(worker["layers"])
+            cost = token_layers * int(worker["price_multiplier"]) if worker["billable"] else 0
+            previous = next(
+                (
+                    row for row in ledger["spend_usage_receipts"]
+                    if row["hold_id"] == stored["hold_id"]
+                    and row["worker_keyid"] == stored["worker_keyid"]
+                    and int(row["sequence"]) == sequence - 1
+                ),
+                None,
+            ) if sequence > 1 else None
+            if sequence < 1 or (
+                sequence > 1
+                and (
+                    previous is None
+                    or prompt != int(previous["cumulative_prompt_tokens"])
+                    or generated < int(previous["cumulative_generated_tokens"])
+                )
+            ):
+                continue
+            previous_cost = 0 if previous is None else int(previous["cumulative_cost"])
+            amount = cost - previous_cost
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            prompt < 0 or generated < 0 or amount <= 0
+            or token_layers != int(stored["cumulative_token_layers"])
+            or cost != int(stored["cumulative_cost"])
+            or amount != int(stored["accepted_delta"])
+            or cost > int(worker["max_cost"])
+            or token_layers > int(worker["max_token_layers"])
+            or not isinstance(receipt.get("work_completed_at"), int)
+            or int(receipt["work_completed_at"]) < int(worker["claimed_at"] or 0)
+            or int(receipt["work_completed_at"]) > int(hold["execution_deadline"])
+        ):
+            continue
+        debit = by_seq[int(debit_seq)]
+        credit = by_seq[int(credit_seq)]
+        expected_detail = json.dumps(
+            {
+                "hold_id": stored["hold_id"],
+                "worker_keyid": stored["worker_keyid"],
+                "sequence": sequence,
+                "cumulative_cost": cost,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if (
+            economic["worker_account"] == operator
+            and economic["hold_id"] == hold["hold_id"]
+            and economic["payer_account"] == hold["payer_account_at_authorize"]
+            and int(economic["amount"]) == amount
+            and int(economic["funded"]) == 1
+            and int(economic["earned_at"]) == int(stored["accepted_at"])
+            and economic["hold_terminal_at"] == hold["terminal_at"]
+            and economic["matures_at"] is not None
+            and int(economic["matures_at"]) == int(hold["terminal_at"]) + HOLD_S
+            and economic["debit_journal_seq"] == debit_seq
+            and economic["credit_journal_seq"] == credit_seq
+            and debit["kind"] == "spend_settle_debit"
+            and debit["receipt_id"] == receipt_id
+            and debit["account"] == hold["escrow_account"]
+            and debit["counterparty"] == worker["worker_account_at_authorize"]
+            and int(debit["amount"]) == -amount
+            and int(debit["ts"]) == int(stored["accepted_at"])
+            and debit["detail"] == expected_detail
+            and credit["kind"] == "spend_earn"
+            and credit["receipt_id"] == receipt_id
+            and credit["account"] == operator
+            and credit["counterparty"] == hold["escrow_account"]
+            and int(credit["amount"]) == amount
+            and int(credit["ts"]) == int(stored["accepted_at"])
+            and credit["detail"] == expected_detail
+            and len(journals_by_receipt.get(receipt_id, [])) == 2
+        ):
+            v2_earnings += amount
+
+    task_holds = {row["hold_id"]: row for row in ledger["task_holds"]}
+    refunded_tasks: set[str] = set()
+    for row in prior:
+        if row["kind"] in {
+            "task_refund_credit", "refund_after_submit",
+            "task_dispute_refund_credit",
+        }:
+            hold_id = detail(row).get("hold_id")
+            if isinstance(hold_id, str):
+                refunded_tasks.add(hold_id)
+    task_spending = 0
+    for hold_id, hold in task_holds.items():
+        auth_rows = journals_by_receipt.get(f"task-authorize:{hold_id}", [])
+        if (
+            hold["payer_account"] == operator
+            and int(hold["funded"]) == 1
+            and hold_id not in refunded_tasks
+            and any(row["kind"] == "task_authorize_debit" for row in auth_rows)
+        ):
+            task_spending += int(hold["amount"])
+
+    task_earnings = 0
+    for earning in ledger["task_earnings"]:
+        hold = task_holds.get(earning["hold_id"])
+        debit = by_seq.get(int(earning["debit_journal_seq"]))
+        credit = by_seq.get(int(earning["credit_journal_seq"]))
+        if (
+            hold is None or debit is None or credit is None
+            or int(hold["funded"]) != 1
+            or hold["worker_account"] != operator
+            or authorized_at <= int(earning["matures_at"])
+        ):
+            continue
+        event_id = f"task-pay:{hold['hold_id']}"
+        valid_details = {
+            json.dumps(
+                {"hold_id": hold["hold_id"]}, sort_keys=True, separators=(",", ":")
+            ),
+            json.dumps(
+                {"hold_id": hold["hold_id"], "paid_by_silence": True},
+                sort_keys=True, separators=(",", ":"),
+            ),
+        }
+        if hold["resolved_outcome"] == "pay":
+            valid_details.add(json.dumps(
+                {
+                    "hold_id": hold["hold_id"], "resolved_by": "operator",
+                    "dispute_reason": hold["dispute_reason"],
+                    "resolution_reason": hold["resolution_reason"],
+                },
+                sort_keys=True, separators=(",", ":"),
+            ))
+        elif hold["disputed_at"] is not None:
+            valid_details.add(json.dumps(
+                {
+                    "hold_id": hold["hold_id"], "dispute_backstop": True,
+                    "dispute_reason": hold["dispute_reason"],
+                },
+                sort_keys=True, separators=(",", ":"),
+            ))
+        escrow_balance = sum(
+            int(row["amount"])
+            for row in prior if row["account"] == hold["escrow_account"]
+        )
+        if (
+            hold["state"] == "paid"
+            and hold["terminal_at"] == earning["earned_at"]
+            and int(earning["matures_at"]) == int(earning["earned_at"]) + HOLD_S
+            and escrow_balance == 0
+            and debit["kind"] == "task_pay_debit"
+            and debit["receipt_id"] == event_id
+            and debit["account"] == hold["escrow_account"]
+            and debit["counterparty"] == operator
+            and int(debit["amount"]) == -int(hold["amount"])
+            and int(debit["ts"]) == int(earning["earned_at"])
+            and debit["detail"] in valid_details
+            and credit["kind"] == "task_earn"
+            and credit["receipt_id"] == event_id
+            and credit["account"] == operator
+            and credit["counterparty"] == hold["escrow_account"]
+            and int(credit["amount"]) == int(hold["amount"])
+            and int(credit["ts"]) == int(earning["earned_at"])
+            and credit["detail"] == debit["detail"]
+            and len(journals_by_receipt.get(event_id, [])) == 2
+        ):
+            task_earnings += int(hold["amount"])
+
+    entitlement = max(
+        0,
+        deposited - withdrawn - held
+        + legacy_earnings + v2_earnings + task_earnings
+        - legacy_spending - spend_spending - task_spending,
+    )
+    return max(0, min(balance, entitlement))
 
 
 def sign_report(report: dict[str, Any], key_path: Path) -> dict[str, Any]:
@@ -1293,9 +1760,10 @@ class Reconciler:
     @staticmethod
     def _spend_checks(
         ledger: dict[str, Any],
-        grandfathered_hold_ids: frozenset[str] = frozenset(),
+        grandfathered_holds: dict[str, GrandfatheredHold] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Independently reconcile N2 receipts, pricing, escrow, and maturity."""
+        grandfathered_holds = grandfathered_holds or {}
         errors: dict[str, list[str]] = {
             "spend_usage_linkage": [],
             "spend_pricing": [],
@@ -1997,28 +2465,6 @@ class Reconciler:
                 "task earning rows do not exactly and bidirectionally match paid holds"
             )
 
-        # Replay journal balances up to (but not including) each authorization
-        # debit. This is the historical funding rule used before task holds had
-        # an immutable funded snapshot: starter credit is spendable, but it is
-        # not deposit-backed funding.
-        running_task_balances: dict[str, int] = {}
-        starter_task_credits: dict[str, int] = {}
-        task_backed_before_seq: dict[int, int] = {}
-        for journal in ledger["journal"]:
-            account = str(journal["account"])
-            if journal["kind"] == "task_authorize_debit":
-                task_backed_before_seq[int(journal["seq"])] = (
-                    running_task_balances.get(account, 0)
-                    - starter_task_credits.get(account, 0)
-                )
-            running_task_balances[account] = (
-                running_task_balances.get(account, 0) + int(journal["amount"])
-            )
-            if journal["kind"] == "starter_receive":
-                starter_task_credits[account] = (
-                    starter_task_credits.get(account, 0) + int(journal["amount"])
-                )
-
         accepted_grandfathers: dict[str, int] = {}
         for hold_id, hold in paid_task_holds.items():
             economic_id = f"task:{hold_id}"
@@ -2054,11 +2500,13 @@ class Reconciler:
             )
             reconstructed_funded: bool | None = None
             if authorization_ok:
-                backed_before = task_backed_before_seq.get(
-                    int(authorization_debits[0]["seq"])
+                backed_before = _replay_funding_backed_balance(
+                    ledger,
+                    str(hold["payer_account"]),
+                    int(authorization_debits[0]["seq"]),
+                    int(hold["authorized_at"]),
                 )
-                if backed_before is not None:
-                    reconstructed_funded = backed_before >= int(hold["amount"])
+                reconstructed_funded = backed_before >= int(hold["amount"])
             if reconstructed_funded is None:
                 authorization_ok = False
                 errors["economic_receipt_view"].append(
@@ -2066,18 +2514,25 @@ class Reconciler:
                 )
 
             stored_funded = int(hold["funded"])
-            listed = hold_id in grandfathered_hold_ids
+            listed_entry = grandfathered_holds.get(hold_id)
+            listed = listed_entry is not None
             grandfather_eligible = (
                 authorization_ok
                 and stored_funded == 1
                 and reconstructed_funded is False
             )
             if listed:
-                if grandfather_eligible:
+                entry_matches = (
+                    listed_entry.amount == int(hold["amount"])
+                    and listed_entry.payer_account == hold["payer_account"]
+                    and listed_entry.worker_account == hold["worker_account"]
+                )
+                if grandfather_eligible and entry_matches:
                     accepted_grandfathers[hold_id] = int(hold["amount"])
                 else:
                     errors["economic_receipt_view"].append(
-                        f"{economic_id}: grandfather list entry is stale or not eligible"
+                        f"{economic_id}: grandfather list entry is stale, mismatched, "
+                        "or not eligible"
                     )
             elif authorization_ok and stored_funded != int(reconstructed_funded):
                 errors["economic_receipt_view"].append(
@@ -2194,7 +2649,7 @@ class Reconciler:
                 errors["economic_receipt_view"].append(
                     f"{economic_id}: task economic projection differs from hold provenance"
                 )
-        for hold_id in sorted(grandfathered_hold_ids - set(paid_task_holds)):
+        for hold_id in sorted(set(grandfathered_holds) - set(paid_task_holds)):
             errors["economic_receipt_view"].append(
                 f"task:{hold_id}: grandfather list entry has no paid task hold"
             )
@@ -2333,7 +2788,11 @@ class Reconciler:
                 # Pre-marker v1 earns used the literal empty object. This is safe
                 # only with the independently verified projection: cashability
                 # reads legacy_funding_projection and never reads this marker.
-                absent_legacy_marker = earn["detail"] == "{}" and projection_ok
+                absent_legacy_marker = (
+                    earn["detail"] == "{}"
+                    and projection_ok
+                    and int(projection["funded"]) == 0
+                )
                 if (
                     not absent_legacy_marker
                     and marker != {"funded": reconstructed_funded}
@@ -2457,7 +2916,7 @@ class Reconciler:
         ledger: dict[str, Any],
         chain: dict[str, Any],
         statuses: dict[str, dict[str, Any] | None],
-        grandfathered_hold_ids: frozenset[str],
+        grandfathered_holds: dict[str, GrandfatheredHold],
         *,
         generated: int,
         attempt: int,
@@ -2497,7 +2956,7 @@ class Reconciler:
             deposit_errors.extend(lag)
             lag = []
         spend_checks, grandfathered_task_holds = self._spend_checks(
-            ledger, grandfathered_hold_ids
+            ledger, grandfathered_holds
         )
         balances = {row["id"]: int(row["balance"]) for row in ledger["accounts"]}
         treasury_balance = balances.get(TREASURY_ACCOUNT, 0)
@@ -2662,7 +3121,7 @@ class Reconciler:
     def collect(self) -> dict[str, Any]:
         """Collect a stable proof without writing balances or operational files."""
         generated = int(self.now())
-        grandfathered_hold_ids = _load_grandfathered_hold_ids(
+        grandfathered_holds = _load_grandfathered_holds(
             self.config.grandfathered_holds_file
         )
         baseline = self._ledger_snapshot()
@@ -2697,7 +3156,7 @@ class Reconciler:
                     ledger,
                     after,
                     statuses,
-                    grandfathered_hold_ids,
+                    grandfathered_holds,
                     generated=generated,
                     attempt=attempt,
                     before_slot=int(before["slot"]),
@@ -2726,7 +3185,7 @@ class Reconciler:
                 baseline,
                 after,
                 statuses,
-                grandfathered_hold_ids,
+                grandfathered_holds,
                 generated=generated,
                 attempt=self.config.snapshot_attempts,
                 before_slot=int(before["slot"]),

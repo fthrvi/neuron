@@ -74,12 +74,15 @@ path, and `nak-credit-reconciliation-v1` purpose inside the signed payload.
 
 Paid task holds that predate the immutable `funded` snapshot must be named explicitly in
 `~/.config/nakshatra/reconcile-grandfathered-holds.txt`, or in the file selected by
-`--grandfathered-holds-file PATH` / `NAK_RECONCILE_GRANDFATHERED_HOLDS`. Put one lowercase
-32-hex hold id on each line; blank lines and `#` comments are allowed. A missing file is
-an empty list. Reconciliation refuses a symlink or a group/world-writable file, reconstructs
-each paid hold's funding decision from its authorization journal provenance, and accepts a
-listed id only when the stored migration default is `funded=1` but reconstruction is
-unfunded. Missing, unpaid, already-matching, or otherwise ineligible entries are mismatches.
+`--grandfathered-holds-file PATH` / `NAK_RECONCILE_GRANDFATHERED_HOLDS`. Each line has
+`hold_id amount payer_account worker_account`; the id is 32 lowercase hex, blank lines and
+`#` comments are allowed, and all four fields must exactly match the paid hold. A missing
+file is an empty list. Reconciliation refuses a symlink, a file not owned by the current
+user, or a file or parent directory that is group/world-writable. It reconstructs each
+paid hold's funding decision from the complete deposit, withdrawal, matured-earning, and
+funded-spending provenance at authorization. A listed row is accepted only when the stored
+migration default is `funded=1` but reconstruction is unfunded. Missing, unpaid,
+already-matching, mismatched, or otherwise ineligible entries are mismatches.
 The accepted ids and amounts are included in the signed report. This exception file is an
 operator-pinned migration record: after an entry is retired it should be removed, and the
 list should only ever shrink.

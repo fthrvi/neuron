@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import random
 import shutil
 import sqlite3
 import sys
@@ -14,7 +15,11 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from chain.reconcile import ReconcileError, Reconciler  # noqa: E402
+from chain.reconcile import (  # noqa: E402
+    ReconcileError,
+    Reconciler,
+    _replay_funding_backed_balance,
+)
 from core.ledger_store import (  # noqa: E402
     HOLD_S,
     CreditLimitError,
@@ -855,6 +860,34 @@ def test_present_wrong_legacy_marker_still_fails(
     assert any("funded marker" in error for error in view["errors"])
 
 
+def test_empty_legacy_marker_is_rejected_for_funded_projection(tmp_path):
+    path = tmp_path / "funded-empty-marker.sqlite"
+    clock = [7_100_000]
+    with LedgerStore(path, clock=lambda: clock[0]) as store:
+        store._db.execute(
+            "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
+            "VALUES ('payer', ?, 1)", (VAULT,),
+        )
+        store.deposit_batch("payer", VAULT, [("funded-marker", 500, 1)], 500)
+        store.settle("funded-receipt", "payer", {"worker": 100}, 100, "self")
+        assert store._db.execute(
+            "SELECT funded FROM legacy_funding_projection "
+            "WHERE receipt_id='funded-receipt'"
+        ).fetchone()[0] == 1
+        store._db.execute("DROP TRIGGER journal_no_update")
+        store._db.execute(
+            "UPDATE journal SET detail='{}' WHERE receipt_id='funded-receipt' "
+            "AND kind='earn'"
+        )
+
+    report = Reconciler(path, FakeReconcileRPC({VAULT: 5}), _config(tmp_path)).collect()
+    assert report["outcome"] == "mismatch"
+    assert any(
+        "funded marker" in error
+        for error in _check(report, "economic_receipt_view")["errors"]
+    )
+
+
 @pytest.mark.parametrize("mutation", ["missing", "mismatching"])
 def test_empty_legacy_marker_requires_matching_projection(
     tmp_path, legacy_task_reconcile_fixture, mutation
@@ -966,6 +999,15 @@ def _write_grandfather_file(config, contents):
     config.grandfathered_holds_file.chmod(0o600)
 
 
+def _grandfather_line(path, hold_id):
+    with sqlite3.connect(path) as db:
+        amount, payer, worker = db.execute(
+            "SELECT amount, payer_account, worker_account FROM task_holds "
+            "WHERE hold_id=?", (hold_id,),
+        ).fetchone()
+    return f"{hold_id} {amount} {payer} {worker}"
+
+
 def test_task_funded_flip_requires_explicit_grandfather(
     tmp_path, legacy_task_reconcile_fixture
 ):
@@ -983,6 +1025,32 @@ def test_task_funded_flip_requires_explicit_grandfather(
     assert any("stored task funding differs" in error for error in view["errors"])
 
 
+def test_transferred_unbacked_balance_does_not_forge_task_funding(tmp_path):
+    path = tmp_path / "transferred-unbacked.sqlite"
+    clock = [7_200_000]
+    with LedgerStore(path, clock=lambda: clock[0]) as store:
+        store.transfer("source", "payer", 200, "self")
+        hold = store.authorize_task_hold(
+            payer_keyid="payer-key", payer_account="payer", tier="self",
+            client_nonce="transfer-funded", task_hash="3" * 64,
+            worker_keyid="worker-key", worker_account="worker", amount=100,
+            deadline=clock[0] + 60,
+        )
+        assert hold["funded"] == 0
+        store.pay_task_hold(hold["hold_id"], "payer-key")
+
+    clean = Reconciler(path, FakeReconcileRPC({VAULT: 0}), _config(tmp_path)).collect()
+    assert clean["outcome"] == "match", clean
+
+    _flip_task_funded(path, hold["hold_id"])
+    forged = Reconciler(path, FakeReconcileRPC({VAULT: 0}), _config(tmp_path)).collect()
+    assert forged["outcome"] == "mismatch"
+    assert any(
+        "stored task funding differs" in error
+        for error in _check(forged, "economic_receipt_view")["errors"]
+    )
+
+
 def test_explicit_grandfather_is_reported_and_accepts_only_funded_migration(
     tmp_path, legacy_task_reconcile_fixture
 ):
@@ -990,7 +1058,9 @@ def test_explicit_grandfather_is_reported_and_accepts_only_funded_migration(
     _flip_task_funded(legacy_task_reconcile_fixture, hold_id)
     config = _config(tmp_path)
     _write_grandfather_file(
-        config, f"# migration exception\n{hold_id}  # verified hold\n"
+        config,
+        f"# migration exception\n{_grandfather_line(legacy_task_reconcile_fixture, hold_id)}"
+        "  # verified hold\n",
     )
     _write_key(config.signing_key)
 
@@ -1019,7 +1089,11 @@ def test_stale_grandfather_entry_is_a_mismatch(
     else:
         hold_id = _paid_task_id(legacy_task_reconcile_fixture, 1)
     config = _config(tmp_path)
-    _write_grandfather_file(config, f"{hold_id}\n")
+    if entry == "missing":
+        line = f"{hold_id} 1 missing-payer missing-worker"
+    else:
+        line = _grandfather_line(legacy_task_reconcile_fixture, hold_id)
+    _write_grandfather_file(config, line + "\n")
 
     report = Reconciler(
         legacy_task_reconcile_fixture,
@@ -1027,6 +1101,29 @@ def test_stale_grandfather_entry_is_a_mismatch(
         config,
     ).collect()
 
+    assert report["outcome"] == "mismatch"
+    assert any(
+        "grandfather list entry" in error
+        for error in _check(report, "economic_receipt_view")["errors"]
+    )
+
+
+@pytest.mark.parametrize("field", ["amount", "payer", "worker"])
+def test_grandfather_entry_must_match_all_hold_fields(
+    tmp_path, legacy_task_reconcile_fixture, field
+):
+    hold_id = _paid_task_id(legacy_task_reconcile_fixture, 0)
+    _flip_task_funded(legacy_task_reconcile_fixture, hold_id)
+    line = _grandfather_line(legacy_task_reconcile_fixture, hold_id).split()
+    line[{"amount": 1, "payer": 2, "worker": 3}[field]] = {
+        "amount": "81", "payer": "wrong-payer", "worker": "wrong-worker",
+    }[field]
+    config = _config(tmp_path)
+    _write_grandfather_file(config, " ".join(line) + "\n")
+
+    report = Reconciler(
+        legacy_task_reconcile_fixture, FakeReconcileRPC({VAULT: 100}), config
+    ).collect()
     assert report["outcome"] == "mismatch"
     assert any(
         "grandfather list entry" in error
@@ -1101,9 +1198,11 @@ def test_task_authorization_journal_is_verified(
     )
 
 
-@pytest.mark.parametrize("unsafe", ["symlink", "world_writable"])
+@pytest.mark.parametrize(
+    "unsafe", ["symlink", "world_writable", "writable_parent", "wrong_owner"]
+)
 def test_grandfather_file_must_be_operator_safe(
-    tmp_path, legacy_task_reconcile_fixture, unsafe
+    tmp_path, legacy_task_reconcile_fixture, unsafe, monkeypatch
 ):
     config = _config(tmp_path)
     target = tmp_path / "grandfather-target.txt"
@@ -1112,9 +1211,15 @@ def test_grandfather_file_must_be_operator_safe(
         config.grandfathered_holds_file.symlink_to(target)
     else:
         config.grandfathered_holds_file.write_text("# empty\n", encoding="ascii")
-        config.grandfathered_holds_file.chmod(0o666)
+        config.grandfathered_holds_file.chmod(0o600)
+        if unsafe == "world_writable":
+            config.grandfathered_holds_file.chmod(0o666)
+        elif unsafe == "writable_parent":
+            tmp_path.chmod(0o777)
+        elif unsafe == "wrong_owner":
+            monkeypatch.setattr(os, "getuid", lambda: os.stat(target).st_uid + 1)
 
-    with pytest.raises(ReconcileError, match="grandfathered task hold file"):
+    with pytest.raises(ReconcileError, match="grandfathered task hold"):
         Reconciler(
             legacy_task_reconcile_fixture,
             FakeReconcileRPC({VAULT: 100}),
@@ -1122,16 +1227,149 @@ def test_grandfather_file_must_be_operator_safe(
         ).collect()
 
 
+@pytest.mark.parametrize("seed", range(8))
+def test_seeded_funding_replay_matches_authorization_snapshots(tmp_path, seed):
+    """Cross-check the independent replay against real authorization decisions."""
+    rng = random.Random(seed)
+    seed_dir = tmp_path / f"history-{seed}"
+    seed_dir.mkdir()
+    path = seed_dir / "ledger.sqlite"
+    clock = [8_000_000 + seed * 100_000]
+    with LedgerStore(path, clock=lambda: clock[0]) as store:
+        store._db.execute(
+            "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
+            "VALUES ('bank', ?, 1)", (VAULT,),
+        )
+        deposit = 20_000 + rng.randrange(5_000)
+        store.deposit_batch("bank", VAULT, [(f"deposit-{seed}", deposit, seed)], deposit)
+
+        # Transfers and starter grants increase balance but never entitlement.
+        store.transfer("bank", "transfer-payer", 300 + rng.randrange(100), "self")
+        store.grant_starter(
+            f"invite-{seed}", "bank", "starter-payer", f"starter-key-{seed}",
+            100 + rng.randrange(50), "self", "known",
+        )
+        for label, payer in (
+            ("transfer", "transfer-payer"), ("starter", "starter-payer")
+        ):
+            result = store.authorize_task_hold(
+                payer_keyid=f"{label}-key-{seed}", payer_account=payer, tier="self",
+                client_nonce=f"{label}-{seed}",
+                task_hash=("1" if label == "transfer" else "2") * 64,
+                worker_keyid=f"{label}-worker-key-{seed}",
+                worker_account=f"{label}-worker-{seed}", amount=50,
+                deadline=clock[0] + 60,
+            )
+            assert result["funded"] == 0
+
+        # A funded task earning is not backing until strictly after maturity.
+        earning = store.authorize_task_hold(
+            payer_keyid=f"bank-key-{seed}", payer_account="bank", tier="self",
+            client_nonce=f"earning-{seed}", task_hash="3" * 64,
+            worker_keyid=f"earner-key-{seed}", worker_account=f"earner-{seed}",
+            amount=200 + rng.randrange(50), deadline=clock[0] + 60,
+        )
+        store.pay_task_hold(earning["hold_id"], f"bank-key-{seed}")
+        before_maturity = store.authorize_task_hold(
+            payer_keyid=f"earner-key-{seed}", payer_account=f"earner-{seed}", tier="self",
+            client_nonce=f"unmatured-{seed}", task_hash="4" * 64,
+            worker_keyid=f"early-worker-key-{seed}", worker_account=f"early-worker-{seed}",
+            amount=40, deadline=clock[0] + 60,
+        )
+        assert before_maturity["funded"] == 0
+        clock[0] += HOLD_S + 1
+        after_maturity = store.authorize_task_hold(
+            payer_keyid=f"earner-key-{seed}", payer_account=f"earner-{seed}", tier="self",
+            client_nonce=f"matured-{seed}", task_hash="5" * 64,
+            worker_keyid=f"late-worker-key-{seed}", worker_account=f"late-worker-{seed}",
+            amount=40, deadline=clock[0] + 60,
+        )
+        assert after_maturity["funded"] == 1
+
+        # Refunded holds restore both balance and unconsumed entitlement.
+        refundable = store.authorize_task_hold(
+            payer_keyid=f"bank-key-{seed}", payer_account="bank", tier="self",
+            client_nonce=f"refund-{seed}", task_hash="6" * 64,
+            worker_keyid=f"refund-worker-key-{seed}", worker_account=f"refund-worker-{seed}",
+            amount=150 + rng.randrange(50), deadline=clock[0] + 60,
+        )
+        store.refund_task_hold(
+            refundable["hold_id"], f"bank-key-{seed}", "operator_refund"
+        )
+
+        # Pending and released withdrawal holds exercise both historical states.
+        withdrawal_id = store.withdraw_hold(
+            "bank", 100 + rng.randrange(50), f"address-{seed}", f"withdrawal-{seed}"
+        )
+        store.authorize_task_hold(
+            payer_keyid=f"bank-key-{seed}", payer_account="bank", tier="self",
+            client_nonce=f"held-withdrawal-{seed}", task_hash="7" * 64,
+            worker_keyid=f"held-worker-key-{seed}", worker_account=f"held-worker-{seed}",
+            amount=30, deadline=clock[0] + 60,
+        )
+        store.withdraw_release(withdrawal_id)
+
+        # Mature legacy and v2 earnings cover all three funded earning namespaces.
+        store.settle(
+            f"legacy-{seed}", "bank", {f"legacy-earner-{seed}": 120}, 120, "self"
+        )
+        v2 = _authorize(
+            store, payer_account="bank", nonce=f"v2-{seed}", session=f"v2-{seed}",
+            tokens=20, worker_label=f"v2-worker-{seed}",
+            worker_account=f"v2-earner-{seed}",
+        )
+        _claim(store, v2["hold_id"], worker_label=f"v2-worker-{seed}")
+        _settle(
+            store,
+            _receipt(
+                store, v2["hold_id"], 5, 5, final=True,
+                worker_label=f"v2-worker-{seed}",
+            ),
+            relayer=_public(f"v2-worker-{seed}"),
+        )
+        clock[0] += HOLD_S + 1
+        for namespace, payer in (
+            ("legacy", f"legacy-earner-{seed}"),
+            ("v2", f"v2-earner-{seed}"),
+        ):
+            matured = store.authorize_task_hold(
+                payer_keyid=f"{namespace}-payer-key-{seed}", payer_account=payer,
+                tier="self", client_nonce=f"{namespace}-matured-{seed}",
+                task_hash=("8" if namespace == "legacy" else "9") * 64,
+                worker_keyid=f"{namespace}-worker-key-{seed}",
+                worker_account=f"{namespace}-worker-{seed}", amount=20,
+                deadline=clock[0] + 60,
+            )
+            assert matured["funded"] == 1
+
+    reconciler = Reconciler(path, FakeReconcileRPC({VAULT: deposit // 100}), _config(seed_dir))
+    ledger = reconciler._ledger_snapshot()
+    holds = {row["hold_id"]: row for row in ledger["task_holds"]}
+    authorization_debits = [
+        row for row in ledger["journal"] if row["kind"] == "task_authorize_debit"
+    ]
+    assert len(authorization_debits) >= 9
+    for debit in authorization_debits:
+        hold_id = debit["receipt_id"].removeprefix("task-authorize:")
+        hold = holds[hold_id]
+        replayed = _replay_funding_backed_balance(
+            ledger, hold["payer_account"], int(debit["seq"]), int(hold["authorized_at"])
+        )
+        assert int(replayed >= int(hold["amount"])) == int(hold["funded"]), (
+            seed, hold_id, replayed, hold["amount"], hold["funded"]
+        )
+
+
 LIVE_LEDGER = Path(
     "/tmp/claude-1000/-home-prithvi-trisul/"
     "61bd987d-366b-47a9-a50b-3114778d4416/scratchpad/s9/live-copy.sqlite"
 )
-LIVE_GRANDFATHERED_TASK_HOLDS = [
-    "18651685cf2b43f297a6e23d0d41f19f",
-    "7e50341708194104a981e41c8669534d",
-    "9786afd19ca14d5fa2a55374cdbdfe12",
-    "dfdf065ca1d445689a4d83cf06846e6f",
-]
+LIVE_GRANDFATHERED_TASK_HOLDS = {
+    "18651685cf2b43f297a6e23d0d41f19f": (200_000, "op-3ac68dc17064d7ab", "op-686a9540"),
+    "7e50341708194104a981e41c8669534d": (15_000_000, "self", "op-686a9540"),
+    "9786afd19ca14d5fa2a55374cdbdfe12": (1_000, "self", "op-686a9540"),
+    "dfdf065ca1d445689a4d83cf06846e6f": (20_000_000, "self", "op-686a9540"),
+}
 
 
 @pytest.mark.skipif(not LIVE_LEDGER.is_file(), reason="review ledger is unavailable")
@@ -1151,7 +1389,12 @@ def test_live_copy_requires_exact_grandfather_list(tmp_path):
     assert len(funding_errors) == 4
 
     _write_grandfather_file(
-        config, "\n".join(LIVE_GRANDFATHERED_TASK_HOLDS) + "\n"
+        config,
+        "\n".join(
+            f"{hold_id} {amount} {payer} {worker}"
+            for hold_id, (amount, payer, worker)
+            in LIVE_GRANDFATHERED_TASK_HOLDS.items()
+        ) + "\n",
     )
     with_exact = Reconciler(
         copied, FakeReconcileRPC({VAULT: 0}), config
@@ -1161,7 +1404,9 @@ def test_live_copy_requires_exact_grandfather_list(tmp_path):
     assert section["ids"] == sorted(LIVE_GRANDFATHERED_TASK_HOLDS)
     assert section["total_credits"] == 35_201_000
 
-    _write_grandfather_file(config, "f" * 32 + "\n")
+    _write_grandfather_file(
+        config, f"{'f' * 32} 1 missing-payer missing-worker\n"
+    )
     wrong = Reconciler(copied, FakeReconcileRPC({VAULT: 0}), config).collect()
     assert wrong["outcome"] == "mismatch"
 
