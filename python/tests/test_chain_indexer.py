@@ -500,13 +500,17 @@ def test_treasury_unit_avoids_user_namespace_sandboxing():
         for line in unit.splitlines()
         if line and not line.startswith("#") and "=" in line
     }
-    # Each of these makes a user manager map root-owned trust pins to nobody.
-    for directive in ("PrivateTmp", "ProtectSystem", "ProtectHome", "ReadWritePaths"):
-        assert directive not in directives
+    # Any mount-based option makes a user manager map root-owned trust pins to nobody.
+    for directive in directives:
+        assert not directive.startswith(("Private", "Protect", "Mount")), directive
+        assert not directive.endswith("Paths"), directive
+        assert directive not in {"TemporaryFileSystem", "RootDirectory", "ProcSubset"}, directive
     for directive in (
         "UMask=0077",
         "NoNewPrivileges=yes",
         "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
         "SystemCallFilter=@system-service",
+        "RestrictNamespaces=yes",
+        "SystemCallArchitectures=native",
     ):
         assert directive in unit

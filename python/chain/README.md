@@ -13,8 +13,8 @@ repository.
    before money routes are exposed.
 2. Install `nak-treasury.service` with `NAK_FUNDS=off`. Confirm its vault, mint, sweep
    minimum, caps, and kill-file path before turning funds on. Do not add mount sandboxing
-   (`PrivateTmp`, `ProtectSystem`, `ProtectHome`, `ReadWritePaths`) to this user unit: it puts
-   the worker in a user namespace where the root-owned approver pin reads as owned by
+   (`Private*`, `Protect*`, `*Paths`, `TemporaryFileSystem`, ...) to this user unit, or to any user
+   unit that calls `enclave_gate`: it puts the worker in a user namespace where the root-owned approver pin reads as owned by
    `nobody`, so every Face ID request is refused and over-cap payouts wait forever.
 3. Install `nak-reconcile.service` and `nak-reconcile.timer` last. Run the service once by
    hand, verify the signed report, then enable the daily timer.

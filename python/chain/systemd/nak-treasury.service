@@ -19,6 +19,10 @@ NoNewPrivileges=yes
 # /etc/prithvi-agent/receipt-signers.json appears owned by nobody. enclave_gate
 # then refuses every signer, so over-cap payouts can never request Face ID.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Namespace-free hardening that keeps the real root-owned pin visible.
+# (CapabilityBoundingSet= fails with 218/CAPABILITIES in a user manager.)
+RestrictNamespaces=yes
+SystemCallArchitectures=native
 LockPersonality=yes
 RestrictRealtime=yes
 SystemCallFilter=@system-service
