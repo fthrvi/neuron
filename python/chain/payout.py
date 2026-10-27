@@ -90,6 +90,10 @@ class SafetyGateError(PayoutError):
     """A mutable global safety gate stopped all money movement in this pass."""
 
 
+class _ApprovalInvalidated(PayoutError):
+    """A withdrawal approval became invalid at a broadcast boundary."""
+
+
 def _credits_for_usdc(value: str | Decimal, name: str) -> int:
     try:
         amount = Decimal(value)
@@ -682,7 +686,8 @@ class WriteGatePresence:
                     **request,
                     "request_id": candidate["request_id"],
                     "expires_ts": min(
-                        int(request["expires_ts"]), int(candidate["expires"])
+                        int(request["expires_ts"]),
+                        int(candidate.get("expires", request["expires_ts"])),
                     ),
                 }
         if not request.get("_allow_new_enqueue"):
@@ -892,15 +897,24 @@ class PayoutEngine:
         now = int(self.now())
         return now - (now % 86_400)
 
-    def _ensure_recipient_ata(self, address: str) -> str:
+    def _ensure_recipient_ata(
+        self, address: str, may_act: Callable[[], None]
+    ) -> str:
         backend = self._backend()
         ata = backend.recipient_ata(address)
         if not self.rpc.account_exists(ata):
-            created = backend.create_recipient_ata(address, self._may_act)
+            created = backend.create_recipient_ata(address, may_act)
             if created != ata:
                 raise PayoutError("recipient ATA changed during idempotent creation")
             self._wait_for_account(ata)
         return ata
+
+    def _approval_valid_after_may_act(self, row: dict[str, Any]) -> bool:
+        """Revalidate a withdrawal approval after the mutable safety gates."""
+        self._may_act()
+        return self.store.withdrawal_approval_valid(
+            row["id"], int(getattr(self, "now", time.time)())
+        )
 
     def _wait_for_account(self, address: str, timeout_s: float = 20.0) -> None:
         """Wait until a newly-created account is visible at finalized commitment."""
@@ -1354,20 +1368,36 @@ class PayoutEngine:
         if not self.store.withdrawal_approval_valid(row["id"], now):
             LOG.error("withdrawal %s has no valid bound approval", row["id"])
             return 0
-        ata = self._ensure_recipient_ata(row["address"])
+        def require_current_approval() -> None:
+            if not PayoutEngine._approval_valid_after_may_act(self, row):
+                raise _ApprovalInvalidated(
+                    f"withdrawal {row['id']} has no currently valid approval"
+                )
+
+        try:
+            ata = self._ensure_recipient_ata(row["address"], require_current_approval)
+        except _ApprovalInvalidated:
+            changed = self.store.withdraw_require_fresh_approval(
+                row["id"], int(self.now())
+            )
+            LOG.info(
+                "withdrawal %s approval expired before ATA creation",
+                row["id"],
+            )
+            return int(changed)
         latest = self.rpc.get_latest_blockhash()
         micro_usdc, remainder = divmod(int(row["amount"]), RATE)
         if remainder:
             raise PayoutError("withdrawal credits are not an exact micro-USDC amount")
         # Check both the mutable process gates and the durable human approval
         # immediately before the treasury key is asked to sign.
-        self._may_act()
-        now = int(self.now())
-        if self.store.withdraw_require_fresh_approval(row["id"], now):
+        if not PayoutEngine._approval_valid_after_may_act(self, row):
             LOG.info("withdrawal %s approval expired before signing", row["id"])
-            return 1
-        if not self.store.withdrawal_approval_valid(row["id"], now):
-            return 0
+            return int(
+                self.store.withdraw_require_fresh_approval(
+                    row["id"], int(self.now())
+                )
+            )
         signed = self._backend().build_transfer(
             row["address"],
             ata,
@@ -1386,10 +1416,7 @@ class PayoutEngine:
         try:
             # Signing can straddle the approval deadline. Never send a newly
             # signed transaction after its exact authorization has expired.
-            self._may_act()
-            if not self.store.withdrawal_approval_valid(
-                row["id"], int(getattr(self, "now", time.time)())
-            ):
+            if not PayoutEngine._approval_valid_after_may_act(self, row):
                 LOG.warning(
                     "withdrawal %s approval expired after signing; not broadcast",
                     row["id"],
@@ -1459,10 +1486,7 @@ class PayoutEngine:
             return 0
         # A crash may have happened after the durable mark and before broadcast.
         try:
-            self._may_act()
-            if not self.store.withdrawal_approval_valid(
-                row["id"], int(getattr(self, "now", time.time)())
-            ):
+            if not PayoutEngine._approval_valid_after_may_act(self, row):
                 LOG.info(
                     "withdrawal %s rebroadcast withheld because its approval "
                     "expired or changed during the safety check",

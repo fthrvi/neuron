@@ -29,7 +29,9 @@ from chain.payout import (  # noqa: E402
     PayoutProcessLock,
     SignedTransaction,
     SoldersTreasuryBackend,
+    WriteGatePresence,
 )
+import chain.payout as payout_module  # noqa: E402
 import core.ledger_store as ledger_store_module  # noqa: E402
 from core.ledger_store import (  # noqa: E402
     HOLD_S,
@@ -976,6 +978,44 @@ def test_broker_expiry_cannot_extend_persisted_local_deadline(tmp_path):
         assert request["expires_ts"] == 105
 
 
+def test_enqueue_recovery_uses_local_deadline_when_broker_omits_expiry(
+    monkeypatch,
+):
+    request = {
+        "withdrawal_id": "withdrawal-1",
+        "amount": credits(6),
+        "address": RECIPIENT,
+        "keyid": "test-owner",
+        "nonce": "nonce:withdrawal-1",
+        "challenge": "challenge:withdrawal-1",
+        "description": "approve withdrawal-1",
+        "expires_ts": 12345,
+    }
+
+    class OrdinaryBroker:
+        @staticmethod
+        def _broker_call(method, path):
+            assert method == "GET"
+            assert path == "/pending?keyid=test-owner"
+            return {
+                "requests": [
+                    {
+                        "request_id": "broker-request-1",
+                        "challenge": "challenge:withdrawal-1",
+                        "description": "approve withdrawal-1",
+                        "created": 12000,
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(payout_module, "_write_gate", lambda: OrdinaryBroker)
+
+    recovered = WriteGatePresence.recover(request, wait_s=180)
+
+    assert recovered["request_id"] == "broker-request-1"
+    assert recovered["expires_ts"] == request["expires_ts"]
+
+
 def test_signed_broker_result_survives_crash_before_verification(tmp_path):
     path = tmp_path / "one-shot-result.sqlite"
     shared = {"prepared": 0, "enqueued": 0, "fetched": 0, "verified": 0}
@@ -1308,6 +1348,39 @@ def test_new_broadcast_rechecks_approval_after_slow_safety_gate(tmp_path):
         assert engine._build_and_send(row(store)) == 1
         assert gate_calls == 2
         assert row(store)["state"] == "sent"
+        assert rpc.broadcasts == []
+
+
+def test_ata_broadcast_rechecks_approval_after_slow_safety_gate(tmp_path):
+    clock = [100]
+    rpc = FakeRPC()
+    rpc.existing_accounts.remove(RECIPIENT_ATA)
+    backend = FakeBackend(rpc)
+    with LedgerStore(
+        tmp_path / "slow-gate-ata.sqlite", clock=lambda: clock[0]
+    ) as store:
+        held(store, credits(6))
+        store.withdraw_approve(
+            "withdrawal-1",
+            "human:test",
+            expires_ts=101,
+            approved_withdrawal_id="withdrawal-1",
+            approved_amount=credits(6),
+            approved_address=RECIPIENT,
+        )
+        engine = PayoutEngine(
+            store, rpc, config(tmp_path), backend=backend, now=lambda: clock[0]
+        )
+
+        def slow_gate():
+            clock[0] = 102
+
+        engine._may_act = slow_gate
+
+        assert engine._build_and_send(row(store)) == 1
+        assert row(store)["state"] == "pending"
+        assert backend.created_atas == []
+        assert backend.builds == []
         assert rpc.broadcasts == []
 
 
