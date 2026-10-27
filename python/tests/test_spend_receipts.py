@@ -752,6 +752,197 @@ def test_legacy_funded_flag_flip_is_ineligible_and_kills_s6(tmp_path):
     assert any("funded marker" in error for error in view["errors"])
 
 
+@pytest.fixture
+def legacy_task_reconcile_fixture(tmp_path):
+    """A live-shaped ledger with pre-marker v1 earns and both task funding states."""
+    path = tmp_path / "legacy-task.sqlite"
+    clock = [7_000_000]
+    with LedgerStore(path, clock=lambda: clock[0]) as store:
+        store._db.execute(
+            "INSERT INTO deposit_accounts(operator, token_account, created_ts) "
+            "VALUES ('task-payer', ?, 1)",
+            (VAULT,),
+        )
+        store.deposit_batch(
+            "task-payer", VAULT, [("task-funding", 10_000, 1)], 10_000
+        )
+        for receipt_id, charged in (
+            ("31257cea-live-shape", 280),
+            ("bdfc57bf-live-shape", 280),
+            ("789f8804-live-shape", 168),
+        ):
+            store.settle(
+                receipt_id,
+                "self",
+                {f"legacy-worker-{receipt_id[:8]}": charged},
+                charged,
+                "self",
+            )
+
+        funded = store.authorize_task_hold(
+            payer_keyid="task-payer-key",
+            payer_account="task-payer",
+            tier="self",
+            client_nonce="funded-task",
+            task_hash="1" * 64,
+            worker_keyid="funded-worker-key",
+            worker_account="funded-task-worker",
+            amount=100,
+            deadline=clock[0] + 60,
+        )
+        assert funded["funded"] == 1
+        store.pay_task_hold(funded["hold_id"], "task-payer-key")
+
+        unfunded = store.authorize_task_hold(
+            payer_keyid="unfunded-payer-key",
+            payer_account="unfunded-payer",
+            tier="stranger",
+            client_nonce="unfunded-task",
+            task_hash="2" * 64,
+            worker_keyid="unfunded-worker-key",
+            worker_account="unfunded-task-worker",
+            amount=80,
+            deadline=clock[0] + 60,
+        )
+        assert unfunded["funded"] == 0
+        store.pay_task_hold(unfunded["hold_id"], "unfunded-payer-key")
+
+        store._db.execute("DROP TRIGGER journal_no_update")
+        store._db.execute(
+            "UPDATE journal SET detail='{}' "
+            "WHERE kind='earn' AND receipt_id LIKE '%-live-shape'"
+        )
+
+    return path
+
+
+def test_full_reconcile_accepts_legacy_markers_and_task_economics(
+    tmp_path, legacy_task_reconcile_fixture
+):
+    config = _config(tmp_path)
+    _write_key(config.signing_key)
+    envelope, _ = Reconciler(
+        legacy_task_reconcile_fixture,
+        FakeReconcileRPC({VAULT: 100}),
+        config,
+        notify=lambda *_: {"attempted": False},
+    ).run()
+
+    report = envelope["report"]
+    assert report["outcome"] == "match", report
+    assert _check(report, "economic_receipt_view")["ok"] is True
+
+
+def test_present_wrong_legacy_marker_still_fails(
+    tmp_path, legacy_task_reconcile_fixture
+):
+    with sqlite3.connect(legacy_task_reconcile_fixture) as db:
+        db.execute(
+            "UPDATE journal SET detail=? WHERE receipt_id='31257cea-live-shape' "
+            "AND kind='earn'",
+            (json.dumps({"funded": True}, separators=(",", ":")),),
+        )
+
+    report = Reconciler(
+        legacy_task_reconcile_fixture,
+        FakeReconcileRPC({VAULT: 100}),
+        _config(tmp_path),
+    ).collect()
+    view = _check(report, "economic_receipt_view")
+    assert report["outcome"] == "mismatch"
+    assert any("funded marker" in error for error in view["errors"])
+
+
+@pytest.mark.parametrize("mutation", ["missing", "mismatching"])
+def test_empty_legacy_marker_requires_matching_projection(
+    tmp_path, legacy_task_reconcile_fixture, mutation
+):
+    with sqlite3.connect(legacy_task_reconcile_fixture) as db:
+        if mutation == "missing":
+            db.execute("DROP TRIGGER legacy_funding_projection_no_delete")
+            db.execute(
+                "DELETE FROM legacy_funding_projection "
+                "WHERE receipt_id='31257cea-live-shape'"
+            )
+        else:
+            db.execute("DROP TRIGGER legacy_funding_projection_no_update")
+            db.execute(
+                "UPDATE legacy_funding_projection SET funded=1 "
+                "WHERE receipt_id='31257cea-live-shape'"
+            )
+
+    report = Reconciler(
+        legacy_task_reconcile_fixture,
+        FakeReconcileRPC({VAULT: 100}),
+        _config(tmp_path),
+    ).collect()
+    view = _check(report, "economic_receipt_view")
+    assert report["outcome"] == "mismatch"
+    assert any("funding projection" in error for error in view["errors"])
+    assert any("funded marker" in error for error in view["errors"])
+
+
+def _materialize_economic_view(db):
+    db.execute(
+        "CREATE TABLE tampered_economic_receipts AS SELECT * FROM economic_receipts"
+    )
+    db.execute("DROP VIEW economic_receipts")
+    db.execute(
+        "ALTER TABLE tampered_economic_receipts RENAME TO economic_receipts"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["wrong_amount", "wrong_funded", "missing", "extra"],
+)
+def test_tampered_task_economic_view_fails(
+    tmp_path, legacy_task_reconcile_fixture, mutation
+):
+    with sqlite3.connect(legacy_task_reconcile_fixture) as db:
+        _materialize_economic_view(db)
+        first_task = (
+            "SELECT economic_id FROM economic_receipts "
+            "WHERE namespace='task' ORDER BY economic_id LIMIT 1"
+        )
+        if mutation == "wrong_amount":
+            db.execute(
+                f"UPDATE economic_receipts SET amount=amount+1 "
+                f"WHERE economic_id=({first_task})"
+            )
+        elif mutation == "wrong_funded":
+            db.execute(
+                f"UPDATE economic_receipts SET funded=1-funded "
+                f"WHERE economic_id=({first_task})"
+            )
+        elif mutation == "missing":
+            db.execute(
+                f"DELETE FROM economic_receipts WHERE economic_id=({first_task})"
+            )
+        else:
+            db.execute(
+                "INSERT INTO economic_receipts "
+                "SELECT 'task:extra', namespace, receipt_id, hold_id, payer_account, "
+                "worker_account, amount, funded, earned_at, hold_terminal_at, "
+                "matures_at, eligible_at, dispute_state, debit_journal_seq, "
+                "credit_journal_seq FROM economic_receipts "
+                "WHERE namespace='task' ORDER BY economic_id LIMIT 1"
+            )
+
+    report = Reconciler(
+        legacy_task_reconcile_fixture,
+        FakeReconcileRPC({VAULT: 100}),
+        _config(tmp_path),
+    ).collect()
+    view = _check(report, "economic_receipt_view")
+    assert report["outcome"] == "mismatch"
+    assert view["ok"] is False
+    if mutation in {"wrong_amount", "wrong_funded"}:
+        assert any("task economic projection differs" in error for error in view["errors"])
+    else:
+        assert any("task economic rows do not exactly" in error for error in view["errors"])
+
+
 def test_legacy_funding_requires_exact_receipt_journal_pair(tmp_path):
     clock = [6_000_000]
     path = tmp_path / "legacy-pair.sqlite"

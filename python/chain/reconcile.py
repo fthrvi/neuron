@@ -567,6 +567,12 @@ class Reconciler:
                             "SELECT * FROM spend_economic_receipts ORDER BY receipt_id"
                         )
                     ],
+                    "task_holds": [
+                        dict(row)
+                        for row in db.execute(
+                            "SELECT * FROM task_holds ORDER BY hold_id"
+                        )
+                    ],
                     "economic_receipts": [
                         dict(row)
                         for row in db.execute(
@@ -1892,6 +1898,85 @@ class Reconciler:
                 f"{economic_id}: v2 economic row is not backed by a verified "
                 "signed usage receipt, accepted delta, and exact journal pair"
             )
+        paid_task_holds = {
+            row["hold_id"]: row for row in ledger["task_holds"]
+            if row["state"] == "paid"
+        }
+        expected_task_ids = {
+            f"task:{hold_id}" for hold_id in paid_task_holds
+        }
+        view_task_rows = [
+            row for row in ledger["economic_receipts"]
+            if row["namespace"] == "task"
+        ]
+        view_task_ids = {row["economic_id"] for row in view_task_rows}
+        if (
+            view_task_ids != expected_task_ids
+            or len(view_task_rows) != len(expected_task_ids)
+        ):
+            errors["economic_receipt_view"].append(
+                "task economic rows do not exactly and bidirectionally match paid holds"
+            )
+        for hold_id, hold in paid_task_holds.items():
+            economic_id = f"task:{hold_id}"
+            event_id = f"task-pay:{hold_id}"
+            view = economic_rows.get(economic_id)
+            event_rows = journals_by_receipt.get(event_id, [])
+            debits = [
+                row for row in event_rows if row["kind"] == "task_pay_debit"
+            ]
+            credits = [
+                row for row in event_rows if row["kind"] == "task_earn"
+            ]
+            terminal = hold["terminal_at"]
+            journal_pair_ok = (
+                terminal is not None
+                and len(event_rows) == 2
+                and len(debits) == 1
+                and len(credits) == 1
+                and debits[0]["account"] == hold["escrow_account"]
+                and debits[0]["counterparty"] == hold["worker_account"]
+                and int(debits[0]["amount"]) == -int(hold["amount"])
+                and int(debits[0]["ts"]) == int(terminal)
+                and credits[0]["account"] == hold["worker_account"]
+                and credits[0]["counterparty"] == hold["escrow_account"]
+                and int(credits[0]["amount"]) == int(hold["amount"])
+                and int(credits[0]["ts"]) == int(terminal)
+            )
+            if not journal_pair_ok:
+                errors["economic_receipt_view"].append(
+                    f"{economic_id}: paid task hold lacks its exact payment journal pair"
+                )
+            if view is None:
+                errors["economic_receipt_view"].append(
+                    f"{economic_id}: missing shared economic row"
+                )
+                continue
+            maturity = None if terminal is None else int(terminal) + HOLD_S
+            expected = {
+                "namespace": "task",
+                "receipt_id": event_id,
+                "hold_id": hold_id,
+                "payer_account": hold["payer_account"],
+                "worker_account": hold["worker_account"],
+                "amount": int(hold["amount"]),
+                "funded": int(hold["funded"]),
+                "earned_at": terminal,
+                "hold_terminal_at": terminal,
+                "matures_at": maturity,
+                "eligible_at": None if maturity is None else maturity + 1,
+                "dispute_state": "none",
+                "debit_journal_seq": (
+                    int(debits[0]["seq"]) if journal_pair_ok else None
+                ),
+                "credit_journal_seq": (
+                    int(credits[0]["seq"]) if journal_pair_ok else None
+                ),
+            }
+            if any(view[field] != value for field, value in expected.items()):
+                errors["economic_receipt_view"].append(
+                    f"{economic_id}: task economic projection differs from hold provenance"
+                )
         expected_economic_ids = expected_v2_ids | {
             f"v1:{row['seq']}"
             for row in ledger["journal"]
@@ -1899,7 +1984,7 @@ class Reconciler:
         } | {
             f"legacy_import:{row['seq']}" for row in ledger["journal"]
             if row["kind"] == "legacy_import" and int(row["amount"]) > 0
-        }
+        } | expected_task_ids
         if set(economic_rows) != expected_economic_ids:
             errors["economic_receipt_view"].append(
                 "shared economic view does not exactly cover receipt earnings"
@@ -2012,7 +2097,18 @@ class Reconciler:
                     marker = json.loads(earn["detail"])
                 except (TypeError, json.JSONDecodeError):
                     marker = None
-                if marker != {"funded": reconstructed_funded}:
+                projection_ok = (
+                    projection is not None
+                    and projection["funded"] == int(reconstructed_funded)
+                )
+                # Pre-marker v1 earns used the literal empty object. This is safe
+                # only with the independently verified projection: cashability
+                # reads legacy_funding_projection and never reads this marker.
+                absent_legacy_marker = earn["detail"] == "{}" and projection_ok
+                if (
+                    not absent_legacy_marker
+                    and marker != {"funded": reconstructed_funded}
+                ):
                     marker_ok = False
             if not marker_ok:
                 errors["economic_receipt_view"].append(
