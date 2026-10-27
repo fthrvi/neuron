@@ -16,3 +16,6 @@ codegen-units = 1
 opt-level = 3
 incremental = false
 codegen-units = 1
+
+[patch.crates-io]
+agave-precompiles = { path = "test-support/agave-precompiles" }

@@ -53,6 +53,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-precompiles"
+version = "3.1.14"
+dependencies = [
+ "agave-feature-set",
+ "ed25519-dalek",
+ "solana-address 2.8.0",
+ "solana-precompile-error",
+ "solana-sdk-ids",
+]
+
+[[package]]
 name = "agave-reserved-account-keys"
 version = "3.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1675,6 +1686,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a6d4edace08253a908d301768f291a7115e8e19e13473dd6e1ace78d6366433"
 dependencies = [
  "agave-feature-set",
+ "agave-precompiles",
  "agave-reserved-account-keys",
  "agave-syscalls",
  "ansi_term",
@@ -1772,8 +1784,10 @@ dependencies = [
  "anchor-spl",
  "bincode",
  "litesvm",
+ "solana-instructions-sysvar",
  "solana-keypair",
  "solana-message",
+ "solana-sdk-ids",
  "solana-signer",
  "solana-transaction",
 ]

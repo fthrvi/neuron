@@ -87,3 +87,65 @@ pub struct EscrowClosed {
     pub destination: Pubkey,
     pub amount: u64,
 }
+
+#[event]
+pub struct DelegateSet {
+    pub escrow: Pubkey,
+    pub delegate: Pubkey,
+    pub key: Pubkey,
+    pub cap_total: u64,
+    pub spent: u64,
+    pub expires_at: i64,
+    pub flags: u8,
+}
+
+#[event]
+pub struct DelegateRevoked {
+    pub escrow: Pubkey,
+    pub delegate: Pubkey,
+    pub key: Pubkey,
+}
+
+#[event]
+pub struct ChannelOpened {
+    pub escrow: Pubkey,
+    pub channel: Pubkey,
+    pub seq: u64,
+    pub worker: Pubkey,
+    pub voucher_signer: Pubkey,
+    pub cap: u64,
+    pub fee_bps_snapshot: u16,
+}
+
+#[event]
+pub struct ChannelFunded {
+    pub channel: Pubkey,
+    pub seq: u64,
+    pub add: u64,
+    pub cap: u64,
+}
+
+#[event]
+pub struct Redeemed {
+    pub channel: Pubkey,
+    pub seq: u64,
+    pub cumulative_total: u64,
+    pub delta: u64,
+    pub fee: u64,
+    pub by: Pubkey,
+}
+
+#[event]
+pub struct ChannelClosing {
+    pub channel: Pubkey,
+    pub seq: u64,
+    pub close_at: i64,
+}
+
+#[event]
+pub struct ChannelClosed {
+    pub channel: Pubkey,
+    pub seq: u64,
+    pub released: u64,
+    pub by: Pubkey,
+}

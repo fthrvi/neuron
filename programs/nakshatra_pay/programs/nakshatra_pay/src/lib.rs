@@ -50,6 +50,20 @@ fn strict_entry<'info>(
         Some(instruction::EscrowWithdrawExecute::DISCRIMINATOR.len())
     } else if data.starts_with(instruction::EscrowClose::DISCRIMINATOR) {
         Some(instruction::EscrowClose::DISCRIMINATOR.len())
+    } else if data.starts_with(instruction::DelegateSet::DISCRIMINATOR) {
+        Some(instruction::DelegateSet::DISCRIMINATOR.len() + 32 + 8 + 8 + 1)
+    } else if data.starts_with(instruction::DelegateRevoke::DISCRIMINATOR) {
+        Some(instruction::DelegateRevoke::DISCRIMINATOR.len() + 32)
+    } else if data.starts_with(instruction::ChannelOpen::DISCRIMINATOR) {
+        Some(instruction::ChannelOpen::DISCRIMINATOR.len() + 32 + 8)
+    } else if data.starts_with(instruction::ChannelFund::DISCRIMINATOR) {
+        Some(instruction::ChannelFund::DISCRIMINATOR.len() + 8)
+    } else if data.starts_with(instruction::ChannelRedeem::DISCRIMINATOR) {
+        Some(instruction::ChannelRedeem::DISCRIMINATOR.len() + 8)
+    } else if data.starts_with(instruction::ChannelCloseRequest::DISCRIMINATOR) {
+        Some(instruction::ChannelCloseRequest::DISCRIMINATOR.len())
+    } else if data.starts_with(instruction::ChannelCloseFinalize::DISCRIMINATOR) {
+        Some(instruction::ChannelCloseFinalize::DISCRIMINATOR.len())
     } else {
         None
     };
@@ -102,5 +116,35 @@ pub mod nakshatra_pay {
     }
     pub fn escrow_close(ctx: Context<EscrowCloseAccounts>) -> Result<()> {
         instructions::handle_escrow_close(ctx)
+    }
+    pub fn delegate_set(
+        ctx: Context<DelegateSetAccounts>,
+        key: Pubkey,
+        cap_total: u64,
+        expires_at: i64,
+        flags: u8,
+    ) -> Result<()> {
+        instructions::handle_delegate_set(ctx, key, cap_total, expires_at, flags)
+    }
+    pub fn delegate_revoke(ctx: Context<DelegateRevokeAccounts>, key: Pubkey) -> Result<()> {
+        instructions::handle_delegate_revoke(ctx, key)
+    }
+    pub fn channel_open(ctx: Context<ChannelOpenAccounts>, worker: Pubkey, cap: u64) -> Result<()> {
+        instructions::handle_channel_open(ctx, worker, cap)
+    }
+    pub fn channel_fund(ctx: Context<ChannelFundAccounts>, add: u64) -> Result<()> {
+        instructions::handle_channel_fund(ctx, add)
+    }
+    pub fn channel_redeem(
+        ctx: Context<ChannelRedeemAccounts>,
+        cumulative_total: u64,
+    ) -> Result<()> {
+        instructions::handle_channel_redeem(ctx, cumulative_total)
+    }
+    pub fn channel_close_request(ctx: Context<ChannelCloseRequestAccounts>) -> Result<()> {
+        instructions::handle_channel_close_request(ctx)
+    }
+    pub fn channel_close_finalize(ctx: Context<ChannelCloseFinalizeAccounts>) -> Result<()> {
+        instructions::handle_channel_close_finalize(ctx)
     }
 }

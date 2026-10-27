@@ -8,6 +8,645 @@
   },
   "instructions": [
     {
+      "name": "channel_close_finalize",
+      "discriminator": [
+        163,
+        85,
+        132,
+        203,
+        131,
+        191,
+        117,
+        194
+      ],
+      "accounts": [
+        {
+          "name": "executor",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "escrow",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.owner",
+                "account": "Escrow"
+              }
+            ]
+          }
+        },
+        {
+          "name": "delegate",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "rent_payer",
+          "writable": true
+        },
+        {
+          "name": "channel",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  104,
+                  97,
+                  110,
+                  110,
+                  101,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "channel.seq",
+                "account": "Channel"
+              }
+            ]
+          }
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "channel_close_request",
+      "discriminator": [
+        209,
+        212,
+        89,
+        236,
+        125,
+        42,
+        35,
+        219
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "escrow",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.owner",
+                "account": "Escrow"
+              }
+            ]
+          }
+        },
+        {
+          "name": "channel",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  104,
+                  97,
+                  110,
+                  110,
+                  101,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "channel.seq",
+                "account": "Channel"
+              }
+            ]
+          }
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "channel_fund",
+      "discriminator": [
+        106,
+        184,
+        136,
+        61,
+        18,
+        65,
+        229,
+        204
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "escrow",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.owner",
+                "account": "Escrow"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              }
+            ]
+          },
+          "relations": [
+            "escrow"
+          ]
+        },
+        {
+          "name": "delegate",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "channel",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  104,
+                  97,
+                  110,
+                  110,
+                  101,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "channel.seq",
+                "account": "Channel"
+              }
+            ]
+          }
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": [
+        {
+          "name": "add",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "channel_open",
+      "discriminator": [
+        161,
+        19,
+        223,
+        17,
+        48,
+        136,
+        3,
+        113
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "escrow",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.owner",
+                "account": "Escrow"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              }
+            ]
+          },
+          "relations": [
+            "escrow"
+          ]
+        },
+        {
+          "name": "delegate",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "channel",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  104,
+                  97,
+                  110,
+                  110,
+                  101,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.channel_seq",
+                "account": "Escrow"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": [
+        {
+          "name": "worker",
+          "type": "pubkey"
+        },
+        {
+          "name": "cap",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "channel_redeem",
+      "discriminator": [
+        182,
+        83,
+        213,
+        21,
+        100,
+        179,
+        158,
+        214
+      ],
+      "accounts": [
+        {
+          "name": "by",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "escrow",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.owner",
+                "account": "Escrow"
+              }
+            ]
+          }
+        },
+        {
+          "name": "channel",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  104,
+                  97,
+                  110,
+                  110,
+                  101,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "channel.seq",
+                "account": "Channel"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              }
+            ]
+          },
+          "relations": [
+            "escrow"
+          ]
+        },
+        {
+          "name": "worker_token",
+          "writable": true
+        },
+        {
+          "name": "fee_wallet",
+          "writable": true
+        },
+        {
+          "name": "instructions_sysvar",
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": [
+        {
+          "name": "cumulative_total",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "config_accept_authority",
       "discriminator": [
         18,
@@ -408,6 +1047,238 @@
         {
           "name": "new_authority",
           "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "delegate_revoke",
+      "discriminator": [
+        207,
+        168,
+        13,
+        194,
+        200,
+        11,
+        0,
+        165
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "escrow"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "escrow",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "delegate",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  101,
+                  108,
+                  101,
+                  103,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "arg",
+                "path": "key"
+              }
+            ]
+          }
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": [
+        {
+          "name": "key",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "delegate_set",
+      "discriminator": [
+        139,
+        16,
+        230,
+        103,
+        254,
+        166,
+        20,
+        165
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "escrow"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "escrow",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "delegate",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  101,
+                  108,
+                  101,
+                  103,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "arg",
+                "path": "key"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": [
+        {
+          "name": "key",
+          "type": "pubkey"
+        },
+        {
+          "name": "cap_total",
+          "type": "u64"
+        },
+        {
+          "name": "expires_at",
+          "type": "i64"
+        },
+        {
+          "name": "flags",
+          "type": "u8"
         }
       ]
     },
@@ -1058,6 +1929,19 @@
   ],
   "accounts": [
     {
+      "name": "Channel",
+      "discriminator": [
+        49,
+        159,
+        99,
+        106,
+        220,
+        87,
+        219,
+        88
+      ]
+    },
+    {
       "name": "Config",
       "discriminator": [
         155,
@@ -1068,6 +1952,19 @@
         250,
         204,
         130
+      ]
+    },
+    {
+      "name": "Delegate",
+      "discriminator": [
+        92,
+        145,
+        166,
+        111,
+        11,
+        38,
+        38,
+        247
       ]
     },
     {
@@ -1109,6 +2006,58 @@
         151,
         35,
         89
+      ]
+    },
+    {
+      "name": "ChannelClosed",
+      "discriminator": [
+        119,
+        198,
+        23,
+        254,
+        216,
+        124,
+        84,
+        16
+      ]
+    },
+    {
+      "name": "ChannelClosing",
+      "discriminator": [
+        213,
+        229,
+        143,
+        197,
+        237,
+        154,
+        150,
+        96
+      ]
+    },
+    {
+      "name": "ChannelFunded",
+      "discriminator": [
+        169,
+        204,
+        168,
+        12,
+        39,
+        168,
+        227,
+        135
+      ]
+    },
+    {
+      "name": "ChannelOpened",
+      "discriminator": [
+        253,
+        213,
+        255,
+        96,
+        31,
+        188,
+        47,
+        170
       ]
     },
     {
@@ -1164,6 +2113,32 @@
       ]
     },
     {
+      "name": "DelegateRevoked",
+      "discriminator": [
+        10,
+        200,
+        133,
+        29,
+        238,
+        207,
+        193,
+        124
+      ]
+    },
+    {
+      "name": "DelegateSet",
+      "discriminator": [
+        103,
+        126,
+        239,
+        131,
+        201,
+        31,
+        212,
+        253
+      ]
+    },
+    {
       "name": "Deposited",
       "discriminator": [
         111,
@@ -1200,6 +2175,19 @@
         87,
         127,
         79
+      ]
+    },
+    {
+      "name": "Redeemed",
+      "discriminator": [
+        14,
+        29,
+        183,
+        71,
+        31,
+        165,
+        107,
+        38
       ]
     },
     {
@@ -1337,6 +2325,91 @@
       "code": 6018,
       "name": "ArithmeticOverflow",
       "msg": "Arithmetic overflow or underflow"
+    },
+    {
+      "code": 6019,
+      "name": "InvalidDelegateExpiry",
+      "msg": "The delegate expiry must be in the future"
+    },
+    {
+      "code": 6020,
+      "name": "DelegateCapBelowSpent",
+      "msg": "The delegate cap cannot be below its current spend"
+    },
+    {
+      "code": 6021,
+      "name": "InvalidDelegateFlags",
+      "msg": "The delegate flags contain unsupported bits"
+    },
+    {
+      "code": 6022,
+      "name": "DelegateExpired",
+      "msg": "The delegate has expired"
+    },
+    {
+      "code": 6023,
+      "name": "DelegateFlagMissing",
+      "msg": "The delegate does not have the required permission"
+    },
+    {
+      "code": 6024,
+      "name": "DelegateCapExceeded",
+      "msg": "The delegate cap would be exceeded"
+    },
+    {
+      "code": 6025,
+      "name": "InsufficientCollateral",
+      "msg": "The escrow vault does not fully collateralize this channel"
+    },
+    {
+      "code": 6026,
+      "name": "ChannelNotOpen",
+      "msg": "The channel is not open"
+    },
+    {
+      "code": 6027,
+      "name": "ChannelCloseElapsed",
+      "msg": "The channel close grace period has elapsed"
+    },
+    {
+      "code": 6028,
+      "name": "ChannelCloseNotElapsed",
+      "msg": "The channel close grace period has not elapsed"
+    },
+    {
+      "code": 6029,
+      "name": "VoucherNotIncreasing",
+      "msg": "The voucher total must strictly increase"
+    },
+    {
+      "code": 6030,
+      "name": "VoucherExceedsCap",
+      "msg": "The voucher total exceeds the channel cap"
+    },
+    {
+      "code": 6031,
+      "name": "InvalidEd25519Instruction",
+      "msg": "The preceding instruction is not a valid Ed25519 verification"
+    },
+    {
+      "code": 6032,
+      "name": "InvalidVoucherSigner",
+      "msg": "The voucher signer is not authorized for this channel"
+    },
+    {
+      "code": 6033,
+      "name": "InvalidVoucherMessage",
+      "msg": "The signed voucher message does not match this redemption"
+    },
+    {
+      "code": 6034,
+      "name": "RedeemViaCpi",
+      "msg": "Channel redemption cannot be invoked through CPI"
+    },
+    {
+      "code": 6035,
+      "name": "WrongDelegate",
+      "msg": "The supplied delegate account does not match the channel"
     }
   ],
   "types": [
@@ -1376,6 +2449,186 @@
           {
             "name": "pending_authority",
             "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Channel",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "escrow",
+            "type": "pubkey"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "worker",
+            "type": "pubkey"
+          },
+          {
+            "name": "voucher_signer",
+            "type": "pubkey"
+          },
+          {
+            "name": "delegate",
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "cap",
+            "type": "u64"
+          },
+          {
+            "name": "redeemed",
+            "type": "u64"
+          },
+          {
+            "name": "fee_bps_snapshot",
+            "type": "u16"
+          },
+          {
+            "name": "status",
+            "type": {
+              "defined": {
+                "name": "ChannelStatus"
+              }
+            }
+          },
+          {
+            "name": "close_at",
+            "type": "i64"
+          },
+          {
+            "name": "rent_payer",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ChannelClosed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "channel",
+            "type": "pubkey"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "released",
+            "type": "u64"
+          },
+          {
+            "name": "by",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ChannelClosing",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "channel",
+            "type": "pubkey"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "close_at",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ChannelFunded",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "channel",
+            "type": "pubkey"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "add",
+            "type": "u64"
+          },
+          {
+            "name": "cap",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ChannelOpened",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "escrow",
+            "type": "pubkey"
+          },
+          {
+            "name": "channel",
+            "type": "pubkey"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "worker",
+            "type": "pubkey"
+          },
+          {
+            "name": "voucher_signer",
+            "type": "pubkey"
+          },
+          {
+            "name": "cap",
+            "type": "u64"
+          },
+          {
+            "name": "fee_bps_snapshot",
+            "type": "u16"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ChannelStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Open"
+          },
+          {
+            "name": "Closing"
           }
         ]
       }
@@ -1516,6 +2769,98 @@
           {
             "name": "effective_at",
             "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Delegate",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "escrow",
+            "type": "pubkey"
+          },
+          {
+            "name": "key",
+            "type": "pubkey"
+          },
+          {
+            "name": "cap_total",
+            "type": "u64"
+          },
+          {
+            "name": "spent",
+            "type": "u64"
+          },
+          {
+            "name": "expires_at",
+            "type": "i64"
+          },
+          {
+            "name": "flags",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DelegateRevoked",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "escrow",
+            "type": "pubkey"
+          },
+          {
+            "name": "delegate",
+            "type": "pubkey"
+          },
+          {
+            "name": "key",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DelegateSet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "escrow",
+            "type": "pubkey"
+          },
+          {
+            "name": "delegate",
+            "type": "pubkey"
+          },
+          {
+            "name": "key",
+            "type": "pubkey"
+          },
+          {
+            "name": "cap_total",
+            "type": "u64"
+          },
+          {
+            "name": "spent",
+            "type": "u64"
+          },
+          {
+            "name": "expires_at",
+            "type": "i64"
+          },
+          {
+            "name": "flags",
+            "type": "u8"
           }
         ]
       }
@@ -1679,6 +3024,38 @@
       }
     },
     {
+      "name": "Redeemed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "channel",
+            "type": "pubkey"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "cumulative_total",
+            "type": "u64"
+          },
+          {
+            "name": "delta",
+            "type": "u64"
+          },
+          {
+            "name": "fee",
+            "type": "u64"
+          },
+          {
+            "name": "by",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
       "name": "WithdrawCancelled",
       "type": {
         "kind": "struct",
@@ -1745,6 +3122,11 @@
   ],
   "constants": [
     {
+      "name": "CHANNEL_SEED",
+      "type": "bytes",
+      "value": "[99, 104, 97, 110, 110, 101, 108]"
+    },
+    {
       "name": "CLOSE_GRACE_S",
       "type": "i64",
       "value": "86400"
@@ -1763,6 +3145,11 @@
       "name": "DEFAULT_FEE_BPS",
       "type": "u16",
       "value": "300"
+    },
+    {
+      "name": "DELEGATE_SEED",
+      "type": "bytes",
+      "value": "[100, 101, 108, 101, 103, 97, 116, 101]"
     },
     {
       "name": "ESCROW_SEED",

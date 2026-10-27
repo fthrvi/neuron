@@ -40,4 +40,38 @@ pub enum PayError {
     DuplicateTokenAccount,
     #[msg("Arithmetic overflow or underflow")]
     ArithmeticOverflow,
+    #[msg("The delegate expiry must be in the future")]
+    InvalidDelegateExpiry,
+    #[msg("The delegate cap cannot be below its current spend")]
+    DelegateCapBelowSpent,
+    #[msg("The delegate flags contain unsupported bits")]
+    InvalidDelegateFlags,
+    #[msg("The delegate has expired")]
+    DelegateExpired,
+    #[msg("The delegate does not have the required permission")]
+    DelegateFlagMissing,
+    #[msg("The delegate cap would be exceeded")]
+    DelegateCapExceeded,
+    #[msg("The escrow vault does not fully collateralize this channel")]
+    InsufficientCollateral,
+    #[msg("The channel is not open")]
+    ChannelNotOpen,
+    #[msg("The channel close grace period has elapsed")]
+    ChannelCloseElapsed,
+    #[msg("The channel close grace period has not elapsed")]
+    ChannelCloseNotElapsed,
+    #[msg("The voucher total must strictly increase")]
+    VoucherNotIncreasing,
+    #[msg("The voucher total exceeds the channel cap")]
+    VoucherExceedsCap,
+    #[msg("The preceding instruction is not a valid Ed25519 verification")]
+    InvalidEd25519Instruction,
+    #[msg("The voucher signer is not authorized for this channel")]
+    InvalidVoucherSigner,
+    #[msg("The signed voucher message does not match this redemption")]
+    InvalidVoucherMessage,
+    #[msg("Channel redemption cannot be invoked through CPI")]
+    RedeemViaCpi,
+    #[msg("The supplied delegate account does not match the channel")]
+    WrongDelegate,
 }
