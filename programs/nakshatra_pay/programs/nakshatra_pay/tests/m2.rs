@@ -1307,6 +1307,116 @@ fn closed_escrow_generation_prevents_old_voucher_replay() {
 }
 
 #[test]
+fn stale_delegate_cannot_spend_after_escrow_reopen_and_can_be_closed() {
+    let mut f = Fixture::new();
+    let delegate_pda = f.delegate_pda(f.delegate.pubkey());
+    let now: Clock = f.svm.get_sysvar();
+    assert!(tx!(
+        f,
+        owner,
+        f.delegate_set_ix(
+            f.delegate.pubkey(),
+            500,
+            now.unix_timestamp + 30 * 86_400,
+            DELEGATE_OPEN_CHANNEL
+        )
+    ));
+    assert_eq!(read_delegate(&f.svm, delegate_pda).generation, 0);
+    assert!(tx!(f, owner, f.escrow_close_ix()));
+
+    f.reinit_and_deposit(100_000);
+    assert_eq!(read_escrow(&f.svm, f.escrow).generation, 1);
+    assert!(!tx!(
+        f,
+        delegate,
+        f.open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.other.pubkey(),
+            500,
+            0
+        )
+    ));
+
+    let owner_channel = f.channel_pda(0);
+    assert!(tx!(
+        f,
+        owner,
+        f.open_ix(f.owner.pubkey(), None, f.worker.pubkey(), 100, 0)
+    ));
+    assert!(!tx!(
+        f,
+        delegate,
+        f.fund_ix(f.delegate.pubkey(), Some(delegate_pda), owner_channel, 1)
+    ));
+    assert!(tx!(
+        f,
+        other,
+        f.delegate_close_ix(f.other.pubkey(), f.delegate.pubkey())
+    ));
+    assert!(f.svm.get_account(&delegate_pda).is_none());
+}
+
+#[test]
+fn delegate_set_resets_a_closed_escrow_generation() {
+    let mut f = Fixture::new();
+    let delegate_pda = f.delegate_pda(f.delegate.pubkey());
+    let now: Clock = f.svm.get_sysvar();
+    let expires_at = now.unix_timestamp + 30 * 86_400;
+    assert!(tx!(
+        f,
+        owner,
+        f.delegate_set_ix(f.delegate.pubkey(), 100, expires_at, DELEGATE_OPEN_CHANNEL)
+    ));
+    let channel = f.channel_pda(0);
+    assert!(tx!(
+        f,
+        delegate,
+        f.open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.worker.pubkey(),
+            100,
+            0
+        )
+    ));
+    let delegate = Keypair::try_from(f.delegate.to_bytes().as_slice()).unwrap();
+    let worker = Keypair::try_from(f.worker.to_bytes().as_slice()).unwrap();
+    assert!(f.redeem_with(&worker, &delegate, channel, 100));
+    assert!(tx!(
+        f,
+        delegate,
+        f.close_request_ix(f.delegate.pubkey(), channel)
+    ));
+    assert!(tx!(
+        f,
+        worker,
+        f.close_finalize_ix(
+            f.worker.pubkey(),
+            Some(delegate_pda),
+            f.delegate.pubkey(),
+            channel
+        )
+    ));
+    let old_delegate = read_delegate(&f.svm, delegate_pda);
+    assert_eq!((old_delegate.generation, old_delegate.spent), (0, 100));
+    assert_eq!(old_delegate.open_channels, 0);
+    assert!(tx!(f, owner, f.escrow_close_ix()));
+
+    f.reinit_and_deposit(100_000);
+    assert!(tx!(
+        f,
+        owner,
+        f.delegate_set_ix(f.delegate.pubkey(), 50, expires_at, DELEGATE_OPEN_CHANNEL)
+    ));
+    let reset_delegate = read_delegate(&f.svm, delegate_pda);
+    assert_eq!(reset_delegate.generation, 1);
+    assert_eq!((reset_delegate.spent, reset_delegate.open_channels), (0, 0));
+    assert!(!reset_delegate.disabled);
+    assert_eq!(reset_delegate.cap_total, 50);
+}
+
+#[test]
 fn delegate_revoke_cannot_reset_cap_while_old_channel_is_live() {
     let mut f = Fixture::new();
     let delegate_pda = f.delegate_pda(f.delegate.pubkey());

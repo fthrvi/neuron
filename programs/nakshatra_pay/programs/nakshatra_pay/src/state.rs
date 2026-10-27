@@ -57,6 +57,7 @@ pub struct PendingWithdrawal {
 pub struct Delegate {
     pub escrow: Pubkey,
     pub key: Pubkey,
+    pub generation: u64,
     pub cap_total: u64,
     pub spent: u64,
     pub expires_at: i64,

@@ -649,6 +649,7 @@ pub fn handle_delegate_set(
     if delegate.escrow == Pubkey::default() {
         delegate.escrow = ctx.accounts.escrow.key();
         delegate.key = key;
+        delegate.generation = ctx.accounts.escrow.generation;
         delegate.cap_total = 0;
         delegate.spent = 0;
         delegate.expires_at = expires_at;
@@ -664,7 +665,18 @@ pub fn handle_delegate_set(
         );
         require_keys_eq!(delegate.key, key, PayError::WrongDelegate);
         require!(delegate.bump == ctx.bumps.delegate, PayError::WrongDelegate);
-        require!(!delegate.disabled, PayError::DelegateDisabled);
+        if delegate.generation == ctx.accounts.escrow.generation {
+            require!(!delegate.disabled, PayError::DelegateDisabled);
+        } else {
+            require!(
+                delegate.generation < ctx.accounts.escrow.generation,
+                PayError::DelegateGenerationMismatch
+            );
+            require!(delegate.open_channels == 0, PayError::DelegateChannelsOpen);
+            delegate.generation = ctx.accounts.escrow.generation;
+            delegate.spent = 0;
+            delegate.disabled = false;
+        }
     }
     require!(cap_total >= delegate.spent, PayError::DelegateCapBelowSpent);
     delegate.cap_total = cap_total;
@@ -729,7 +741,11 @@ pub struct DelegateCloseAccounts<'info> {
 }
 
 pub fn handle_delegate_close(ctx: Context<DelegateCloseAccounts>) -> Result<()> {
-    require!(ctx.accounts.delegate.disabled, PayError::DelegateDisabled);
+    require!(
+        ctx.accounts.delegate.disabled
+            || ctx.accounts.delegate.generation != ctx.accounts.escrow.generation,
+        PayError::DelegateDisabled
+    );
     require!(
         ctx.accounts.delegate.open_channels == 0,
         PayError::DelegateChannelsOpen
@@ -1171,6 +1187,10 @@ fn authorize_channel_spend(
     let delegate = delegate.ok_or(PayError::Unauthorized)?;
     require_keys_eq!(delegate.escrow, escrow.key(), PayError::WrongDelegate);
     require_keys_eq!(delegate.key, signer, PayError::Unauthorized);
+    require!(
+        delegate.generation == escrow.generation,
+        PayError::DelegateGenerationMismatch
+    );
     require!(!delegate.disabled, PayError::DelegateDisabled);
     let expected = Pubkey::find_program_address(
         &[DELEGATE_SEED, escrow.key().as_ref(), signer.as_ref()],

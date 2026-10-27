@@ -78,4 +78,6 @@ pub enum PayError {
     RedeemViaCpi,
     #[msg("The supplied delegate account does not match the channel")]
     WrongDelegate,
+    #[msg("The delegate belongs to a different escrow generation")]
+    DelegateGenerationMismatch,
 }
