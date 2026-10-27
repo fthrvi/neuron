@@ -421,6 +421,26 @@ class LedgerStore:
                 FOREIGN KEY(withdrawal_id) REFERENCES withdrawals(id)
             );
 
+            CREATE TABLE IF NOT EXISTS withdrawal_presence_requests (
+                withdrawal_id TEXT PRIMARY KEY,
+                amount INTEGER NOT NULL
+                    CHECK(typeof(amount) = 'integer'
+                          AND amount BETWEEN 1 AND {max_units}),
+                address TEXT NOT NULL,
+                keyid TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                challenge TEXT NOT NULL,
+                description TEXT NOT NULL,
+                request_id TEXT UNIQUE,
+                enqueue_attempted INTEGER NOT NULL DEFAULT 0
+                    CHECK(enqueue_attempted IN (0, 1)),
+                expires_ts INTEGER NOT NULL
+                    CHECK(typeof(expires_ts) = 'integer' AND expires_ts >= 0),
+                created_ts INTEGER NOT NULL CHECK(typeof(created_ts) = 'integer'),
+                updated_ts INTEGER NOT NULL CHECK(typeof(updated_ts) = 'integer'),
+                FOREIGN KEY(withdrawal_id) REFERENCES withdrawals(id)
+            );
+
             CREATE TABLE IF NOT EXISTS chain_sweeps (
                 id TEXT PRIMARY KEY,
                 operator TEXT NOT NULL,
@@ -758,6 +778,14 @@ class LedgerStore:
             BEFORE DELETE ON chain_sweeps
             BEGIN
                 SELECT RAISE(ABORT, 'chain sweeps are permanent');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS withdrawal_presence_binding_immutable
+            BEFORE UPDATE OF withdrawal_id, amount, address, keyid, nonce,
+                challenge, description, created_ts
+            ON withdrawal_presence_requests
+            BEGIN
+                SELECT RAISE(ABORT, 'withdrawal presence binding is immutable');
             END;
 
             CREATE TRIGGER IF NOT EXISTS spend_holds_snapshots_immutable
@@ -3458,6 +3486,10 @@ class LedgerStore:
                 "approval_ts=?, updated_ts=? WHERE id=?",
                 (approval_ref, now, now, withdrawal_id),
             )
+            db.execute(
+                "DELETE FROM withdrawal_presence_requests WHERE withdrawal_id=?",
+                (withdrawal_id,),
+            )
             return int(row["amount"])
 
         return self._tx(operation)
@@ -3482,7 +3514,153 @@ class LedgerStore:
                 "UPDATE withdrawals SET presence_attempts=?, updated_ts=? WHERE id=?",
                 (attempts, now, withdrawal_id),
             )
+            db.execute(
+                "DELETE FROM withdrawal_presence_requests WHERE withdrawal_id=?",
+                (withdrawal_id,),
+            )
             return attempts
+
+        return self._tx(operation)
+
+    def withdraw_begin_presence(
+        self,
+        withdrawal_id: str,
+        amount: int,
+        address: str,
+        keyid: str,
+        nonce: str,
+        challenge: str,
+        description: str,
+        expires_ts: int,
+    ) -> dict[str, Any]:
+        """Persist one exact payout approval challenge before broker enqueue."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        amount = _amount(amount)
+        address = _identifier(address, "address")
+        keyid = _identifier(keyid, "keyid")
+        nonce = _identifier(nonce, "nonce")
+        challenge = _identifier(challenge, "challenge")
+        description = _identifier(description, "description")
+        if (
+            isinstance(expires_ts, bool)
+            or not isinstance(expires_ts, int)
+            or expires_ts < 0
+            or expires_ts > 2 ** 63 - 1
+        ):
+            raise LedgerValueError("expires_ts is invalid")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            withdrawal = db.execute(
+                "SELECT amount, address, state FROM withdrawals WHERE id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if withdrawal is None or withdrawal["state"] != "pending":
+                state = "missing" if withdrawal is None else withdrawal["state"]
+                raise WithdrawalStateError(
+                    f"withdrawal {withdrawal_id!r} is {state} and cannot request presence"
+                )
+            if int(withdrawal["amount"]) != amount or withdrawal["address"] != address:
+                raise WithdrawalStateError("presence request does not match withdrawal")
+            existing = db.execute(
+                "SELECT * FROM withdrawal_presence_requests WHERE withdrawal_id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+            db.execute(
+                "INSERT INTO withdrawal_presence_requests"
+                "(withdrawal_id, amount, address, keyid, nonce, challenge, "
+                "description, expires_ts, created_ts, updated_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    withdrawal_id, amount, address, keyid, nonce, challenge,
+                    description, expires_ts, now, now,
+                ),
+            )
+            return dict(
+                db.execute(
+                    "SELECT * FROM withdrawal_presence_requests WHERE withdrawal_id=?",
+                    (withdrawal_id,),
+                ).fetchone()
+            )
+
+        return self._tx(operation)
+
+    def withdrawal_presence(self, withdrawal_id: str) -> dict[str, Any] | None:
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM withdrawal_presence_requests WHERE withdrawal_id=?",
+                (withdrawal_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def withdraw_presence_enqueued(
+        self, withdrawal_id: str, request_id: str, expires_ts: int
+    ) -> dict[str, Any]:
+        """Attach the broker identity to a previously persisted challenge."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        request_id = _identifier(request_id, "request_id")
+        if (
+            isinstance(expires_ts, bool)
+            or not isinstance(expires_ts, int)
+            or expires_ts < 0
+            or expires_ts > 2 ** 63 - 1
+        ):
+            raise LedgerValueError("expires_ts is invalid")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            row = db.execute(
+                "SELECT request_id FROM withdrawal_presence_requests "
+                "WHERE withdrawal_id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if row is None:
+                raise WithdrawalStateError("presence request does not exist")
+            if row["request_id"] not in (None, request_id):
+                raise WithdrawalStateError("presence request already has another broker id")
+            db.execute(
+                "UPDATE withdrawal_presence_requests SET request_id=?, expires_ts=?, "
+                "updated_ts=? WHERE withdrawal_id=?",
+                (request_id, expires_ts, now, withdrawal_id),
+            )
+            return dict(
+                db.execute(
+                    "SELECT * FROM withdrawal_presence_requests WHERE withdrawal_id=?",
+                    (withdrawal_id,),
+                ).fetchone()
+            )
+
+        return self._tx(operation)
+
+    def withdraw_presence_mark_enqueue_attempted(
+        self, withdrawal_id: str
+    ) -> dict[str, Any]:
+        """Fence the one allowed broker POST before making the network call."""
+        withdrawal_id = _identifier(withdrawal_id, "withdrawal_id")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            row = db.execute(
+                "SELECT * FROM withdrawal_presence_requests WHERE withdrawal_id=?",
+                (withdrawal_id,),
+            ).fetchone()
+            if row is None:
+                raise WithdrawalStateError("presence request does not exist")
+            if not int(row["enqueue_attempted"]):
+                db.execute(
+                    "UPDATE withdrawal_presence_requests SET enqueue_attempted=1, "
+                    "updated_ts=? WHERE withdrawal_id=?",
+                    (now, withdrawal_id),
+                )
+            return dict(
+                db.execute(
+                    "SELECT * FROM withdrawal_presence_requests WHERE withdrawal_id=?",
+                    (withdrawal_id,),
+                ).fetchone()
+            )
 
         return self._tx(operation)
 

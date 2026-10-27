@@ -715,6 +715,135 @@ def test_auto_cap_day_cap_and_injected_presence(tmp_path):
         assert [call[0] for call in presence_calls] == ["second"]
 
 
+class AsyncPresence:
+    def __init__(self, shared, result=None):
+        self.shared = shared
+        self.result = result or ("pending", {})
+
+    def prepare(self, record, description, wait_s):
+        self.shared["prepared"] += 1
+        return {
+            "keyid": "test-owner",
+            "nonce": f"nonce:{record['id']}",
+            "challenge": f"challenge:{record['id']}",
+            "description": description,
+            "expires_ts": 4_000_000_000,
+        }
+
+    def enqueue(self, request, _wait_s):
+        if request.get("request_id"):
+            return request
+        self.shared["enqueued"] += 1
+        return {
+            **request,
+            "request_id": f"request:{request['withdrawal_id']}",
+        }
+
+    def check(self, request):
+        self.shared["checked"] += 1
+        status, detail = self.result
+        if status == "approved":
+            detail = {
+                "withdrawal_id": request["withdrawal_id"],
+                "amount": int(request["amount"]),
+                "address": request["address"],
+                "challenge": request["challenge"],
+                **detail,
+            }
+        return status, detail
+
+
+def test_presence_config_exception_isolated_while_other_payout_and_sweep_continue(
+    tmp_path, caplog
+):
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    account = BLOCKHASHES[0]
+
+    class ConfigFailure(AsyncPresence):
+        def prepare(self, record, description, wait_s):
+            if record["id"] == "a-config-failure":
+                raise RuntimeError("MissingMeshConfig")
+            return super().prepare(record, description, wait_s)
+
+    shared = {"prepared": 0, "enqueued": 0, "checked": 0}
+    with LedgerStore(tmp_path / "isolated-presence.sqlite") as store:
+        held(store, credits(6), "a-config-failure", "alice")
+        held(store, credits(1), "b-automatic", "bob")
+        indexed_account(store, account, 1_000_000, "carol")
+        rpc.token_accounts[account] = 1_000_000
+        before = row(store, "a-config-failure")
+        engine = PayoutEngine(
+            store, rpc, config(tmp_path), backend=backend,
+            presence=ConfigFailure(shared),
+        )
+
+        with caplog.at_level("ERROR", logger="nak-treasury"):
+            engine.poll_once()
+
+        after = row(store, "a-config-failure")
+        assert after == before
+        assert store.withdrawal_presence("a-config-failure") is None
+        assert row(store, "b-automatic")["state"] == "sent"
+        assert store._db.execute(
+            "SELECT state FROM chain_sweeps WHERE token_account=?", (account,)
+        ).fetchone()[0] == "sent"
+        assert len(backend.builds) == 1
+        assert len(backend.sweeps) == 1
+        assert "MissingMeshConfig" in caplog.text
+
+
+def test_pending_presence_survives_restart_without_second_request(tmp_path):
+    path = tmp_path / "restart-presence.sqlite"
+    shared = {"prepared": 0, "enqueued": 0, "checked": 0}
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    with LedgerStore(path) as store:
+        held(store, credits(6))
+        first = PayoutEngine(
+            store, rpc, config(tmp_path), backend=backend,
+            presence=AsyncPresence(shared),
+        )
+        first.poll_once()
+        request = store.withdrawal_presence("withdrawal-1")
+        assert request["request_id"] == "request:withdrawal-1"
+        assert row(store)["state"] == "pending"
+        assert shared == {"prepared": 1, "enqueued": 1, "checked": 0}
+
+    with LedgerStore(path) as reopened:
+        restarted = PayoutEngine(
+            reopened, rpc, config(tmp_path), backend=backend,
+            presence=AsyncPresence(shared, ("approved", {})),
+        )
+        restarted.poll_once()
+        assert row(reopened)["state"] == "sent"
+        assert reopened.withdrawal_presence("withdrawal-1") is None
+        assert shared == {"prepared": 1, "enqueued": 1, "checked": 1}
+        assert len(backend.builds) == 1
+
+
+@pytest.mark.parametrize(
+    "mismatch", [{"amount": credits(7)}, {"address": VAULT_ACCOUNT}]
+)
+def test_presence_approval_for_different_payout_is_rejected(tmp_path, mismatch):
+    shared = {"prepared": 0, "enqueued": 0, "checked": 0}
+    rpc = FakeRPC()
+    backend = FakeBackend(rpc)
+    with LedgerStore(tmp_path / "mismatched-approval.sqlite") as store:
+        held(store, credits(6))
+        presence = AsyncPresence(shared, ("approved", mismatch))
+        engine = PayoutEngine(
+            store, rpc, config(tmp_path), backend=backend, presence=presence
+        )
+        engine.poll_once()
+        engine.poll_once()
+
+        assert row(store)["state"] == "pending"
+        assert row(store)["approval_ref"] is None
+        assert row(store)["presence_attempts"] == 1
+        assert backend.builds == []
+
+
 def test_suspended_account_withdrawal_stays_pending_until_unsuspended(
     tmp_path, caplog
 ):

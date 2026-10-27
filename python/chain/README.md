@@ -27,6 +27,22 @@ and never runs `LedgerStore` initialization or
 migrations. A missing, unreadable, or old-schema ledger is therefore a collection error
 and creates the payout kill file rather than a new database.
 
+An indexer account paused by a mismatch stays paused until a human operator repairs the
+cause and runs the hub-local CLI:
+
+```bash
+python3 python/chain/indexer.py unpause \
+  --token-account TOKEN_ACCOUNT \
+  --reason "what was repaired and how it was verified"
+```
+
+This command is intentionally only a CLI; it is not exposed through HTTP or an agent/MCP
+tool. It reads the token account at finalized commitment and refuses unless that balance
+equals the account's indexed deposits minus every finalized or still-in-flight sweep. It
+has no force option. A successful unpause and the most recent prior indexer alert are
+written together to the append-only `chain_indexer_unpause_audit` table in the same
+transaction that clears `chain_indexer_accounts.paused`.
+
 It uses only read RPC methods and does not need `solders`; `/usr/bin/python3` is sufficient
 when Neuron's normal Python dependencies are installed. Every collection brackets one
 transactional ledger image with two finalized `getMultipleAccounts` reads and batches all
@@ -114,6 +130,14 @@ list should only ever shrink.
   exception, or repeated inconclusive result and never removes it. Creation is exclusive,
   does not follow symlinks, and replaces a symlink/special-file obstruction with a real
   regular kill file.
+- Withdrawals above the automatic/day caps use the existing write-gate presence flow, but
+  the treasury worker never waits synchronously for Face ID. It durably records the exact
+  withdrawal id, amount, address, challenge, broker request, and expiry, then checks that
+  same request on later passes. Restarts resume the recorded request instead of prompting
+  twice. Only a locally verified, unexpired answer matching all three payout fields can
+  approve the withdrawal; denial, expiry, malformed approval, broker/configuration errors,
+  and ambiguous responses all fail closed. Other withdrawals and deposit-account sweeps
+  continue while approval is pending or one request fails.
 
 The reconcile alert path calls Trisul's existing
 `/home/prithvi/trisul/infra/mesh-agent/buzz-say.sh` helper when present. That helper reuses

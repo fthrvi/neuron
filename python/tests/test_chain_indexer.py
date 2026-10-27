@@ -1,6 +1,7 @@
 """Unit tests against captured jsonParsed Solana RPC shapes."""
 import json
 import os
+import sqlite3
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -14,6 +15,8 @@ from chain.indexer import (  # noqa: E402
     MAINNET_GENESIS_HASH,
     DepositIndexer,
     IndexerConfig,
+    UnpauseRefused,
+    _parser,
 )
 from chain.solana_rpc import RPCError, decode_base58, validate_pubkey  # noqa: E402
 from core.ledger_store import RATE, LedgerStore  # noqa: E402
@@ -175,6 +178,71 @@ def test_balance_mismatch_pauses_account_and_writes_alert(recorded, tmp_path, ca
         assert indexer.poll_once() == 0
         assert len(rpc.calls) == calls
         assert "chain_indexer_alert" in caplog.text
+
+
+def test_operator_unpause_refuses_mismatch_then_succeeds_and_audits(
+    recorded, tmp_path
+):
+    rpc = FakeRPC(recorded, balance=9)
+    account = recorded["addresses"]["deposit"]
+    with LedgerStore(tmp_path / "unpause.sqlite") as store:
+        _register(store, recorded)
+        indexer = DepositIndexer(store, rpc, _config(recorded))
+        assert [item.token_account for item in indexer._accounts()] == [account]
+        store.deposit_batch(
+            "alice", account, [("indexed:0", 15 * RATE, 1)], 15 * RATE
+        )
+        store.begin_sweep(
+            "sweep", "alice", account, 5, "sweep-sig", "blockhash", 99
+        )
+        store.finalize_sweep("sweep")
+        store._db.execute(
+            "UPDATE chain_indexer_accounts SET paused=1 WHERE token_account=?",
+            (account,),
+        )
+        store._db.execute(
+            "INSERT INTO chain_indexer_alerts"
+            "(ts, token_account, operator, kind, expected, actual, detail) "
+            "VALUES (1, ?, 'alice', 'balance_mismatch', 10, 9, 'repair required')",
+            (account,),
+        )
+
+        with pytest.raises(UnpauseRefused, match="expected 10, actual 9"):
+            indexer.unpause_account(account, "fixed the missing transfer")
+        assert store._db.execute(
+            "SELECT paused FROM chain_indexer_accounts WHERE token_account=?",
+            (account,),
+        ).fetchone()[0] == 1
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM chain_indexer_unpause_audit"
+        ).fetchone()[0] == 0
+
+        rpc.balance = 10
+        result = indexer.unpause_account(account, "fixed the missing transfer")
+        assert result["expected"] == result["actual"] == 10
+        assert store._db.execute(
+            "SELECT paused FROM chain_indexer_accounts WHERE token_account=?",
+            (account,),
+        ).fetchone()[0] == 0
+        audit = store._db.execute(
+            "SELECT token_account, reason, prior_alert "
+            "FROM chain_indexer_unpause_audit"
+        ).fetchone()
+        assert audit["token_account"] == account
+        assert audit["reason"] == "fixed the missing transfer"
+        assert json.loads(audit["prior_alert"])["detail"] == "repair required"
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            store._db.execute("DELETE FROM chain_indexer_unpause_audit")
+
+
+def test_unpause_cli_is_explicit_operator_subcommand(recorded):
+    account = recorded["addresses"]["deposit"]
+    args = _parser().parse_args(
+        ["unpause", "--token-account", account, "--reason", "repaired"]
+    )
+    assert args.command == "unpause"
+    assert args.token_account == account
+    assert args.reason == "repaired"
 
 
 def test_finalized_sweep_then_new_deposit_is_credited(recorded, tmp_path):

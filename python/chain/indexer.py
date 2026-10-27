@@ -71,6 +71,10 @@ class RPCDisagreement(RuntimeError):
     """The primary and confirmation RPCs returned different durable data."""
 
 
+class UnpauseRefused(RuntimeError):
+    """A paused account is not yet safe for an operator to resume."""
+
+
 def _is_loopback_rpc(url: str) -> bool:
     parsed = urlparse(url)
     host = parsed.hostname
@@ -307,6 +311,35 @@ class DepositIndexer:
                     actual INTEGER,
                     detail TEXT NOT NULL
                 )
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chain_indexer_unpause_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_account TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    prior_alert TEXT NOT NULL
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS chain_indexer_unpause_audit_no_update
+                BEFORE UPDATE ON chain_indexer_unpause_audit
+                BEGIN
+                    SELECT RAISE(ABORT, 'indexer unpause audit is append-only');
+                END
+                """
+            )
+            db.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS chain_indexer_unpause_audit_no_delete
+                BEFORE DELETE ON chain_indexer_unpause_audit
+                BEGIN
+                    SELECT RAISE(ABORT, 'indexer unpause audit is append-only');
+                END
                 """
             )
 
@@ -619,18 +652,123 @@ class DepositIndexer:
                 )
         return accepted
 
+    def unpause_account(self, token_account: str, reason: str) -> dict[str, Any]:
+        """Resume one repaired account only when chain and ledger now reconcile."""
+        token_account = validate_pubkey(token_account, "token account")
+        if not isinstance(reason, str) or not reason.strip():
+            raise UnpauseRefused("--reason must be non-empty")
+        reason = reason.strip()
+        if len(reason) > 2000:
+            raise UnpauseRefused("--reason must be at most 2000 characters")
+        now = int(time.time())
+
+        def operation(db: sqlite3.Connection) -> dict[str, Any]:
+            row = db.execute(
+                "SELECT d.operator, d.token_account, s.cursor, s.paused "
+                "FROM deposit_accounts AS d JOIN chain_indexer_accounts AS s "
+                "ON s.token_account=d.token_account WHERE d.token_account=?",
+                (token_account,),
+            ).fetchone()
+            if row is None:
+                raise UnpauseRefused("token account is not registered with the indexer")
+            if not int(row["paused"]):
+                raise UnpauseRefused("token account is not paused")
+
+            # The RPC helper reads at finalized commitment.  Keeping this read
+            # inside BEGIN IMMEDIATE prevents the ledger expectation changing
+            # between comparison and the audited unpause commit.
+            try:
+                snapshot = self._validate_snapshot(
+                    DepositAccount(
+                        operator=str(row["operator"]),
+                        token_account=str(row["token_account"]),
+                        cursor=row["cursor"],
+                        paused=True,
+                    )
+                )
+            except (RPCError, RPCDisagreement):
+                raise
+            except (KeyError, TypeError, ValueError) as exc:
+                raise UnpauseRefused(f"token account snapshot is invalid: {exc}") from exc
+            indexed_credits = int(
+                db.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM chain_refs "
+                    "WHERE kind='deposit' AND token_account=?",
+                    (token_account,),
+                ).fetchone()[0]
+            )
+            if indexed_credits % RATE:
+                raise UnpauseRefused("indexed deposit total is not an exact token amount")
+            swept_micro = int(
+                db.execute(
+                    "SELECT COALESCE(SUM(amount_micro), 0) FROM chain_sweeps "
+                    "WHERE token_account=? AND state IN ('sent','finalized')",
+                    (token_account,),
+                ).fetchone()[0]
+            )
+            expected = indexed_credits // RATE - swept_micro
+            actual = int(snapshot["amount"])
+            if expected < 0:
+                raise UnpauseRefused("sweeps exceed indexed deposits")
+            if actual != expected:
+                raise UnpauseRefused(
+                    f"finalized balance still mismatches: expected {expected}, actual {actual}"
+                )
+            alert = db.execute(
+                "SELECT id, ts, token_account, operator, kind, expected, actual, detail "
+                "FROM chain_indexer_alerts WHERE token_account=? ORDER BY id DESC LIMIT 1",
+                (token_account,),
+            ).fetchone()
+            if alert is None:
+                raise UnpauseRefused("paused account has no prior alert to audit")
+            prior_alert = json.dumps(
+                dict(alert), sort_keys=True, separators=(",", ":")
+            )
+            db.execute(
+                "INSERT INTO chain_indexer_unpause_audit"
+                "(token_account, reason, ts, prior_alert) VALUES (?, ?, ?, ?)",
+                (token_account, reason, now, prior_alert),
+            )
+            updated = db.execute(
+                "UPDATE chain_indexer_accounts SET paused=0, updated_ts=? "
+                "WHERE token_account=? AND paused=1",
+                (now, token_account),
+            ).rowcount
+            if updated != 1:
+                raise UnpauseRefused("paused state changed during unpause")
+            return {
+                "token_account": token_account,
+                "operator": str(row["operator"]),
+                "expected": expected,
+                "actual": actual,
+                "reason": reason,
+                "ts": now,
+                "prior_alert": json.loads(prior_alert),
+            }
+
+        return self.store._tx(operation)
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", default=DEFAULT_STORE, help="ledger SQLite path")
     parser.add_argument("--once", action="store_true", help="poll once and exit")
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S)
+    commands = parser.add_subparsers(dest="command")
+    unpause = commands.add_parser(
+        "unpause", help="operator-only reconciliation-checked account unpause"
+    )
+    unpause.add_argument(
+        "--store", dest="store", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    unpause.add_argument("--token-account", required=True)
+    unpause.add_argument("--reason", required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.interval <= 0:
+    if args.command is None and args.interval <= 0:
         raise SystemExit("--interval must be positive")
     logging.basicConfig(
         level=os.environ.get("NAK_INDEXER_LOG_LEVEL", "INFO"),
@@ -652,6 +790,18 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             LOG.error("RPC cluster refused: %s", exc)
             return 2
+        if args.command == "unpause":
+            try:
+                result = indexer.unpause_account(args.token_account, args.reason)
+            except (UnpauseRefused, RPCError, RPCDisagreement, ValueError) as exc:
+                LOG.error("unpause refused: %s", exc)
+                return 1
+            LOG.info(
+                "account unpaused operator=%s account=%s balance_micro=%s reason=%s",
+                result["operator"], result["token_account"], result["actual"],
+                result["reason"],
+            )
+            return 0
         while True:
             indexer.poll_once()
             if args.once:
