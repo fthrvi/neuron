@@ -102,6 +102,11 @@
               },
               {
                 "kind": "account",
+                "path": "channel.generation",
+                "account": "Channel"
+              },
+              {
+                "kind": "account",
                 "path": "channel.seq",
                 "account": "Channel"
               }
@@ -199,6 +204,11 @@
               {
                 "kind": "account",
                 "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "channel.generation",
+                "account": "Channel"
               },
               {
                 "kind": "account",
@@ -329,6 +339,11 @@
               {
                 "kind": "account",
                 "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "channel.generation",
+                "account": "Channel"
               },
               {
                 "kind": "account",
@@ -468,6 +483,11 @@
               },
               {
                 "kind": "account",
+                "path": "escrow.generation",
+                "account": "Escrow"
+              },
+              {
+                "kind": "account",
                 "path": "escrow.channel_seq",
                 "account": "Escrow"
               }
@@ -585,6 +605,11 @@
               },
               {
                 "kind": "account",
+                "path": "channel.generation",
+                "account": "Channel"
+              },
+              {
+                "kind": "account",
                 "path": "channel.seq",
                 "account": "Channel"
               }
@@ -621,8 +646,30 @@
           "writable": true
         },
         {
-          "name": "fee_wallet",
-          "writable": true
+          "name": "fee_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              }
+            ]
+          }
         },
         {
           "name": "instructions_sysvar",
@@ -916,6 +963,35 @@
           "name": "fee_wallet"
         },
         {
+          "name": "fee_vault",
+          "docs": [
+            "and initialized with the config PDA as its authority."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              }
+            ]
+          }
+        },
+        {
           "name": "token_program",
           "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         },
@@ -1049,6 +1125,110 @@
           "type": "pubkey"
         }
       ]
+    },
+    {
+      "name": "delegate_close",
+      "discriminator": [
+        120,
+        94,
+        188,
+        183,
+        112,
+        152,
+        74,
+        240
+      ],
+      "accounts": [
+        {
+          "name": "executor",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "escrow",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  115,
+                  99,
+                  114,
+                  111,
+                  119
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "escrow.owner",
+                "account": "Escrow"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner",
+          "writable": true
+        },
+        {
+          "name": "delegate",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  101,
+                  108,
+                  101,
+                  103,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "delegate"
+              }
+            ]
+          }
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": []
     },
     {
       "name": "delegate_revoke",
@@ -1544,6 +1724,38 @@
           }
         },
         {
+          "name": "owner_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  119,
+                  110,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
           "name": "mint"
         },
         {
@@ -1925,6 +2137,95 @@
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "fee_withdraw",
+      "discriminator": [
+        235,
+        155,
+        45,
+        148,
+        187,
+        198,
+        29,
+        179
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "fee_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "config"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fee_wallet",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
     }
   ],
   "accounts": [
@@ -1978,6 +2279,19 @@
         22,
         218,
         155
+      ]
+    },
+    {
+      "name": "OwnerState",
+      "discriminator": [
+        234,
+        56,
+        107,
+        216,
+        144,
+        52,
+        54,
+        244
       ]
     }
   ],
@@ -2113,6 +2427,19 @@
       ]
     },
     {
+      "name": "DelegateClosed",
+      "discriminator": [
+        234,
+        128,
+        98,
+        53,
+        255,
+        112,
+        237,
+        21
+      ]
+    },
+    {
       "name": "DelegateRevoked",
       "discriminator": [
         10,
@@ -2175,6 +2502,19 @@
         87,
         127,
         79
+      ]
+    },
+    {
+      "name": "FeeWithdrawn",
+      "discriminator": [
+        167,
+        107,
+        0,
+        35,
+        67,
+        79,
+        125,
+        118
       ]
     },
     {
@@ -2358,56 +2698,66 @@
     },
     {
       "code": 6025,
+      "name": "DelegateDisabled",
+      "msg": "The delegate is disabled while existing channels are still open"
+    },
+    {
+      "code": 6026,
+      "name": "DelegateChannelsOpen",
+      "msg": "The delegate still has open channels"
+    },
+    {
+      "code": 6027,
       "name": "InsufficientCollateral",
       "msg": "The escrow vault does not fully collateralize this channel"
     },
     {
-      "code": 6026,
+      "code": 6028,
       "name": "ChannelNotOpen",
       "msg": "The channel is not open"
     },
     {
-      "code": 6027,
+      "code": 6029,
       "name": "ChannelCloseElapsed",
       "msg": "The channel close grace period has elapsed"
     },
     {
-      "code": 6028,
+      "code": 6030,
       "name": "ChannelCloseNotElapsed",
       "msg": "The channel close grace period has not elapsed"
     },
     {
-      "code": 6029,
+      "code": 6031,
       "name": "VoucherNotIncreasing",
       "msg": "The voucher total must strictly increase"
     },
     {
-      "code": 6030,
+      "code": 6032,
       "name": "VoucherExceedsCap",
       "msg": "The voucher total exceeds the channel cap"
     },
     {
-      "code": 6031,
+      "code": 6033,
       "name": "InvalidEd25519Instruction",
       "msg": "The preceding instruction is not a valid Ed25519 verification"
     },
     {
-      "code": 6032,
+      "code": 6034,
       "name": "InvalidVoucherSigner",
       "msg": "The voucher signer is not authorized for this channel"
     },
     {
-      "code": 6033,
+      "code": 6035,
       "name": "InvalidVoucherMessage",
       "msg": "The signed voucher message does not match this redemption"
     },
     {
-      "code": 6034,
+      "code": 6036,
       "name": "RedeemViaCpi",
       "msg": "Channel redemption cannot be invoked through CPI"
     },
     {
-      "code": 6035,
+      "code": 6037,
       "name": "WrongDelegate",
       "msg": "The supplied delegate account does not match the channel"
     }
@@ -2461,6 +2811,10 @@
           {
             "name": "escrow",
             "type": "pubkey"
+          },
+          {
+            "name": "generation",
+            "type": "u64"
           },
           {
             "name": "seq",
@@ -2601,6 +2955,10 @@
             "type": "u64"
           },
           {
+            "name": "generation",
+            "type": "u64"
+          },
+          {
             "name": "worker",
             "type": "pubkey"
           },
@@ -2684,6 +3042,10 @@
           },
           {
             "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "fee_vault_bump",
             "type": "u8"
           }
         ]
@@ -2803,8 +3165,36 @@
             "type": "u8"
           },
           {
+            "name": "open_channels",
+            "type": "u32"
+          },
+          {
+            "name": "disabled",
+            "type": "bool"
+          },
+          {
             "name": "bump",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DelegateClosed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "escrow",
+            "type": "pubkey"
+          },
+          {
+            "name": "delegate",
+            "type": "pubkey"
+          },
+          {
+            "name": "key",
+            "type": "pubkey"
           }
         ]
       }
@@ -2915,6 +3305,10 @@
             "type": "u64"
           },
           {
+            "name": "generation",
+            "type": "u64"
+          },
+          {
             "name": "pending_withdraw",
             "type": {
               "option": {
@@ -2983,6 +3377,42 @@
           {
             "name": "vault",
             "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FeeWithdrawn",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "config",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OwnerState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "next_generation",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
           }
         ]
       }
@@ -3160,6 +3590,16 @@
       "name": "FEE_BPS_MAX",
       "type": "u16",
       "value": "1000"
+    },
+    {
+      "name": "FEE_VAULT_SEED",
+      "type": "bytes",
+      "value": "[102, 101, 101, 95, 118, 97, 117, 108, 116]"
+    },
+    {
+      "name": "OWNER_STATE_SEED",
+      "type": "bytes",
+      "value": "[111, 119, 110, 101, 114, 95, 115, 116, 97, 116, 101]"
     },
     {
       "name": "VAULT_SEED",

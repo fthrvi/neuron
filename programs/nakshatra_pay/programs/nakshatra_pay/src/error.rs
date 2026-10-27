@@ -52,6 +52,10 @@ pub enum PayError {
     DelegateFlagMissing,
     #[msg("The delegate cap would be exceeded")]
     DelegateCapExceeded,
+    #[msg("The delegate is disabled while existing channels are still open")]
+    DelegateDisabled,
+    #[msg("The delegate still has open channels")]
+    DelegateChannelsOpen,
     #[msg("The escrow vault does not fully collateralize this channel")]
     InsufficientCollateral,
     #[msg("The channel is not open")]

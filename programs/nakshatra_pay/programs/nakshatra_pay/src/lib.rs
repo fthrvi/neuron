@@ -38,6 +38,8 @@ fn strict_entry<'info>(
         Some(instruction::ConfigProposeAuthority::DISCRIMINATOR.len() + 32)
     } else if data.starts_with(instruction::ConfigAcceptAuthority::DISCRIMINATOR) {
         Some(instruction::ConfigAcceptAuthority::DISCRIMINATOR.len())
+    } else if data.starts_with(instruction::FeeWithdraw::DISCRIMINATOR) {
+        Some(instruction::FeeWithdraw::DISCRIMINATOR.len() + 8)
     } else if data.starts_with(instruction::EscrowInit::DISCRIMINATOR) {
         Some(instruction::EscrowInit::DISCRIMINATOR.len())
     } else if data.starts_with(instruction::EscrowDeposit::DISCRIMINATOR) {
@@ -54,6 +56,8 @@ fn strict_entry<'info>(
         Some(instruction::DelegateSet::DISCRIMINATOR.len() + 32 + 8 + 8 + 1)
     } else if data.starts_with(instruction::DelegateRevoke::DISCRIMINATOR) {
         Some(instruction::DelegateRevoke::DISCRIMINATOR.len() + 32)
+    } else if data.starts_with(instruction::DelegateClose::DISCRIMINATOR) {
+        Some(instruction::DelegateClose::DISCRIMINATOR.len())
     } else if data.starts_with(instruction::ChannelOpen::DISCRIMINATOR) {
         Some(instruction::ChannelOpen::DISCRIMINATOR.len() + 32 + 8)
     } else if data.starts_with(instruction::ChannelFund::DISCRIMINATOR) {
@@ -99,6 +103,9 @@ pub mod nakshatra_pay {
     pub fn config_accept_authority(ctx: Context<ConfigAcceptAuthorityAccounts>) -> Result<()> {
         instructions::handle_config_accept_authority(ctx)
     }
+    pub fn fee_withdraw(ctx: Context<FeeWithdrawAccounts>, amount: u64) -> Result<()> {
+        instructions::handle_fee_withdraw(ctx, amount)
+    }
     pub fn escrow_init(ctx: Context<EscrowInitAccounts>) -> Result<()> {
         instructions::handle_escrow_init(ctx)
     }
@@ -128,6 +135,9 @@ pub mod nakshatra_pay {
     }
     pub fn delegate_revoke(ctx: Context<DelegateRevokeAccounts>, key: Pubkey) -> Result<()> {
         instructions::handle_delegate_revoke(ctx, key)
+    }
+    pub fn delegate_close(ctx: Context<DelegateCloseAccounts>) -> Result<()> {
+        instructions::handle_delegate_close(ctx)
     }
     pub fn channel_open(ctx: Context<ChannelOpenAccounts>, worker: Pubkey, cap: u64) -> Result<()> {
         instructions::handle_channel_open(ctx, worker, cap)

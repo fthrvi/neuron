@@ -13,6 +13,14 @@ pub struct Config {
     pub pending: Option<PendingConfig>,
     pub pending_authority: Option<Pubkey>,
     pub bump: u8,
+    pub fee_vault_bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct OwnerState {
+    pub next_generation: u64,
+    pub bump: u8,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, InitSpace, PartialEq, Eq)]
@@ -31,6 +39,7 @@ pub struct Escrow {
     pub open_channels: u32,
     pub open_tasks: u32,
     pub channel_seq: u64,
+    pub generation: u64,
     pub pending_withdraw: Option<PendingWithdrawal>,
     pub rent_payer: Pubkey,
     pub bump: u8,
@@ -52,6 +61,8 @@ pub struct Delegate {
     pub spent: u64,
     pub expires_at: i64,
     pub flags: u8,
+    pub open_channels: u32,
+    pub disabled: bool,
     pub bump: u8,
 }
 
@@ -65,6 +76,7 @@ pub enum ChannelStatus {
 #[derive(InitSpace)]
 pub struct Channel {
     pub escrow: Pubkey,
+    pub generation: u64,
     pub seq: u64,
     pub worker: Pubkey,
     pub voucher_signer: Pubkey,

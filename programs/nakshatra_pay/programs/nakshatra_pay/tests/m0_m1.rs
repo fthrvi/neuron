@@ -177,6 +177,8 @@ fn config_init_ix(
     fee_wallet: Pubkey,
     fee_bps: u16,
 ) -> Instruction {
+    let fee_vault =
+        Pubkey::find_program_address(&[FEE_VAULT_SEED, config.as_ref()], &nakshatra_pay::id()).0;
     Instruction::new_with_bytes(
         nakshatra_pay::id(),
         &nakshatra_pay::instruction::ConfigInit { fee_bps }.data(),
@@ -186,6 +188,7 @@ fn config_init_ix(
             program_data: program_data_address(),
             mint,
             fee_wallet,
+            fee_vault,
             token_program: spl_token::ID,
             system_program: system_program::ID,
             event_authority: event_authority(),
@@ -257,6 +260,11 @@ impl Fixture {
         .0;
         let vault =
             Pubkey::find_program_address(&[VAULT_SEED, escrow.as_ref()], &nakshatra_pay::id()).0;
+        let owner_state = Pubkey::find_program_address(
+            &[OWNER_STATE_SEED, config.as_ref(), owner.pubkey().as_ref()],
+            &nakshatra_pay::id(),
+        )
+        .0;
         if init_config {
             assert!(send(
                 &mut svm,
@@ -277,6 +285,7 @@ impl Fixture {
                 nakshatra_pay::accounts::EscrowInitAccounts {
                     owner: owner.pubkey(),
                     config,
+                    owner_state,
                     mint,
                     escrow,
                     vault,
@@ -834,12 +843,18 @@ fn m1_fake_config_owned_by_another_program_is_rejected() {
     .0;
     let fake_vault =
         Pubkey::find_program_address(&[VAULT_SEED, fake_escrow.as_ref()], &nakshatra_pay::id()).0;
+    let fake_owner_state = Pubkey::find_program_address(
+        &[OWNER_STATE_SEED, fake.as_ref(), f.owner.pubkey().as_ref()],
+        &nakshatra_pay::id(),
+    )
+    .0;
     let ix = Instruction::new_with_bytes(
         nakshatra_pay::id(),
         &nakshatra_pay::instruction::EscrowInit {}.data(),
         nakshatra_pay::accounts::EscrowInitAccounts {
             owner: f.owner.pubkey(),
             config: fake,
+            owner_state: fake_owner_state,
             mint: f.mint,
             escrow: fake_escrow,
             vault: fake_vault,

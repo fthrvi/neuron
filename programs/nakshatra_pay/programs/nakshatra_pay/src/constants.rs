@@ -3,6 +3,8 @@ use anchor_lang::prelude::*;
 #[constant]
 pub const CONFIG_SEED: &[u8] = b"config";
 #[constant]
+pub const OWNER_STATE_SEED: &[u8] = b"owner_state";
+#[constant]
 pub const ESCROW_SEED: &[u8] = b"escrow";
 #[constant]
 pub const VAULT_SEED: &[u8] = b"vault";
@@ -10,6 +12,8 @@ pub const VAULT_SEED: &[u8] = b"vault";
 pub const DELEGATE_SEED: &[u8] = b"delegate";
 #[constant]
 pub const CHANNEL_SEED: &[u8] = b"channel";
+#[constant]
+pub const FEE_VAULT_SEED: &[u8] = b"fee_vault";
 
 pub const DELEGATE_OPEN_CHANNEL: u8 = 1;
 pub const DELEGATE_OPEN_TASK: u8 = 2;

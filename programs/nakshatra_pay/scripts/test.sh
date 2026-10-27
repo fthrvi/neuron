@@ -5,4 +5,5 @@ workspace_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$workspace_dir"
 
 anchor build --arch v0 --tools-version v1.57
+cargo build-sbf --manifest-path test-support/redeem-cpi/Cargo.toml --sbf-out-dir target/deploy
 cargo test

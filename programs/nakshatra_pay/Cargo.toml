@@ -2,6 +2,7 @@
 members = [
     "programs/*"
 ]
+exclude = ["test-support/redeem-cpi"]
 resolver = "2"
 
 [workspace.package]

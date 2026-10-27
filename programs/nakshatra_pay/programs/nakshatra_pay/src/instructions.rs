@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::instruction::get_stack_height;
 use anchor_lang::solana_program::program_pack::Pack;
-use anchor_lang::solana_program::{instruction::get_stack_height, program::invoke_signed};
 use anchor_spl::token::{
     self,
     spl_token::state::{Account as SplTokenAccount, Mint as SplMint},
@@ -11,7 +11,10 @@ use crate::{
     constants::*,
     error::PayError,
     events::*,
-    state::{Channel, ChannelStatus, Config, Delegate, Escrow, PendingConfig, PendingWithdrawal},
+    state::{
+        Channel, ChannelStatus, Config, Delegate, Escrow, OwnerState, PendingConfig,
+        PendingWithdrawal,
+    },
 };
 
 #[event_cpi]
@@ -32,6 +35,10 @@ pub struct ConfigInitAccounts<'info> {
     pub mint: UncheckedAccount<'info>,
     /// CHECK: classic SPL token owner, layout, and mint checked in the handler.
     pub fee_wallet: UncheckedAccount<'info>,
+    #[account(init, payer = authority, space = SplTokenAccount::LEN, owner = token_program.key(), seeds = [FEE_VAULT_SEED, config.key().as_ref()], bump)]
+    /// CHECK: created at the canonical fee-vault PDA, assigned to classic SPL Token,
+    /// and initialized with the config PDA as its authority.
+    pub fee_vault: UncheckedAccount<'info>,
     #[account(address = anchor_spl::token::ID @ PayError::InvalidTokenProgram)]
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -51,6 +58,14 @@ pub fn handle_config_init(ctx: Context<ConfigInitAccounts>, fee_bps: u16) -> Res
         ctx.accounts.mint.key(),
         PayError::WrongMint
     );
+    token::initialize_account3(CpiContext::new(
+        ctx.accounts.token_program.key(),
+        InitializeAccount3 {
+            account: ctx.accounts.fee_vault.to_account_info(),
+            mint: ctx.accounts.mint.to_account_info(),
+            authority: ctx.accounts.config.to_account_info(),
+        },
+    ))?;
     let config = &mut ctx.accounts.config;
     config.authority = ctx.accounts.authority.key();
     config.mint = ctx.accounts.mint.key();
@@ -62,6 +77,7 @@ pub fn handle_config_init(ctx: Context<ConfigInitAccounts>, fee_bps: u16) -> Res
     config.pending = None;
     config.pending_authority = None;
     config.bump = ctx.bumps.config;
+    config.fee_vault_bump = ctx.bumps.fee_vault;
     emit_cpi!(ConfigInit {
         config: config.key(),
         authority: config.authority,
@@ -221,11 +237,71 @@ pub fn handle_config_accept_authority(ctx: Context<ConfigAcceptAuthorityAccounts
 
 #[event_cpi]
 #[derive(Accounts)]
+pub struct FeeWithdrawAccounts<'info> {
+    pub authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = authority @ PayError::Unauthorized)]
+    pub config: Account<'info, Config>,
+    /// CHECK: pinned by config; classic SPL mint layout checked in the handler.
+    #[account(address = config.mint @ PayError::WrongMint)]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: canonical PDA; classic SPL token layout, mint, and authority checked in handler.
+    #[account(mut, seeds = [FEE_VAULT_SEED, config.key().as_ref()], bump = config.fee_vault_bump)]
+    pub fee_vault: UncheckedAccount<'info>,
+    /// CHECK: current configured wallet; classic SPL token layout and mint checked in handler.
+    #[account(mut, address = config.fee_wallet, constraint = fee_wallet.key() != fee_vault.key() @ PayError::DuplicateTokenAccount)]
+    pub fee_wallet: UncheckedAccount<'info>,
+    #[account(address = anchor_spl::token::ID @ PayError::InvalidTokenProgram)]
+    pub token_program: Program<'info, Token>,
+}
+
+pub fn handle_fee_withdraw(ctx: Context<FeeWithdrawAccounts>, amount: u64) -> Result<()> {
+    require!(amount > 0, PayError::ZeroAmount);
+    let mint = load_mint(&ctx.accounts.mint)?;
+    let fee_vault = load_token(&ctx.accounts.fee_vault)?;
+    let fee_wallet = load_token(&ctx.accounts.fee_wallet)?;
+    require_token(
+        &fee_vault,
+        ctx.accounts.config.mint,
+        ctx.accounts.config.key(),
+    )?;
+    require_keys_eq!(
+        fee_wallet.mint,
+        ctx.accounts.config.mint,
+        PayError::WrongMint
+    );
+    let bump = [ctx.accounts.config.bump];
+    let signer_seeds: &[&[u8]] = &[CONFIG_SEED, &bump];
+    token::transfer_checked(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.key(),
+            TransferChecked {
+                from: ctx.accounts.fee_vault.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                to: ctx.accounts.fee_wallet.to_account_info(),
+                authority: ctx.accounts.config.to_account_info(),
+            },
+            &[signer_seeds],
+        ),
+        amount,
+        mint.decimals,
+    )?;
+    emit_cpi!(FeeWithdrawn {
+        config: ctx.accounts.config.key(),
+        fee_wallet: ctx.accounts.fee_wallet.key(),
+        amount
+    });
+    Ok(())
+}
+
+#[event_cpi]
+#[derive(Accounts)]
 pub struct EscrowInitAccounts<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
+    #[account(init_if_needed, payer = owner, space = 8 + OwnerState::INIT_SPACE, seeds = [OWNER_STATE_SEED, config.key().as_ref(), owner.key().as_ref()], bump)]
+    pub owner_state: Account<'info, OwnerState>,
     /// CHECK: pinned by config; classic SPL mint owner and layout checked in the handler.
     #[account(address = config.mint @ PayError::WrongMint)]
     pub mint: UncheckedAccount<'info>,
@@ -255,6 +331,19 @@ pub fn handle_escrow_init(ctx: Context<EscrowInitAccounts>) -> Result<()> {
             authority: ctx.accounts.escrow.to_account_info(),
         },
     ))?;
+    let owner_state = &mut ctx.accounts.owner_state;
+    if owner_state.next_generation == 0 {
+        owner_state.bump = ctx.bumps.owner_state;
+    } else {
+        require!(
+            owner_state.bump == ctx.bumps.owner_state,
+            PayError::Unauthorized
+        );
+    }
+    let generation = owner_state.next_generation;
+    owner_state.next_generation = generation
+        .checked_add(1)
+        .ok_or(PayError::ArithmeticOverflow)?;
     let escrow = &mut ctx.accounts.escrow;
     escrow.owner = ctx.accounts.owner.key();
     escrow.vault = ctx.accounts.vault.key();
@@ -262,6 +351,7 @@ pub fn handle_escrow_init(ctx: Context<EscrowInitAccounts>) -> Result<()> {
     escrow.open_channels = 0;
     escrow.open_tasks = 0;
     escrow.channel_seq = 0;
+    escrow.generation = generation;
     escrow.pending_withdraw = None;
     escrow.rent_payer = ctx.accounts.owner.key();
     escrow.bump = ctx.bumps.escrow;
@@ -535,9 +625,8 @@ pub struct DelegateSetAccounts<'info> {
     pub config: Account<'info, Config>,
     #[account(seeds = [ESCROW_SEED, config.key().as_ref(), owner.key().as_ref()], bump = escrow.bump, has_one = owner @ PayError::Unauthorized)]
     pub escrow: Account<'info, Escrow>,
-    /// CHECK: canonical PDA; this is manually initialized to support safe upsert without init_if_needed.
-    #[account(mut, seeds = [DELEGATE_SEED, escrow.key().as_ref(), key.as_ref()], bump)]
-    pub delegate: UncheckedAccount<'info>,
+    #[account(init_if_needed, payer = owner, space = 8 + Delegate::INIT_SPACE, seeds = [DELEGATE_SEED, escrow.key().as_ref(), key.as_ref()], bump)]
+    pub delegate: Account<'info, Delegate>,
     pub system_program: Program<'info, System>,
 }
 
@@ -556,56 +645,34 @@ pub fn handle_delegate_set(
         flags & !DELEGATE_FLAGS_ALL == 0,
         PayError::InvalidDelegateFlags
     );
-    let info = ctx.accounts.delegate.to_account_info();
-    let mut delegate = if info.owner == &crate::ID {
-        let current = Delegate::try_deserialize(&mut info.try_borrow_data()?.as_ref())?;
+    let delegate = &mut ctx.accounts.delegate;
+    if delegate.escrow == Pubkey::default() {
+        delegate.escrow = ctx.accounts.escrow.key();
+        delegate.key = key;
+        delegate.cap_total = 0;
+        delegate.spent = 0;
+        delegate.expires_at = expires_at;
+        delegate.flags = flags;
+        delegate.open_channels = 0;
+        delegate.disabled = false;
+        delegate.bump = ctx.bumps.delegate;
+    } else {
         require_keys_eq!(
-            current.escrow,
+            delegate.escrow,
             ctx.accounts.escrow.key(),
             PayError::WrongDelegate
         );
-        require_keys_eq!(current.key, key, PayError::WrongDelegate);
-        require!(current.bump == ctx.bumps.delegate, PayError::WrongDelegate);
-        current
-    } else {
-        require_keys_eq!(*info.owner, System::id(), PayError::WrongDelegate);
-        require!(info.data_is_empty(), PayError::WrongDelegate);
-        let escrow_key = ctx.accounts.escrow.key();
-        let bump = [ctx.bumps.delegate];
-        let seeds: &[&[u8]] = &[DELEGATE_SEED, escrow_key.as_ref(), key.as_ref(), &bump];
-        invoke_signed(
-            &anchor_lang::solana_program::system_instruction::create_account(
-                &ctx.accounts.owner.key(),
-                &info.key(),
-                Rent::get()?.minimum_balance(8 + Delegate::INIT_SPACE),
-                (8 + Delegate::INIT_SPACE) as u64,
-                &crate::ID,
-            ),
-            &[
-                ctx.accounts.owner.to_account_info(),
-                info.clone(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-            &[seeds],
-        )?;
-        Delegate {
-            escrow: ctx.accounts.escrow.key(),
-            key,
-            cap_total: 0,
-            spent: 0,
-            expires_at,
-            flags,
-            bump: ctx.bumps.delegate,
-        }
-    };
+        require_keys_eq!(delegate.key, key, PayError::WrongDelegate);
+        require!(delegate.bump == ctx.bumps.delegate, PayError::WrongDelegate);
+        require!(!delegate.disabled, PayError::DelegateDisabled);
+    }
     require!(cap_total >= delegate.spent, PayError::DelegateCapBelowSpent);
     delegate.cap_total = cap_total;
     delegate.expires_at = expires_at;
     delegate.flags = flags;
-    delegate.try_serialize(&mut &mut info.try_borrow_mut_data()?[..])?;
     emit_cpi!(DelegateSet {
         escrow: delegate.escrow,
-        delegate: info.key(),
+        delegate: delegate.key(),
         key,
         cap_total,
         spent: delegate.spent,
@@ -625,15 +692,52 @@ pub struct DelegateRevokeAccounts<'info> {
     pub config: Account<'info, Config>,
     #[account(seeds = [ESCROW_SEED, config.key().as_ref(), owner.key().as_ref()], bump = escrow.bump, has_one = owner @ PayError::Unauthorized)]
     pub escrow: Account<'info, Escrow>,
-    #[account(mut, close = owner, seeds = [DELEGATE_SEED, escrow.key().as_ref(), key.as_ref()], bump = delegate.bump, constraint = delegate.escrow == escrow.key() @ PayError::WrongDelegate, constraint = delegate.key == key @ PayError::WrongDelegate)]
+    #[account(mut, seeds = [DELEGATE_SEED, escrow.key().as_ref(), key.as_ref()], bump = delegate.bump, constraint = delegate.escrow == escrow.key() @ PayError::WrongDelegate, constraint = delegate.key == key @ PayError::WrongDelegate)]
     pub delegate: Account<'info, Delegate>,
 }
 
 pub fn handle_delegate_revoke(ctx: Context<DelegateRevokeAccounts>, key: Pubkey) -> Result<()> {
+    let delegate_key = ctx.accounts.delegate.key();
+    ctx.accounts.delegate.disabled = true;
+    ctx.accounts.delegate.cap_total = ctx.accounts.delegate.spent;
     emit_cpi!(DelegateRevoked {
         escrow: ctx.accounts.escrow.key(),
-        delegate: ctx.accounts.delegate.key(),
+        delegate: delegate_key,
         key
+    });
+    if ctx.accounts.delegate.open_channels == 0 {
+        ctx.accounts
+            .delegate
+            .close(ctx.accounts.owner.to_account_info())?;
+    }
+    Ok(())
+}
+
+#[event_cpi]
+#[derive(Accounts)]
+pub struct DelegateCloseAccounts<'info> {
+    pub executor: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(seeds = [ESCROW_SEED, config.key().as_ref(), escrow.owner.as_ref()], bump = escrow.bump)]
+    pub escrow: Account<'info, Escrow>,
+    /// CHECK: receives delegate rent and is pinned to the escrow owner.
+    #[account(mut, address = escrow.owner)]
+    pub owner: UncheckedAccount<'info>,
+    #[account(mut, close = owner, seeds = [DELEGATE_SEED, escrow.key().as_ref(), delegate.key.as_ref()], bump = delegate.bump, constraint = delegate.escrow == escrow.key() @ PayError::WrongDelegate)]
+    pub delegate: Account<'info, Delegate>,
+}
+
+pub fn handle_delegate_close(ctx: Context<DelegateCloseAccounts>) -> Result<()> {
+    require!(ctx.accounts.delegate.disabled, PayError::DelegateDisabled);
+    require!(
+        ctx.accounts.delegate.open_channels == 0,
+        PayError::DelegateChannelsOpen
+    );
+    emit_cpi!(DelegateClosed {
+        escrow: ctx.accounts.escrow.key(),
+        delegate: ctx.accounts.delegate.key(),
+        key: ctx.accounts.delegate.key
     });
     Ok(())
 }
@@ -653,7 +757,7 @@ pub struct ChannelOpenAccounts<'info> {
     pub vault: UncheckedAccount<'info>,
     #[account(mut)]
     pub delegate: Option<Account<'info, Delegate>>,
-    #[account(init, payer = signer, space = 8 + Channel::INIT_SPACE, seeds = [CHANNEL_SEED, escrow.key().as_ref(), &escrow.channel_seq.to_le_bytes()], bump)]
+    #[account(init, payer = signer, space = 8 + Channel::INIT_SPACE, seeds = [CHANNEL_SEED, escrow.key().as_ref(), &escrow.generation.to_le_bytes(), &escrow.channel_seq.to_le_bytes()], bump)]
     pub channel: Account<'info, Channel>,
     pub system_program: Program<'info, System>,
 }
@@ -672,6 +776,17 @@ pub fn handle_channel_open(
         cap,
         now,
     )?;
+    if delegate_key.is_some() {
+        let delegate = ctx
+            .accounts
+            .delegate
+            .as_mut()
+            .ok_or(PayError::WrongDelegate)?;
+        delegate.open_channels = delegate
+            .open_channels
+            .checked_add(1)
+            .ok_or(PayError::ArithmeticOverflow)?;
+    }
     let vault = load_token(&ctx.accounts.vault)?;
     require_token(&vault, ctx.accounts.config.mint, ctx.accounts.escrow.key())?;
     let committed = ctx
@@ -682,6 +797,7 @@ pub fn handle_channel_open(
         .ok_or(PayError::ArithmeticOverflow)?;
     require!(vault.amount >= committed, PayError::InsufficientCollateral);
     let seq = ctx.accounts.escrow.channel_seq;
+    let generation = ctx.accounts.escrow.generation;
     ctx.accounts.escrow.committed = committed;
     ctx.accounts.escrow.channel_seq = seq.checked_add(1).ok_or(PayError::ArithmeticOverflow)?;
     ctx.accounts.escrow.open_channels = ctx
@@ -692,6 +808,7 @@ pub fn handle_channel_open(
         .ok_or(PayError::ArithmeticOverflow)?;
     let channel = &mut ctx.accounts.channel;
     channel.escrow = ctx.accounts.escrow.key();
+    channel.generation = generation;
     channel.seq = seq;
     channel.worker = worker;
     channel.voucher_signer = ctx.accounts.signer.key();
@@ -707,6 +824,7 @@ pub fn handle_channel_open(
         escrow: channel.escrow,
         channel: channel.key(),
         seq,
+        generation,
         worker,
         voucher_signer: channel.voucher_signer,
         cap,
@@ -728,7 +846,7 @@ pub struct ChannelFundAccounts<'info> {
     pub vault: UncheckedAccount<'info>,
     #[account(mut)]
     pub delegate: Option<Account<'info, Delegate>>,
-    #[account(mut, seeds = [CHANNEL_SEED, escrow.key().as_ref(), &channel.seq.to_le_bytes()], bump = channel.bump, constraint = channel.escrow == escrow.key())]
+    #[account(mut, seeds = [CHANNEL_SEED, escrow.key().as_ref(), &channel.generation.to_le_bytes(), &channel.seq.to_le_bytes()], bump = channel.bump, constraint = channel.escrow == escrow.key(), constraint = channel.generation == escrow.generation)]
     pub channel: Account<'info, Channel>,
 }
 
@@ -790,17 +908,17 @@ pub struct ChannelRedeemAccounts<'info> {
     pub mint: UncheckedAccount<'info>,
     #[account(mut, seeds = [ESCROW_SEED, config.key().as_ref(), escrow.owner.as_ref()], bump = escrow.bump, has_one = vault)]
     pub escrow: Account<'info, Escrow>,
-    #[account(mut, seeds = [CHANNEL_SEED, escrow.key().as_ref(), &channel.seq.to_le_bytes()], bump = channel.bump, constraint = channel.escrow == escrow.key())]
+    #[account(mut, seeds = [CHANNEL_SEED, escrow.key().as_ref(), &channel.generation.to_le_bytes(), &channel.seq.to_le_bytes()], bump = channel.bump, constraint = channel.escrow == escrow.key(), constraint = channel.generation == escrow.generation)]
     pub channel: Account<'info, Channel>,
     /// CHECK: canonical PDA and classic SPL layout checked in the handler.
     #[account(mut, seeds = [VAULT_SEED, escrow.key().as_ref()], bump = escrow.vault_bump)]
     pub vault: UncheckedAccount<'info>,
     /// CHECK: classic SPL layout, worker authority and mint checked in the handler.
-    #[account(mut, constraint = worker_token.key() != vault.key() @ PayError::DuplicateTokenAccount, constraint = worker_token.key() != fee_wallet.key() @ PayError::DuplicateTokenAccount)]
+    #[account(mut, constraint = worker_token.key() != vault.key() @ PayError::DuplicateTokenAccount, constraint = worker_token.key() != fee_vault.key() @ PayError::DuplicateTokenAccount)]
     pub worker_token: UncheckedAccount<'info>,
-    /// CHECK: current configured wallet; classic SPL layout and mint checked in the handler.
-    #[account(mut, address = config.fee_wallet, constraint = fee_wallet.key() != vault.key() @ PayError::DuplicateTokenAccount)]
-    pub fee_wallet: UncheckedAccount<'info>,
+    /// CHECK: canonical fee PDA; classic SPL layout, mint and config authority checked in handler.
+    #[account(mut, seeds = [FEE_VAULT_SEED, config.key().as_ref()], bump = config.fee_vault_bump, constraint = fee_vault.key() != vault.key() @ PayError::DuplicateTokenAccount)]
+    pub fee_vault: UncheckedAccount<'info>,
     /// CHECK: address pinned to the instructions sysvar.
     #[account(address = solana_instructions_sysvar::ID)]
     pub instructions_sysvar: UncheckedAccount<'info>,
@@ -838,32 +956,42 @@ pub fn handle_channel_redeem(
     let mint = load_mint(&ctx.accounts.mint)?;
     let vault = load_token(&ctx.accounts.vault)?;
     let worker_token = load_token(&ctx.accounts.worker_token)?;
-    let fee_wallet = load_token(&ctx.accounts.fee_wallet)?;
+    let fee_vault = load_token(&ctx.accounts.fee_vault)?;
     require_token(&vault, ctx.accounts.config.mint, ctx.accounts.escrow.key())?;
     require_token(
         &worker_token,
         ctx.accounts.config.mint,
         ctx.accounts.channel.worker,
     )?;
-    require_keys_eq!(
-        fee_wallet.mint,
+    require_token(
+        &fee_vault,
         ctx.accounts.config.mint,
-        PayError::WrongMint
-    );
+        ctx.accounts.config.key(),
+    )?;
     let delta = cumulative_total
         .checked_sub(ctx.accounts.channel.redeemed)
         .ok_or(PayError::ArithmeticOverflow)?;
-    let fee = ((delta as u128)
+    let cumulative_fee = (cumulative_total as u128)
         .checked_mul(ctx.accounts.channel.fee_bps_snapshot as u128)
         .ok_or(PayError::ArithmeticOverflow)?
-        / 10_000) as u64;
+        / 10_000;
+    let redeemed_fee = (ctx.accounts.channel.redeemed as u128)
+        .checked_mul(ctx.accounts.channel.fee_bps_snapshot as u128)
+        .ok_or(PayError::ArithmeticOverflow)?
+        / 10_000;
+    let fee = u64::try_from(
+        cumulative_fee
+            .checked_sub(redeemed_fee)
+            .ok_or(PayError::ArithmeticOverflow)?,
+    )
+    .map_err(|_| error!(PayError::ArithmeticOverflow))?;
     let worker_amount = delta.checked_sub(fee).ok_or(PayError::ArithmeticOverflow)?;
     if fee > 0 {
         transfer_from_vault_to(
             &ctx.accounts.config,
             &ctx.accounts.escrow,
             &ctx.accounts.vault,
-            &ctx.accounts.fee_wallet,
+            &ctx.accounts.fee_vault,
             &ctx.accounts.mint,
             &ctx.accounts.token_program,
             fee,
@@ -908,7 +1036,7 @@ pub struct ChannelCloseRequestAccounts<'info> {
     pub config: Account<'info, Config>,
     #[account(seeds = [ESCROW_SEED, config.key().as_ref(), escrow.owner.as_ref()], bump = escrow.bump)]
     pub escrow: Account<'info, Escrow>,
-    #[account(mut, seeds = [CHANNEL_SEED, escrow.key().as_ref(), &channel.seq.to_le_bytes()], bump = channel.bump, constraint = channel.escrow == escrow.key())]
+    #[account(mut, seeds = [CHANNEL_SEED, escrow.key().as_ref(), &channel.generation.to_le_bytes(), &channel.seq.to_le_bytes()], bump = channel.bump, constraint = channel.escrow == escrow.key(), constraint = channel.generation == escrow.generation)]
     pub channel: Account<'info, Channel>,
 }
 
@@ -949,7 +1077,7 @@ pub struct ChannelCloseFinalizeAccounts<'info> {
     /// CHECK: receives channel rent and is pinned to the recorded payer.
     #[account(mut, address = channel.rent_payer)]
     pub rent_payer: UncheckedAccount<'info>,
-    #[account(mut, close = rent_payer, seeds = [CHANNEL_SEED, escrow.key().as_ref(), &channel.seq.to_le_bytes()], bump = channel.bump, constraint = channel.escrow == escrow.key())]
+    #[account(mut, close = rent_payer, seeds = [CHANNEL_SEED, escrow.key().as_ref(), &channel.generation.to_le_bytes(), &channel.seq.to_le_bytes()], bump = channel.bump, constraint = channel.escrow == escrow.key(), constraint = channel.generation == escrow.generation)]
     pub channel: Account<'info, Channel>,
 }
 
@@ -983,33 +1111,40 @@ pub fn handle_channel_close_finalize(ctx: Context<ChannelCloseFinalizeAccounts>)
         .checked_sub(1)
         .ok_or(PayError::ArithmeticOverflow)?;
     if let Some(delegate_key) = ctx.accounts.channel.delegate {
-        if let Some(delegate) = ctx.accounts.delegate.as_mut() {
-            require_keys_eq!(delegate.key(), delegate_key, PayError::WrongDelegate);
-            require_keys_eq!(
-                delegate.escrow,
-                ctx.accounts.escrow.key(),
-                PayError::WrongDelegate
-            );
-            require_keys_eq!(
-                delegate.key,
-                ctx.accounts.channel.voucher_signer,
-                PayError::WrongDelegate
-            );
-            let (expected, bump) = Pubkey::find_program_address(
-                &[
-                    DELEGATE_SEED,
-                    ctx.accounts.escrow.key().as_ref(),
-                    delegate.key.as_ref(),
-                ],
-                &crate::ID,
-            );
-            require_keys_eq!(expected, delegate.key(), PayError::WrongDelegate);
-            require!(delegate.bump == bump, PayError::WrongDelegate);
-            delegate.spent = delegate
-                .spent
-                .checked_sub(released)
-                .ok_or(PayError::ArithmeticOverflow)?;
-        }
+        let delegate = ctx
+            .accounts
+            .delegate
+            .as_mut()
+            .ok_or(PayError::WrongDelegate)?;
+        require_keys_eq!(delegate.key(), delegate_key, PayError::WrongDelegate);
+        require_keys_eq!(
+            delegate.escrow,
+            ctx.accounts.escrow.key(),
+            PayError::WrongDelegate
+        );
+        require_keys_eq!(
+            delegate.key,
+            ctx.accounts.channel.voucher_signer,
+            PayError::WrongDelegate
+        );
+        let (expected, bump) = Pubkey::find_program_address(
+            &[
+                DELEGATE_SEED,
+                ctx.accounts.escrow.key().as_ref(),
+                delegate.key.as_ref(),
+            ],
+            &crate::ID,
+        );
+        require_keys_eq!(expected, delegate.key(), PayError::WrongDelegate);
+        require!(delegate.bump == bump, PayError::WrongDelegate);
+        delegate.spent = delegate
+            .spent
+            .checked_sub(released)
+            .ok_or(PayError::ArithmeticOverflow)?;
+        delegate.open_channels = delegate
+            .open_channels
+            .checked_sub(1)
+            .ok_or(PayError::ArithmeticOverflow)?;
     } else {
         require!(ctx.accounts.delegate.is_none(), PayError::WrongDelegate);
     }
@@ -1036,6 +1171,7 @@ fn authorize_channel_spend(
     let delegate = delegate.ok_or(PayError::Unauthorized)?;
     require_keys_eq!(delegate.escrow, escrow.key(), PayError::WrongDelegate);
     require_keys_eq!(delegate.key, signer, PayError::Unauthorized);
+    require!(!delegate.disabled, PayError::DelegateDisabled);
     let expected = Pubkey::find_program_address(
         &[DELEGATE_SEED, escrow.key().as_ref(), signer.as_ref()],
         &crate::ID,

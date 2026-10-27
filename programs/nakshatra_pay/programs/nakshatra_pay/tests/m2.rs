@@ -8,7 +8,7 @@ use anchor_lang::{
     prelude::{Clock, Pubkey},
     solana_program::{
         bpf_loader_upgradeable::{self, UpgradeableLoaderState},
-        instruction::Instruction,
+        instruction::{AccountMeta, Instruction},
         program_pack::Pack,
         system_instruction, system_program,
     },
@@ -30,9 +30,14 @@ use nakshatra_pay::{
 };
 
 const DEPOSIT: u64 = 1_000_000;
+const CPI_PROGRAM_ID: Pubkey = Pubkey::new_from_array([7u8; 32]);
 
 fn program_binary_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/deploy/nakshatra_pay.so")
+}
+
+fn cpi_program_binary_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/deploy/redeem_cpi.so")
 }
 
 fn newest_source_mtime(path: &Path) -> std::time::SystemTime {
@@ -66,6 +71,22 @@ fn assert_program_is_fresh() {
             built >= newest_source_mtime(&source),
             "{} is older than program source; run `anchor build` first",
             binary.display()
+        );
+        let cpi_binary = cpi_program_binary_path();
+        let cpi_built = fs::metadata(&cpi_binary)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{} is missing; run `./scripts/test.sh` first",
+                    cpi_binary.display()
+                )
+            });
+        let cpi_source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-support/redeem-cpi/src");
+        assert!(
+            cpi_built >= newest_source_mtime(&cpi_source),
+            "{} is older than CPI test-program source; run `./scripts/test.sh` first",
+            cpi_binary.display()
         );
     });
 }
@@ -153,6 +174,23 @@ fn token_amount(svm: &LiteSVM, key: Pubkey) -> u64 {
         .amount
 }
 
+fn freeze_token(svm: &mut LiteSVM, key: Pubkey) {
+    let mut account = svm.get_account(&key).unwrap();
+    let mut token = SplAccount::unpack(&account.data).unwrap();
+    token.state = AccountState::Frozen;
+    SplAccount::pack(token, &mut account.data).unwrap();
+    svm.set_account(key, account).unwrap();
+}
+
+fn close_account_for_test(svm: &mut LiteSVM, key: Pubkey) {
+    let mut account = svm.get_account(&system_program::ID).unwrap();
+    account.lamports = 0;
+    account.data.clear();
+    account.owner = system_program::ID;
+    account.executable = false;
+    svm.set_account(key, account).unwrap();
+}
+
 fn read_escrow(svm: &LiteSVM, key: Pubkey) -> Escrow {
     Escrow::try_deserialize(&mut svm.get_account(&key).unwrap().data.as_slice()).unwrap()
 }
@@ -211,6 +249,8 @@ struct Fixture {
     other: Keypair,
     mint: Pubkey,
     fee_wallet: Pubkey,
+    fee_vault: Pubkey,
+    owner_state: Pubkey,
     owner_destination: Pubkey,
     worker_token: Pubkey,
     wrong_worker_token: Pubkey,
@@ -221,6 +261,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::new_with_prefund(false)
+    }
+
+    fn new_with_prefund(prefund: bool) -> Self {
         assert_program_is_fresh();
         let mut svm = LiteSVM::new();
         let authority = Keypair::new();
@@ -231,6 +275,11 @@ impl Fixture {
         svm.add_program(
             nakshatra_pay::id(),
             &fs::read(program_binary_path()).unwrap(),
+        )
+        .unwrap();
+        svm.add_program(
+            CPI_PROGRAM_ID,
+            &fs::read(cpi_program_binary_path()).unwrap(),
         )
         .unwrap();
         set_program_upgrade_authority(&mut svm, authority.pubkey());
@@ -256,6 +305,9 @@ impl Fixture {
         put_token(&mut svm, worker_token, mint, worker.pubkey(), 0);
         put_token(&mut svm, wrong_worker_token, mint, other.pubkey(), 0);
         let config = Pubkey::find_program_address(&[CONFIG_SEED], &nakshatra_pay::id()).0;
+        let fee_vault =
+            Pubkey::find_program_address(&[FEE_VAULT_SEED, config.as_ref()], &nakshatra_pay::id())
+                .0;
         let escrow = Pubkey::find_program_address(
             &[ESCROW_SEED, config.as_ref(), owner.pubkey().as_ref()],
             &nakshatra_pay::id(),
@@ -263,6 +315,43 @@ impl Fixture {
         .0;
         let vault =
             Pubkey::find_program_address(&[VAULT_SEED, escrow.as_ref()], &nakshatra_pay::id()).0;
+        let owner_state = Pubkey::find_program_address(
+            &[OWNER_STATE_SEED, config.as_ref(), owner.pubkey().as_ref()],
+            &nakshatra_pay::id(),
+        )
+        .0;
+        if prefund {
+            let delegate_pda = Pubkey::find_program_address(
+                &[DELEGATE_SEED, escrow.as_ref(), delegate.pubkey().as_ref()],
+                &nakshatra_pay::id(),
+            )
+            .0;
+            let channel_pda = Pubkey::find_program_address(
+                &[
+                    CHANNEL_SEED,
+                    escrow.as_ref(),
+                    &0u64.to_le_bytes(),
+                    &0u64.to_le_bytes(),
+                ],
+                &nakshatra_pay::id(),
+            )
+            .0;
+            for pda in [
+                config,
+                fee_vault,
+                owner_state,
+                escrow,
+                vault,
+                delegate_pda,
+                channel_pda,
+            ] {
+                assert!(send_ixs(
+                    &mut svm,
+                    &other,
+                    &[system_instruction::transfer(&other.pubkey(), &pda, 1)]
+                ));
+            }
+        }
         let config_ix = Instruction::new_with_bytes(
             nakshatra_pay::id(),
             &nakshatra_pay::instruction::ConfigInit {
@@ -275,6 +364,7 @@ impl Fixture {
                 program_data: program_data_address(),
                 mint,
                 fee_wallet,
+                fee_vault,
                 token_program: spl_token::ID,
                 system_program: system_program::ID,
                 event_authority: event_authority(),
@@ -289,6 +379,7 @@ impl Fixture {
             nakshatra_pay::accounts::EscrowInitAccounts {
                 owner: owner.pubkey(),
                 config,
+                owner_state,
                 mint,
                 escrow,
                 vault,
@@ -326,6 +417,8 @@ impl Fixture {
             other,
             mint,
             fee_wallet,
+            fee_vault,
+            owner_state,
             owner_destination,
             worker_token,
             wrong_worker_token,
@@ -344,8 +437,14 @@ impl Fixture {
     }
 
     fn channel_pda(&self, seq: u64) -> Pubkey {
+        let generation = read_escrow(&self.svm, self.escrow).generation;
         Pubkey::find_program_address(
-            &[CHANNEL_SEED, self.escrow.as_ref(), &seq.to_le_bytes()],
+            &[
+                CHANNEL_SEED,
+                self.escrow.as_ref(),
+                &generation.to_le_bytes(),
+                &seq.to_le_bytes(),
+            ],
             &nakshatra_pay::id(),
         )
         .0
@@ -389,6 +488,41 @@ impl Fixture {
                 config: self.config,
                 escrow: self.escrow,
                 delegate: self.delegate_pda(key),
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    fn delegate_close_ix(&self, executor: Pubkey, key: Pubkey) -> Instruction {
+        Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::DelegateClose {}.data(),
+            nakshatra_pay::accounts::DelegateCloseAccounts {
+                executor,
+                config: self.config,
+                escrow: self.escrow,
+                owner: self.owner.pubkey(),
+                delegate: self.delegate_pda(key),
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    fn fee_withdraw_ix(&self, authority: Pubkey, amount: u64) -> Instruction {
+        Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::FeeWithdraw { amount }.data(),
+            nakshatra_pay::accounts::FeeWithdrawAccounts {
+                authority,
+                config: self.config,
+                mint: self.mint,
+                fee_vault: self.fee_vault,
+                fee_wallet: self.fee_wallet,
+                token_program: spl_token::ID,
                 event_authority: event_authority(),
                 program: nakshatra_pay::id(),
             }
@@ -452,7 +586,7 @@ impl Fixture {
         channel: Pubkey,
         total: u64,
         worker_token: Pubkey,
-        fee_wallet: Pubkey,
+        fee_vault: Pubkey,
     ) -> Instruction {
         Instruction::new_with_bytes(
             nakshatra_pay::id(),
@@ -468,7 +602,7 @@ impl Fixture {
                 channel,
                 vault: self.vault,
                 worker_token,
-                fee_wallet,
+                fee_vault,
                 instructions_sysvar: solana_instructions_sysvar::ID,
                 token_program: spl_token::ID,
                 event_authority: event_authority(),
@@ -534,9 +668,74 @@ impl Fixture {
             channel,
             total,
             self.worker_token,
-            self.fee_wallet,
+            self.fee_vault,
         );
         send_ixs(&mut self.svm, tx_payer, &[ed, redeem])
+    }
+
+    fn escrow_close_ix(&self) -> Instruction {
+        Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::EscrowClose {}.data(),
+            nakshatra_pay::accounts::EscrowCloseAccounts {
+                owner: self.owner.pubkey(),
+                config: self.config,
+                mint: self.mint,
+                escrow: self.escrow,
+                vault: self.vault,
+                destination: self.owner_destination,
+                token_program: spl_token::ID,
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    fn reinit_and_deposit(&mut self, amount: u64) {
+        let init = Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::EscrowInit {}.data(),
+            nakshatra_pay::accounts::EscrowInitAccounts {
+                owner: self.owner.pubkey(),
+                config: self.config,
+                owner_state: self.owner_state,
+                mint: self.mint,
+                escrow: self.escrow,
+                vault: self.vault,
+                token_program: spl_token::ID,
+                system_program: system_program::ID,
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        );
+        assert!(send_ixs(&mut self.svm, &self.owner, &[init]));
+        let source = Pubkey::new_unique();
+        put_token(
+            &mut self.svm,
+            source,
+            self.mint,
+            self.owner.pubkey(),
+            amount,
+        );
+        let deposit = Instruction::new_with_bytes(
+            nakshatra_pay::id(),
+            &nakshatra_pay::instruction::EscrowDeposit { amount }.data(),
+            nakshatra_pay::accounts::EscrowDepositAccounts {
+                owner: self.owner.pubkey(),
+                config: self.config,
+                mint: self.mint,
+                escrow: self.escrow,
+                source,
+                vault: self.vault,
+                token_program: spl_token::ID,
+                event_authority: event_authority(),
+                program: nakshatra_pay::id(),
+            }
+            .to_account_metas(None),
+        );
+        assert!(send_ixs(&mut self.svm, &self.owner, &[deposit]));
     }
 }
 
@@ -562,7 +761,8 @@ fn owner_and_delegate_happy_paths_redeem_close_and_exit() {
     assert!(f.redeem_with(&other, &owner, channel0, 101));
     assert!(f.redeem_with(&other, &owner, channel0, 201));
     assert_eq!(token_amount(&f.svm, f.worker_token), 195);
-    assert_eq!(token_amount(&f.svm, f.fee_wallet), 6);
+    assert_eq!(token_amount(&f.svm, f.fee_vault), 6);
+    assert_eq!(token_amount(&f.svm, f.fee_wallet), 0);
     assert!(tx!(
         f,
         owner,
@@ -601,7 +801,7 @@ fn owner_and_delegate_happy_paths_redeem_close_and_exit() {
     ));
     assert_eq!(read_delegate(&f.svm, delegate_pda).spent, 500);
     assert!(tx!(f, owner, f.delegate_revoke_ix(f.delegate.pubkey())));
-    assert!(f.svm.get_account(&delegate_pda).is_none());
+    assert!(read_delegate(&f.svm, delegate_pda).disabled);
     let delegate = Keypair::try_from(f.delegate.to_bytes().as_slice()).unwrap();
     let other = Keypair::try_from(f.other.to_bytes().as_slice()).unwrap();
     assert!(f.redeem_with(&other, &delegate, channel1, 123));
@@ -613,33 +813,41 @@ fn owner_and_delegate_happy_paths_redeem_close_and_exit() {
     assert!(!tx!(
         f,
         other,
-        f.close_finalize_ix(f.other.pubkey(), None, f.delegate.pubkey(), channel1)
+        f.close_finalize_ix(
+            f.other.pubkey(),
+            Some(delegate_pda),
+            f.delegate.pubkey(),
+            channel1
+        )
     ));
     warp_seconds(&mut f.svm, CLOSE_GRACE_S);
     assert!(tx!(
         f,
         other,
-        f.close_finalize_ix(f.other.pubkey(), None, f.delegate.pubkey(), channel1)
+        f.close_finalize_ix(
+            f.other.pubkey(),
+            Some(delegate_pda),
+            f.delegate.pubkey(),
+            channel1
+        )
     ));
     let escrow = read_escrow(&f.svm, f.escrow);
     assert_eq!((escrow.committed, escrow.open_channels), (0, 0));
+    assert!(tx!(
+        f,
+        other,
+        f.delegate_close_ix(f.other.pubkey(), f.delegate.pubkey())
+    ));
+    assert!(f.svm.get_account(&delegate_pda).is_none());
+    assert!(tx!(
+        f,
+        authority,
+        f.fee_withdraw_ix(f.authority.pubkey(), 9)
+    ));
+    assert_eq!(token_amount(&f.svm, f.fee_wallet), 9);
+    assert_eq!(token_amount(&f.svm, f.fee_vault), 0);
 
-    let close = Instruction::new_with_bytes(
-        nakshatra_pay::id(),
-        &nakshatra_pay::instruction::EscrowClose {}.data(),
-        nakshatra_pay::accounts::EscrowCloseAccounts {
-            owner: f.owner.pubkey(),
-            config: f.config,
-            mint: f.mint,
-            escrow: f.escrow,
-            vault: f.vault,
-            destination: f.owner_destination,
-            token_program: spl_token::ID,
-            event_authority: event_authority(),
-            program: nakshatra_pay::id(),
-        }
-        .to_account_metas(None),
-    );
+    let close = f.escrow_close_ix();
     assert!(send_ixs(&mut f.svm, &f.owner, &[close]));
     assert_eq!(
         token_amount(&f.svm, f.owner_destination),
@@ -663,7 +871,7 @@ fn voucher_parser_and_cumulative_guards_reject_adversarial_inputs() {
         owner,
         f.open_ix(f.owner.pubkey(), None, f.worker.pubkey(), 1_000, 1)
     ));
-    let redeem_100 = f.redeem_ix(f.other.pubkey(), a, 100, f.worker_token, f.fee_wallet);
+    let redeem_100 = f.redeem_ix(f.other.pubkey(), a, 100, f.worker_token, f.fee_vault);
 
     let wrong = ed25519_ix(&f.other, &voucher_message(nakshatra_pay::id(), a, 100));
     assert!(!send_ixs(
@@ -692,10 +900,10 @@ fn voucher_parser_and_cumulative_guards_reject_adversarial_inputs() {
         &[out_of_bounds, redeem_100.clone()]
     ));
     let tampered = ed25519_ix(&f.owner, &voucher_message(nakshatra_pay::id(), a, 100));
-    let redeem_200 = f.redeem_ix(f.other.pubkey(), a, 200, f.worker_token, f.fee_wallet);
+    let redeem_200 = f.redeem_ix(f.other.pubkey(), a, 200, f.worker_token, f.fee_vault);
     assert!(!send_ixs(&mut f.svm, &f.other, &[tampered, redeem_200]));
     let replay_a_on_b = ed25519_ix(&f.owner, &voucher_message(nakshatra_pay::id(), a, 100));
-    let redeem_b = f.redeem_ix(f.other.pubkey(), b, 100, f.worker_token, f.fee_wallet);
+    let redeem_b = f.redeem_ix(f.other.pubkey(), b, 100, f.worker_token, f.fee_vault);
     assert!(!send_ixs(&mut f.svm, &f.other, &[replay_a_on_b, redeem_b]));
     let other_program = ed25519_ix(&f.owner, &voucher_message(Pubkey::new_unique(), a, 100));
     assert!(!send_ixs(
@@ -711,6 +919,28 @@ fn voucher_parser_and_cumulative_guards_reject_adversarial_inputs() {
         &f.other,
         &[ed, unrelated, redeem_100.clone()]
     ));
+
+    let ed = ed25519_ix(&f.owner, &voucher_message(nakshatra_pay::id(), a, 100));
+    let mut cpi_redeem = redeem_100.clone();
+    cpi_redeem.program_id = CPI_PROGRAM_ID;
+    cpi_redeem
+        .accounts
+        .push(AccountMeta::new_readonly(nakshatra_pay::id(), false));
+    f.svm.expire_blockhash();
+    let message = Message::new_with_blockhash(
+        &[ed, cpi_redeem],
+        Some(&f.other.pubkey()),
+        &f.svm.latest_blockhash(),
+    );
+    let transaction =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&f.other]).unwrap();
+    let failure = f.svm.send_transaction(transaction).unwrap_err();
+    let redeem_via_cpi: u32 = nakshatra_pay::error::PayError::RedeemViaCpi.into();
+    assert!(
+        format!("{:?}", failure.err).contains(&format!("Custom({redeem_via_cpi})")),
+        "unexpected CPI failure: {:?}",
+        failure.err
+    );
 
     // The second precompile verifies bytes in the first instruction. It succeeds,
     // but the program rejects its non-local instruction indexes.
@@ -963,7 +1193,7 @@ fn worker_fee_wallet_close_deadline_and_strict_lengths_are_enforced() {
         channel,
         100,
         f.wrong_worker_token,
-        f.fee_wallet,
+        f.fee_vault,
     );
     assert!(!send_ixs(&mut f.svm, &f.other, &[ed.clone(), wrong_worker]));
     let duplicate = f.redeem_ix(
@@ -987,7 +1217,7 @@ fn worker_fee_wallet_close_deadline_and_strict_lengths_are_enforced() {
     assert!(tx!(f, owner, f.close_request_ix(f.owner.pubkey(), channel)));
     warp_seconds(&mut f.svm, CLOSE_GRACE_S);
     let ed = ed25519_ix(&f.owner, &msg);
-    let late = f.redeem_ix(f.other.pubkey(), channel, 100, f.worker_token, f.fee_wallet);
+    let late = f.redeem_ix(f.other.pubkey(), channel, 100, f.worker_token, f.fee_vault);
     assert!(!send_ixs(&mut f.svm, &f.other, &[ed, late]));
 
     let now: Clock = f.svm.get_sysvar();
@@ -1000,9 +1230,11 @@ fn worker_fee_wallet_close_deadline_and_strict_lengths_are_enforced() {
             DELEGATE_OPEN_CHANNEL,
         ),
         f.delegate_revoke_ix(f.delegate.pubkey()),
+        f.delegate_close_ix(f.owner.pubkey(), f.delegate.pubkey()),
+        f.fee_withdraw_ix(f.owner.pubkey(), 1),
         f.open_ix(f.owner.pubkey(), None, f.worker.pubkey(), 1, 1),
         f.fund_ix(f.owner.pubkey(), None, channel, 1),
-        f.redeem_ix(f.owner.pubkey(), channel, 1, f.worker_token, f.fee_wallet),
+        f.redeem_ix(f.owner.pubkey(), channel, 1, f.worker_token, f.fee_vault),
         f.close_request_ix(f.owner.pubkey(), channel),
         f.close_finalize_ix(f.owner.pubkey(), Some(delegate), f.owner.pubkey(), channel),
     ];
@@ -1022,9 +1254,248 @@ fn worker_fee_wallet_close_deadline_and_strict_lengths_are_enforced() {
             "InstructionError(0, InvalidInstructionData)"
         );
     }
+}
 
-    let source =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/instructions.rs"))
-            .unwrap();
-    assert!(source.contains("get_stack_height() == 1"));
+#[test]
+fn closed_escrow_generation_prevents_old_voucher_replay() {
+    let mut f = Fixture::new();
+    let old_channel = f.channel_pda(0);
+    assert!(tx!(
+        f,
+        owner,
+        f.open_ix(f.owner.pubkey(), None, f.worker.pubkey(), 10_000, 0)
+    ));
+    let old_voucher = ed25519_ix(
+        &f.owner,
+        &voucher_message(nakshatra_pay::id(), old_channel, 5_000),
+    );
+    let owner = Keypair::try_from(f.owner.to_bytes().as_slice()).unwrap();
+    let worker = Keypair::try_from(f.worker.to_bytes().as_slice()).unwrap();
+    assert!(f.redeem_with(&worker, &owner, old_channel, 5_000));
+    assert!(tx!(
+        f,
+        owner,
+        f.close_request_ix(f.owner.pubkey(), old_channel)
+    ));
+    assert!(tx!(
+        f,
+        worker,
+        f.close_finalize_ix(f.worker.pubkey(), None, f.owner.pubkey(), old_channel)
+    ));
+    let close = f.escrow_close_ix();
+    assert!(send_ixs(&mut f.svm, &f.owner, &[close]));
+
+    f.reinit_and_deposit(100_000);
+    assert_eq!(read_escrow(&f.svm, f.escrow).generation, 1);
+    let new_channel = f.channel_pda(0);
+    assert_ne!(old_channel, new_channel);
+    assert!(tx!(
+        f,
+        owner,
+        f.open_ix(f.owner.pubkey(), None, f.worker.pubkey(), 10_000, 0)
+    ));
+    let before = token_amount(&f.svm, f.worker_token);
+    let redeem = f.redeem_ix(
+        f.worker.pubkey(),
+        new_channel,
+        5_000,
+        f.worker_token,
+        f.fee_vault,
+    );
+    assert!(!send_ixs(&mut f.svm, &f.worker, &[old_voucher, redeem]));
+    assert_eq!(token_amount(&f.svm, f.worker_token), before);
+}
+
+#[test]
+fn delegate_revoke_cannot_reset_cap_while_old_channel_is_live() {
+    let mut f = Fixture::new();
+    let delegate_pda = f.delegate_pda(f.delegate.pubkey());
+    let now: Clock = f.svm.get_sysvar();
+    let expires_at = now.unix_timestamp + 1_000_000;
+    assert!(tx!(
+        f,
+        owner,
+        f.delegate_set_ix(f.delegate.pubkey(), 100, expires_at, DELEGATE_OPEN_CHANNEL)
+    ));
+    assert!(tx!(
+        f,
+        delegate,
+        f.open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.worker.pubkey(),
+            100,
+            0
+        )
+    ));
+    assert_eq!(read_delegate(&f.svm, delegate_pda).open_channels, 1);
+    assert!(tx!(f, owner, f.delegate_revoke_ix(f.delegate.pubkey())));
+    assert!(!tx!(
+        f,
+        owner,
+        f.delegate_set_ix(f.delegate.pubkey(), 100, expires_at, DELEGATE_OPEN_CHANNEL)
+    ));
+    assert!(!tx!(
+        f,
+        delegate,
+        f.open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.worker.pubkey(),
+            1,
+            1
+        )
+    ));
+    let delegate = read_delegate(&f.svm, delegate_pda);
+    assert_eq!((delegate.cap_total, delegate.spent), (100, 100));
+    assert!(delegate.disabled);
+}
+
+#[test]
+fn delegated_channel_finalize_requires_delegate_and_restores_counters() {
+    let mut f = Fixture::new();
+    let delegate_pda = f.delegate_pda(f.delegate.pubkey());
+    let now: Clock = f.svm.get_sysvar();
+    assert!(tx!(
+        f,
+        owner,
+        f.delegate_set_ix(
+            f.delegate.pubkey(),
+            100,
+            now.unix_timestamp + 1_000_000,
+            DELEGATE_OPEN_CHANNEL
+        )
+    ));
+    let channel = f.channel_pda(0);
+    assert!(tx!(
+        f,
+        delegate,
+        f.open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.worker.pubkey(),
+            100,
+            0
+        )
+    ));
+    assert!(tx!(f, owner, f.delegate_revoke_ix(f.delegate.pubkey())));
+    assert!(tx!(f, owner, f.close_request_ix(f.owner.pubkey(), channel)));
+    warp_seconds(&mut f.svm, CLOSE_GRACE_S);
+    assert!(!tx!(
+        f,
+        other,
+        f.close_finalize_ix(f.other.pubkey(), None, f.delegate.pubkey(), channel)
+    ));
+    assert_eq!(read_delegate(&f.svm, delegate_pda).spent, 100);
+    assert!(tx!(
+        f,
+        other,
+        f.close_finalize_ix(
+            f.other.pubkey(),
+            Some(delegate_pda),
+            f.delegate.pubkey(),
+            channel
+        )
+    ));
+    let delegate = read_delegate(&f.svm, delegate_pda);
+    assert_eq!((delegate.spent, delegate.open_channels), (0, 0));
+    assert!(tx!(
+        f,
+        other,
+        f.delegate_close_ix(f.other.pubkey(), f.delegate.pubkey())
+    ));
+}
+
+#[test]
+fn one_lamport_prefunds_do_not_block_any_pda_initialization() {
+    let mut f = Fixture::new_with_prefund(true);
+    let now: Clock = f.svm.get_sysvar();
+    let delegate_pda = f.delegate_pda(f.delegate.pubkey());
+    assert!(tx!(
+        f,
+        owner,
+        f.delegate_set_ix(
+            f.delegate.pubkey(),
+            100,
+            now.unix_timestamp + 1_000,
+            DELEGATE_OPEN_CHANNEL
+        )
+    ));
+    assert!(tx!(
+        f,
+        delegate,
+        f.open_ix(
+            f.delegate.pubkey(),
+            Some(delegate_pda),
+            f.worker.pubkey(),
+            100,
+            0
+        )
+    ));
+    assert_eq!(read_escrow(&f.svm, f.escrow).generation, 0);
+    assert_eq!(read_delegate(&f.svm, delegate_pda).open_channels, 1);
+}
+
+#[test]
+fn frozen_fee_wallet_cannot_block_redeem_and_fees_withdraw_separately() {
+    let mut f = Fixture::new();
+    freeze_token(&mut f.svm, f.fee_wallet);
+    let channel = f.channel_pda(0);
+    assert!(tx!(
+        f,
+        owner,
+        f.open_ix(f.owner.pubkey(), None, f.worker.pubkey(), 100, 0)
+    ));
+    let owner = Keypair::try_from(f.owner.to_bytes().as_slice()).unwrap();
+    let worker = Keypair::try_from(f.worker.to_bytes().as_slice()).unwrap();
+    assert!(f.redeem_with(&worker, &owner, channel, 100));
+    assert_eq!(token_amount(&f.svm, f.worker_token), 97);
+    assert_eq!(token_amount(&f.svm, f.fee_vault), 3);
+    assert!(!tx!(
+        f,
+        authority,
+        f.fee_withdraw_ix(f.authority.pubkey(), 3)
+    ));
+    close_account_for_test(&mut f.svm, f.fee_wallet);
+    let closed_wallet_channel = f.channel_pda(1);
+    assert!(tx!(
+        f,
+        owner,
+        f.open_ix(f.owner.pubkey(), None, f.worker.pubkey(), 100, 1)
+    ));
+    assert!(f.redeem_with(&worker, &owner, closed_wallet_channel, 100));
+    assert_eq!(token_amount(&f.svm, f.worker_token), 194);
+    assert_eq!(token_amount(&f.svm, f.fee_vault), 6);
+    put_token(&mut f.svm, f.fee_wallet, f.mint, f.authority.pubkey(), 0);
+    assert!(tx!(
+        f,
+        authority,
+        f.fee_withdraw_ix(f.authority.pubkey(), 6)
+    ));
+    assert_eq!(token_amount(&f.svm, f.fee_wallet), 6);
+}
+
+#[test]
+fn cumulative_fee_rounding_is_split_invariant() {
+    let mut f = Fixture::new();
+    let split = f.channel_pda(0);
+    assert!(tx!(
+        f,
+        owner,
+        f.open_ix(f.owner.pubkey(), None, f.worker.pubkey(), 100, 0)
+    ));
+    let once = f.channel_pda(1);
+    assert!(tx!(
+        f,
+        owner,
+        f.open_ix(f.owner.pubkey(), None, f.worker.pubkey(), 100, 1)
+    ));
+    let owner = Keypair::try_from(f.owner.to_bytes().as_slice()).unwrap();
+    let worker = Keypair::try_from(f.worker.to_bytes().as_slice()).unwrap();
+    for total in 1..=100 {
+        assert!(f.redeem_with(&worker, &owner, split, total));
+    }
+    assert!(f.redeem_with(&worker, &owner, once, 100));
+    assert_eq!(token_amount(&f.svm, f.fee_vault), 6);
+    assert_eq!(token_amount(&f.svm, f.worker_token), 194);
 }

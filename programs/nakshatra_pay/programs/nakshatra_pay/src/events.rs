@@ -107,14 +107,29 @@ pub struct DelegateRevoked {
 }
 
 #[event]
+pub struct DelegateClosed {
+    pub escrow: Pubkey,
+    pub delegate: Pubkey,
+    pub key: Pubkey,
+}
+
+#[event]
 pub struct ChannelOpened {
     pub escrow: Pubkey,
     pub channel: Pubkey,
     pub seq: u64,
+    pub generation: u64,
     pub worker: Pubkey,
     pub voucher_signer: Pubkey,
     pub cap: u64,
     pub fee_bps_snapshot: u16,
+}
+
+#[event]
+pub struct FeeWithdrawn {
+    pub config: Pubkey,
+    pub fee_wallet: Pubkey,
+    pub amount: u64,
 }
 
 #[event]
