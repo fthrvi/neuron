@@ -351,6 +351,7 @@ pub fn handle_escrow_init(ctx: Context<EscrowInitAccounts>) -> Result<()> {
     escrow.open_channels = 0;
     escrow.open_tasks = 0;
     escrow.channel_seq = 0;
+    escrow.task_seq = 0;
     escrow.generation = generation;
     escrow.pending_withdraw = None;
     escrow.rent_payer = ctx.accounts.owner.key();
@@ -1197,7 +1198,7 @@ pub struct TaskOpenAccounts<'info> {
     pub vault: UncheckedAccount<'info>,
     #[account(mut)]
     pub delegate: Option<Account<'info, Delegate>>,
-    #[account(init, payer = signer, space = 8 + Task::INIT_SPACE, seeds = [TASK_SEED, escrow.key().as_ref(), &escrow.generation.to_le_bytes(), &task_hash], bump)]
+    #[account(init, payer = signer, space = 8 + Task::INIT_SPACE, seeds = [TASK_SEED, escrow.key().as_ref(), &escrow.generation.to_le_bytes(), &escrow.task_seq.to_le_bytes()], bump)]
     pub task: Account<'info, Task>,
     pub system_program: Program<'info, System>,
 }
@@ -1257,9 +1258,14 @@ pub fn handle_task_open(
         .open_tasks
         .checked_add(1)
         .ok_or(PayError::ArithmeticOverflow)?;
+    let task_seq = ctx.accounts.escrow.task_seq;
+    ctx.accounts.escrow.task_seq = task_seq
+        .checked_add(1)
+        .ok_or(PayError::ArithmeticOverflow)?;
     let task = &mut ctx.accounts.task;
     task.escrow = ctx.accounts.escrow.key();
     task.generation = ctx.accounts.escrow.generation;
+    task.task_seq = task_seq;
     task.worker = worker;
     task.verifier = verifier;
     task.amount = amount;
@@ -1294,7 +1300,7 @@ pub struct TaskSubmitAccounts<'info> {
     pub config: Account<'info, Config>,
     #[account(seeds = [ESCROW_SEED, config.key().as_ref(), escrow.owner.as_ref()], bump = escrow.bump)]
     pub escrow: Account<'info, Escrow>,
-    #[account(mut, seeds = [TASK_SEED, escrow.key().as_ref(), &task.generation.to_le_bytes(), &task.task_hash], bump = task.bump, constraint = task.escrow == escrow.key(), constraint = task.generation == escrow.generation, has_one = worker @ PayError::Unauthorized)]
+    #[account(mut, seeds = [TASK_SEED, escrow.key().as_ref(), &task.generation.to_le_bytes(), &task.task_seq.to_le_bytes()], bump = task.bump, constraint = task.escrow == escrow.key(), constraint = task.generation == escrow.generation, has_one = worker @ PayError::Unauthorized)]
     pub task: Account<'info, Task>,
 }
 
@@ -1336,7 +1342,7 @@ pub struct TaskSettleAccounts<'info> {
     /// CHECK: receives task rent and is pinned to the recorded payer.
     #[account(mut, address = task.rent_payer)]
     pub rent_payer: UncheckedAccount<'info>,
-    #[account(mut, close = rent_payer, seeds = [TASK_SEED, escrow.key().as_ref(), &task.generation.to_le_bytes(), &task.task_hash], bump = task.bump, constraint = task.escrow == escrow.key(), constraint = task.generation == escrow.generation)]
+    #[account(mut, close = rent_payer, seeds = [TASK_SEED, escrow.key().as_ref(), &task.generation.to_le_bytes(), &task.task_seq.to_le_bytes()], bump = task.bump, constraint = task.escrow == escrow.key(), constraint = task.generation == escrow.generation)]
     pub task: Account<'info, Task>,
     /// CHECK: canonical escrow vault; classic SPL layout checked before a payment.
     #[account(mut, seeds = [VAULT_SEED, escrow.key().as_ref()], bump = escrow.vault_bump)]
@@ -1381,8 +1387,10 @@ pub fn handle_task_verify(ctx: Context<TaskSettleAccounts>, verdict: Verdict) ->
     expected[..16].copy_from_slice(VERDICT_DOMAIN);
     expected[16..48].copy_from_slice(crate::ID.as_ref());
     expected[48..80].copy_from_slice(ctx.accounts.task.key().as_ref());
-    expected[80..112].copy_from_slice(&ctx.accounts.task.result_hash);
-    expected[112] = verdict as u8;
+    expected[80..112].copy_from_slice(ctx.accounts.task.worker.as_ref());
+    expected[112..120].copy_from_slice(&ctx.accounts.task.amount.to_le_bytes());
+    expected[120..152].copy_from_slice(&ctx.accounts.task.result_hash);
+    expected[152] = verdict as u8;
     require!(message == expected, PayError::InvalidVerdictMessage);
     match verdict {
         Verdict::Pass => finish_task(ctx, true, Some(TaskPaidHow::Verified), None),

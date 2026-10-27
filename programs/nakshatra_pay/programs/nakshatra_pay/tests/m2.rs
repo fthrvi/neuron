@@ -216,6 +216,8 @@ fn voucher_message(program: Pubkey, channel: Pubkey, total: u64) -> [u8; VOUCHER
 fn verdict_message(
     program: Pubkey,
     task: Pubkey,
+    worker: Pubkey,
+    amount: u64,
     result_hash: [u8; 32],
     verdict: Verdict,
 ) -> [u8; VERDICT_MESSAGE_LEN] {
@@ -223,8 +225,10 @@ fn verdict_message(
     message[..16].copy_from_slice(VERDICT_DOMAIN);
     message[16..48].copy_from_slice(program.as_ref());
     message[48..80].copy_from_slice(task.as_ref());
-    message[80..112].copy_from_slice(&result_hash);
-    message[112] = verdict as u8;
+    message[80..112].copy_from_slice(worker.as_ref());
+    message[112..120].copy_from_slice(&amount.to_le_bytes());
+    message[120..152].copy_from_slice(&result_hash);
+    message[152] = verdict as u8;
     message
 }
 
@@ -466,14 +470,14 @@ impl Fixture {
         .0
     }
 
-    fn task_pda(&self, task_hash: [u8; 32]) -> Pubkey {
+    fn task_pda(&self, task_seq: u64) -> Pubkey {
         let generation = read_escrow(&self.svm, self.escrow).generation;
         Pubkey::find_program_address(
             &[
                 TASK_SEED,
                 self.escrow.as_ref(),
                 &generation.to_le_bytes(),
-                &task_hash,
+                &task_seq.to_le_bytes(),
             ],
             &nakshatra_pay::id(),
         )
@@ -730,7 +734,7 @@ impl Fixture {
                 escrow: self.escrow,
                 vault: self.vault,
                 delegate,
-                task: self.task_pda(task_hash),
+                task: self.task_pda(read_escrow(&self.svm, self.escrow).task_seq),
                 system_program: system_program::ID,
                 event_authority: event_authority(),
                 program: nakshatra_pay::id(),
@@ -830,9 +834,17 @@ impl Fixture {
         verdict: Verdict,
         worker_token: Pubkey,
     ) -> bool {
+        let task_account = read_task(&self.svm, task);
         let ed = ed25519_ix(
             verifier,
-            &verdict_message(nakshatra_pay::id(), task, result_hash, verdict),
+            &verdict_message(
+                nakshatra_pay::id(),
+                task,
+                task_account.worker,
+                task_account.amount,
+                result_hash,
+                verdict,
+            ),
         );
         let verify = self.task_verify_ix(
             tx_payer.pubkey(),
@@ -1792,7 +1804,7 @@ fn tasks_owner_pass_and_fail_settle_exactly() {
     let now: Clock = f.svm.get_sysvar();
     let pass_hash = [1u8; 32];
     let pass_result = [2u8; 32];
-    let pass_task = f.task_pda(pass_hash);
+    let pass_task = f.task_pda(0);
     assert!(tx!(
         f,
         owner,
@@ -1835,7 +1847,7 @@ fn tasks_owner_pass_and_fail_settle_exactly() {
 
     let fail_hash = [3u8; 32];
     let fail_result = [4u8; 32];
-    let fail_task = f.task_pda(fail_hash);
+    let fail_task = f.task_pda(1);
     let now: Clock = f.svm.get_sysvar();
     assert!(tx!(
         f,
@@ -1872,6 +1884,108 @@ fn tasks_owner_pass_and_fail_settle_exactly() {
 }
 
 #[test]
+fn task_verdict_cannot_replay_when_task_hash_is_reused() {
+    let mut f = Fixture::new();
+    let verifier = Keypair::try_from(f.delegate.to_bytes().as_slice()).unwrap();
+    let worker = Keypair::try_from(f.worker.to_bytes().as_slice()).unwrap();
+    let task_hash = [7u8; 32];
+    let result_hash = [8u8; 32];
+    let first_task = f.task_pda(0);
+    let now: Clock = f.svm.get_sysvar();
+    assert!(tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.delegate.pubkey(),
+            10_000,
+            now.unix_timestamp + 1_000,
+            task_hash
+        )
+    ));
+    assert_eq!(read_task(&f.svm, first_task).task_seq, 0);
+    assert!(tx!(
+        f,
+        worker,
+        f.task_submit_ix(f.worker.pubkey(), first_task, result_hash)
+    ));
+    let old_verdict = ed25519_ix(
+        &verifier,
+        &verdict_message(
+            nakshatra_pay::id(),
+            first_task,
+            f.worker.pubkey(),
+            10_000,
+            result_hash,
+            Verdict::Pass,
+        ),
+    );
+    let first_verify = f.task_verify_ix(
+        worker.pubkey(),
+        None,
+        f.owner.pubkey(),
+        first_task,
+        Verdict::Pass,
+        f.worker_token,
+    );
+    assert!(send_ixs(
+        &mut f.svm,
+        &worker,
+        &[old_verdict.clone(), first_verify]
+    ));
+
+    let second_task = f.task_pda(1);
+    assert_ne!(first_task, second_task);
+    let now: Clock = f.svm.get_sysvar();
+    assert!(tx!(
+        f,
+        owner,
+        f.task_open_ix(
+            f.owner.pubkey(),
+            None,
+            f.worker.pubkey(),
+            f.delegate.pubkey(),
+            10_000,
+            now.unix_timestamp + 1_000,
+            task_hash
+        )
+    ));
+    let second = read_task(&f.svm, second_task);
+    assert_eq!((second.task_seq, second.task_hash), (1, task_hash));
+    assert_eq!(read_escrow(&f.svm, f.escrow).task_seq, 2);
+    assert!(tx!(
+        f,
+        worker,
+        f.task_submit_ix(f.worker.pubkey(), second_task, result_hash)
+    ));
+    let second_verify = f.task_verify_ix(
+        worker.pubkey(),
+        None,
+        f.owner.pubkey(),
+        second_task,
+        Verdict::Pass,
+        f.worker_token,
+    );
+    assert!(!send_ixs(
+        &mut f.svm,
+        &worker,
+        &[old_verdict, second_verify]
+    ));
+    assert!(f.verify_task_with(
+        &worker,
+        &verifier,
+        None,
+        f.owner.pubkey(),
+        second_task,
+        result_hash,
+        Verdict::Pass,
+        f.worker_token,
+    ));
+}
+
+#[test]
 fn delegated_tasks_restore_refunds_but_consume_paid_spend() {
     let mut f = Fixture::new();
     let delegate_pda = f.delegate_pda(f.delegate.pubkey());
@@ -1888,7 +2002,7 @@ fn delegated_tasks_restore_refunds_but_consume_paid_spend() {
     ));
     let paid_hash = [10u8; 32];
     let paid_result = [11u8; 32];
-    let paid_task = f.task_pda(paid_hash);
+    let paid_task = f.task_pda(0);
     assert!(tx!(
         f,
         delegate,
@@ -1950,7 +2064,7 @@ fn delegated_tasks_restore_refunds_but_consume_paid_spend() {
         )
     ));
     let refund_hash = [12u8; 32];
-    let refund_task = f.task_pda(refund_hash);
+    let refund_task = f.task_pda(1);
     assert!(!tx!(
         f,
         delegate,
@@ -2009,7 +2123,7 @@ fn task_verdict_parser_rejects_substitution_cross_indexes_and_cpi() {
     let mut f = Fixture::new();
     let now: Clock = f.svm.get_sysvar();
     let unsubmitted_hash = [19u8; 32];
-    let unsubmitted = f.task_pda(unsubmitted_hash);
+    let unsubmitted = f.task_pda(0);
     assert!(tx!(
         f,
         owner,
@@ -2025,7 +2139,14 @@ fn task_verdict_parser_rejects_substitution_cross_indexes_and_cpi() {
     ));
     let premature_ed = ed25519_ix(
         &f.delegate,
-        &verdict_message(nakshatra_pay::id(), unsubmitted, [0u8; 32], Verdict::Pass),
+        &verdict_message(
+            nakshatra_pay::id(),
+            unsubmitted,
+            f.worker.pubkey(),
+            100,
+            [0u8; 32],
+            Verdict::Pass,
+        ),
     );
     let premature_verify = f.task_verify_ix(
         f.other.pubkey(),
@@ -2042,7 +2163,7 @@ fn task_verdict_parser_rejects_substitution_cross_indexes_and_cpi() {
     ));
     let task_hash = [20u8; 32];
     let result_hash = [21u8; 32];
-    let task = f.task_pda(task_hash);
+    let task = f.task_pda(1);
     assert!(tx!(
         f,
         owner,
@@ -2071,7 +2192,14 @@ fn task_verdict_parser_rejects_substitution_cross_indexes_and_cpi() {
     );
     let wrong_signer = ed25519_ix(
         &f.other,
-        &verdict_message(nakshatra_pay::id(), task, result_hash, Verdict::Pass),
+        &verdict_message(
+            nakshatra_pay::id(),
+            task,
+            f.worker.pubkey(),
+            1_000,
+            result_hash,
+            Verdict::Pass,
+        ),
     );
     assert!(!send_ixs(
         &mut f.svm,
@@ -2080,7 +2208,14 @@ fn task_verdict_parser_rejects_substitution_cross_indexes_and_cpi() {
     ));
     let wrong_result = ed25519_ix(
         &f.delegate,
-        &verdict_message(nakshatra_pay::id(), task, [99u8; 32], Verdict::Pass),
+        &verdict_message(
+            nakshatra_pay::id(),
+            task,
+            f.worker.pubkey(),
+            1_000,
+            [99u8; 32],
+            Verdict::Pass,
+        ),
     );
     assert!(!send_ixs(
         &mut f.svm,
@@ -2089,7 +2224,14 @@ fn task_verdict_parser_rejects_substitution_cross_indexes_and_cpi() {
     ));
     let wrong_program = ed25519_ix(
         &f.delegate,
-        &verdict_message(Pubkey::new_unique(), task, result_hash, Verdict::Pass),
+        &verdict_message(
+            Pubkey::new_unique(),
+            task,
+            f.worker.pubkey(),
+            1_000,
+            result_hash,
+            Verdict::Pass,
+        ),
     );
     assert!(!send_ixs(
         &mut f.svm,
@@ -2101,6 +2243,8 @@ fn task_verdict_parser_rejects_substitution_cross_indexes_and_cpi() {
         &verdict_message(
             nakshatra_pay::id(),
             Pubkey::new_unique(),
+            f.worker.pubkey(),
+            1_000,
             result_hash,
             Verdict::Pass,
         ),
@@ -2110,10 +2254,49 @@ fn task_verdict_parser_rejects_substitution_cross_indexes_and_cpi() {
         &f.other,
         &[wrong_task, verify.clone()]
     ));
+    let wrong_worker = ed25519_ix(
+        &f.delegate,
+        &verdict_message(
+            nakshatra_pay::id(),
+            task,
+            f.other.pubkey(),
+            1_000,
+            result_hash,
+            Verdict::Pass,
+        ),
+    );
+    assert!(!send_ixs(
+        &mut f.svm,
+        &f.other,
+        &[wrong_worker, verify.clone()]
+    ));
+    let wrong_amount = ed25519_ix(
+        &f.delegate,
+        &verdict_message(
+            nakshatra_pay::id(),
+            task,
+            f.worker.pubkey(),
+            999,
+            result_hash,
+            Verdict::Pass,
+        ),
+    );
+    assert!(!send_ixs(
+        &mut f.svm,
+        &f.other,
+        &[wrong_amount, verify.clone()]
+    ));
 
     let real = ed25519_ix(
         &f.delegate,
-        &verdict_message(nakshatra_pay::id(), task, result_hash, Verdict::Pass),
+        &verdict_message(
+            nakshatra_pay::id(),
+            task,
+            f.worker.pubkey(),
+            1_000,
+            result_hash,
+            Verdict::Pass,
+        ),
     );
     let mut cross = real.clone();
     cross.data.truncate(16);
@@ -2191,9 +2374,9 @@ fn task_deadlines_collateral_worker_and_commitment_guards_hold() {
     ));
 
     let task_hash = [33u8; 32];
-    let task = f.task_pda(task_hash);
+    let task = f.task_pda(1);
     let late_hash = [35u8; 32];
-    let late_task = f.task_pda(late_hash);
+    let late_task = f.task_pda(0);
     assert!(tx!(
         f,
         owner,
@@ -2316,7 +2499,14 @@ fn task_deadlines_collateral_worker_and_commitment_guards_hold() {
     warp_seconds(&mut f.svm, CLOSE_GRACE_S);
     let late_ed = ed25519_ix(
         &verifier,
-        &verdict_message(nakshatra_pay::id(), task, [34u8; 32], Verdict::Pass),
+        &verdict_message(
+            nakshatra_pay::id(),
+            task,
+            f.worker.pubkey(),
+            400_000,
+            [34u8; 32],
+            Verdict::Pass,
+        ),
     );
     let late_verify = f.task_verify_ix(
         f.other.pubkey(),
@@ -2386,7 +2576,7 @@ fn task_generation_delegate_permissions_prefund_and_strict_lengths_hold() {
     ));
 
     let hash = [42u8; 32];
-    let old_task = f.task_pda(hash);
+    let old_task = f.task_pda(0);
     let now: Clock = f.svm.get_sysvar();
     assert!(send_ixs(
         &mut f.svm,
@@ -2472,7 +2662,7 @@ fn task_generation_delegate_permissions_prefund_and_strict_lengths_hold() {
 
     assert!(tx!(f, owner, f.escrow_close_ix()));
     f.reinit_and_deposit(1_000);
-    let new_task = f.task_pda(hash);
+    let new_task = f.task_pda(0);
     assert_ne!(old_task, new_task);
     let now: Clock = f.svm.get_sysvar();
     assert!(!tx!(

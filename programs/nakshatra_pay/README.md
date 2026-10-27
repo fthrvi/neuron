@@ -53,9 +53,11 @@ expired task restores the delegate's spend; a paid task consumes it permanently.
 
 ## Verified task settlement
 
-Task addresses use `['task', escrow, generation_u64_le, task_hash]`. The worker submits a result
-hash, then the named verifier can sign a fixed, domain-separated verdict over the program, task,
-result hash, and pass/fail byte. Anyone may relay that Ed25519 instruction immediately before
+Task addresses use `['task', escrow, generation_u64_le, task_seq_u64_le]`, where the escrow assigns
+and increments the sequence without resetting it within a generation. The task hash remains stored
+metadata, so duplicate hashes are safe. The worker submits a result hash, then the named verifier
+can sign a fixed, domain-separated verdict over the program, task, worker, amount, result hash, and
+pass/fail byte. Anyone may relay that Ed25519 instruction immediately before
 `task_verify`. A pass pays the worker and a fail refunds the commitment. An open task expires just
 after its deadline; a submitted task pays by silence once `Config.close_grace_s` has elapsed.
 `close_grace_s` is intentionally reused as the verdict window and defaults to 86,400 seconds.

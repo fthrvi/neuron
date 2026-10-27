@@ -24,7 +24,7 @@ pub const DELEGATE_FLAGS_ALL: u8 = DELEGATE_OPEN_CHANNEL | DELEGATE_OPEN_TASK;
 pub const VOUCHER_DOMAIN: &[u8; 16] = b"NAK_PAY_VOUCHER1";
 pub const VOUCHER_MESSAGE_LEN: usize = 88;
 pub const VERDICT_DOMAIN: &[u8; 16] = b"NAK_PAY_VERDICT1";
-pub const VERDICT_MESSAGE_LEN: usize = 113;
+pub const VERDICT_MESSAGE_LEN: usize = 153;
 
 #[constant]
 pub const FEE_BPS_MAX: u16 = 1_000;

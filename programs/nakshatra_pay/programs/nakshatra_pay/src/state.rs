@@ -39,6 +39,7 @@ pub struct Escrow {
     pub open_channels: u32,
     pub open_tasks: u32,
     pub channel_seq: u64,
+    pub task_seq: u64,
     pub generation: u64,
     pub pending_withdraw: Option<PendingWithdrawal>,
     pub rent_payer: Pubkey,
@@ -109,6 +110,7 @@ pub enum Verdict {
 pub struct Task {
     pub escrow: Pubkey,
     pub generation: u64,
+    pub task_seq: u64,
     pub worker: Pubkey,
     pub verifier: Pubkey,
     pub amount: u64,

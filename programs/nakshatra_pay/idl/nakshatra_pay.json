@@ -2344,8 +2344,9 @@
                 "account": "Escrow"
               },
               {
-                "kind": "arg",
-                "path": "task_hash"
+                "kind": "account",
+                "path": "escrow.task_seq",
+                "account": "Escrow"
               }
             ]
           }
@@ -2456,7 +2457,34 @@
         },
         {
           "name": "task",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  97,
+                  115,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "task.generation",
+                "account": "Task"
+              },
+              {
+                "kind": "account",
+                "path": "task.task_seq",
+                "account": "Task"
+              }
+            ]
+          }
         },
         {
           "name": "event_authority"
@@ -2554,7 +2582,34 @@
         },
         {
           "name": "task",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  97,
+                  115,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "task.generation",
+                "account": "Task"
+              },
+              {
+                "kind": "account",
+                "path": "task.task_seq",
+                "account": "Task"
+              }
+            ]
+          }
         },
         {
           "name": "vault",
@@ -2705,7 +2760,34 @@
         },
         {
           "name": "task",
-          "writable": true
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  97,
+                  115,
+                  107
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "escrow"
+              },
+              {
+                "kind": "account",
+                "path": "task.generation",
+                "account": "Task"
+              },
+              {
+                "kind": "account",
+                "path": "task.task_seq",
+                "account": "Task"
+              }
+            ]
+          }
         },
         {
           "name": "vault",
@@ -3994,6 +4076,10 @@
             "type": "u64"
           },
           {
+            "name": "task_seq",
+            "type": "u64"
+          },
+          {
             "name": "generation",
             "type": "u64"
           },
@@ -4185,6 +4271,10 @@
           },
           {
             "name": "generation",
+            "type": "u64"
+          },
+          {
+            "name": "task_seq",
             "type": "u64"
           },
           {
