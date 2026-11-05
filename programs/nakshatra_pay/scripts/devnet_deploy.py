@@ -60,6 +60,19 @@ class DeployError(RuntimeError):
     pass
 
 
+class RefuseRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Make every JSON-RPC redirect a hard failure."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"redirect refused to {newurl}",
+            headers,
+            fp,
+        )
+
+
 def b58encode(raw: bytes) -> str:
     n = int.from_bytes(raw, "big")
     chars: list[str] = []
@@ -247,6 +260,7 @@ class Rpc:
         self.url = url
         self.timeout = timeout
         self._request_id = 0
+        self._opener = urllib.request.build_opener(RefuseRedirectHandler())
 
     def call(self, method: str, params: list[Any] | None = None) -> Any:
         self._request_id += 1
@@ -256,7 +270,7 @@ class Rpc:
         ).encode()
         request = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self._opener.open(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read(8 * 1024 * 1024))
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
             raise DeployError(f"RPC {method} failed: {exc}") from exc
@@ -421,6 +435,8 @@ class State:
                 self.data = json.loads(self.path.read_text())
             except (OSError, json.JSONDecodeError) as exc:
                 raise DeployError(f"invalid state file: {self.path}") from exc
+            if not isinstance(self.data, dict):
+                raise DeployError(f"invalid state file (expected a JSON object): {self.path}")
 
     def save(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -525,15 +541,17 @@ def inspect_program(rpc: Rpc, so_size: int | None = None) -> dict[str, Any] | No
     decoded = decode_program_data(program_data_account)
     deployed_bytes = decoded.pop("bytes")
     if so_size is not None:
-        if len(deployed_bytes) < so_size:
-            raise DeployError("ProgramData is shorter than the reviewed binary")
-        deployed_bytes = deployed_bytes[:so_size]
+        if len(deployed_bytes) != so_size:
+            raise DeployError(
+                f"ProgramData code length mismatch: expected {so_size}, got {len(deployed_bytes)}"
+            )
     decoded.update(
         {
             "program": PROGRAM_ID,
             "program_data": encoded_program_data,
             "executable": True,
             "code_sha256": hashlib.sha256(deployed_bytes).hexdigest(),
+            "code_length": len(deployed_bytes),
         }
     )
     return decoded
@@ -1060,43 +1078,85 @@ def cmd_verify(args: argparse.Namespace, state: State, rpc: Rpc) -> dict[str, An
     host = urllib.parse.urlparse(args.url).hostname
     if genesis != DEVNET_GENESIS and not (args.rehearsal and host == "127.0.0.1"):
         raise DeployError("verification RPC is neither devnet nor the rehearsal validator")
-    require_state(state, "expected_sha256", "so_size", "vault", "multisig", "mint", "members", "time_lock")
+    require_state(state, "expected_sha256", "so_size", "multisig", "members")
+    expected_sha256 = state.data["expected_sha256"]
+    so_size = state.data["so_size"]
+    multisig_address = state.data["multisig"]
+    expected_members = state.data["members"]
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha256)
+    ):
+        raise DeployError("deployment state has an invalid expected_sha256")
+    if isinstance(so_size, bool) or not isinstance(so_size, int) or so_size < 1:
+        raise DeployError("deployment state has an invalid so_size")
+    if not isinstance(multisig_address, str):
+        raise DeployError("deployment state has an invalid multisig address")
+    multisig_raw = pubkey(multisig_address)
+    if (
+        not isinstance(expected_members, list)
+        or len(expected_members) != 3
+        or any(not isinstance(member, str) for member in expected_members)
+        or len(set(expected_members)) != 3
+    ):
+        raise DeployError("deployment state must contain exactly 3 distinct expected members")
+    for member in expected_members:
+        pubkey(member)
+    vault = b58encode(squads_vault_pda(multisig_raw))
+    if args.rehearsal:
+        require_state(state, "mint")
+        expected_mint = state.data["mint"]
+        if not isinstance(expected_mint, str):
+            raise DeployError("deployment state has an invalid rehearsal mint")
+        pubkey(expected_mint)
+        expected_time_lock = 5
+    else:
+        expected_mint = DEVNET_USDC_MINT
+        expected_time_lock = 172800
     mismatches: list[str] = []
-    program = inspect_program(rpc, int(state.data["so_size"]))
+    program = inspect_program(rpc, so_size)
     if program is None:
         raise DeployError("program is not deployed")
     if not program["executable"]:
         mismatches.append("program_not_executable")
-    if program["upgrade_authority"] != state.data["vault"]:
+    if program["upgrade_authority"] != vault:
         mismatches.append("upgrade_authority")
-    if program["code_sha256"] != state.data["expected_sha256"]:
+    if program["code_sha256"] != expected_sha256:
         mismatches.append("code_sha256")
     config = read_config(rpc)
+    config_authority_status = None
     if config is None:
         mismatches.append("config_missing")
     else:
-        if config["mint"] != state.data["mint"]: mismatches.append("config_mint")
+        if config["mint"] != expected_mint: mismatches.append("config_mint")
         if config["fee_bps"] != 300: mismatches.append("config_fee_bps")
-        if config["authority"] != state.data["vault"]: mismatches.append("config_authority")
-        if config["pending_authority"] is not None: mismatches.append("config_pending_authority")
-    multisig = read_multisig(rpc, state.data["multisig"])
+        if config["authority"] == vault and config["pending_authority"] is None:
+            config_authority_status = "accepted"
+        elif config["authority"] != vault and config["pending_authority"] == vault:
+            config_authority_status = "pending"
+        else:
+            if config["authority"] != vault: mismatches.append("config_authority")
+            if config["pending_authority"] is not None: mismatches.append("config_pending_authority")
+    multisig = read_multisig(rpc, multisig_address)
     if multisig is None:
         mismatches.append("multisig_missing")
     else:
         if multisig["threshold"] != 2: mismatches.append("multisig_threshold")
-        if multisig["time_lock"] != state.data["time_lock"]: mismatches.append("multisig_time_lock")
+        if multisig["time_lock"] != expected_time_lock: mismatches.append("multisig_time_lock")
         actual = [item["key"] for item in multisig["members"]]
         permissions = [item["permissions"] for item in multisig["members"]]
-        if actual != state.data["members"] or permissions != [7, 7, 7]: mismatches.append("multisig_members")
+        if len(actual) != 3: mismatches.append("multisig_member_count")
+        if actual != expected_members or permissions != [7, 7, 7]: mismatches.append("multisig_members")
     report = {
         "ok": not mismatches, "command": "verify", "genesis": genesis, "mismatches": mismatches,
         "program": program,
         "config": None if config is None else {
             "mint": config["mint"], "fee_bps": config["fee_bps"], "authority": config["authority"],
-            "pending_authority": config["pending_authority"],
+            "pending_authority": config["pending_authority"], "authority_status": config_authority_status,
         },
         "multisig": None if multisig is None else {
-            "address": state.data["multisig"], "vault": state.data["vault"], "threshold": multisig["threshold"],
+            "address": multisig_address, "vault": vault, "threshold": multisig["threshold"],
             "time_lock": multisig["time_lock"], "members": multisig["members"],
         },
     }

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import hashlib
+import http.server
 import importlib.util
+import io
 import json
+import struct
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -27,6 +32,75 @@ class FakeRpc:
         if method == "getGenesisHash":
             return self.genesis
         raise AssertionError(method)
+
+
+class AccountRpc(FakeRpc):
+    def __init__(self, accounts):
+        super().__init__(genesis=deploy.DEVNET_GENESIS, url=deploy.DEVNET_RPC)
+        self.accounts = accounts
+
+    def account(self, address):
+        return self.accounts.get(address)
+
+
+class QuietHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, _format, *_args):
+        pass
+
+
+class RedirectHandler(QuietHandler):
+    target = ""
+
+    def do_POST(self):
+        self.send_response(302)
+        self.send_header("Location", self.target)
+        self.end_headers()
+
+
+class GenesisHandler(QuietHandler):
+    requests = 0
+
+    def do_GET(self):
+        type(self).requests += 1
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": "redirected-non-devnet"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@contextlib.contextmanager
+def redirecting_rpc():
+    GenesisHandler.requests = 0
+    target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), GenesisHandler)
+    RedirectHandler.target = f"http://localhost:{target.server_port}/"
+    source = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in (target, source)]
+    for thread in threads:
+        thread.start()
+    try:
+        yield f"http://127.0.0.1:{source.server_port}/"
+    finally:
+        for server in (source, target):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join()
+
+
+def program_accounts(code, authority=deploy.SYSTEM_PROGRAM_ID):
+    program_data = deploy.b58encode(deploy.program_data_pda())
+    program = {
+        "owner": deploy.UPGRADEABLE_LOADER_ID,
+        "executable": True,
+        "data_raw": struct.pack("<I", 2) + deploy.pubkey(program_data),
+    }
+    data = struct.pack("<IQB", 3, 7, 1) + deploy.pubkey(authority) + code
+    return {
+        deploy.PROGRAM_ID: program,
+        program_data: {"owner": deploy.UPGRADEABLE_LOADER_ID, "data_raw": data},
+    }
 
 
 class CodecTests(unittest.TestCase):
@@ -84,6 +158,33 @@ class SafetyTests(unittest.TestCase):
             deploy.cluster_guard(FakeRpc(url="http://localhost:19999"), True)
         self.assertEqual(deploy.cluster_guard(FakeRpc(), True), "local-test-genesis")
 
+    def test_rpc_redirect_is_refused_on_every_subcommand_path(self):
+        with tempfile.TemporaryDirectory() as directory, redirecting_rpc() as url:
+            root = Path(directory)
+            so = root / "program.so"
+            so.write_bytes(b"reviewed program")
+            digest = hashlib.sha256(so.read_bytes()).hexdigest()
+            commands = {
+                "build-check": ["build-check", "--so", str(so), "--expect-sha256", digest],
+                "deploy": ["deploy", "--so", str(so), "--program-keypair", str(root / "program.json"), "--payer", str(root / "payer.json")],
+                "config-init": ["config-init", "--fee-bps", "300", "--payer", str(root / "payer.json")],
+                "multisig-create": [
+                    "multisig-create", "--member", deploy.SYSTEM_PROGRAM_ID, "--member", deploy.TOKEN_PROGRAM_ID,
+                    "--member", deploy.PROGRAM_ID, "--threshold", "2", "--time-lock", "5", "--payer", str(root / "payer.json"),
+                ],
+                "handover": ["handover", "--payer", str(root / "payer.json")],
+                "accept-config-authority": ["accept-config-authority", "propose", "--member-key", str(root / "member.json")],
+                "verify": ["verify"],
+            }
+            for name, command in commands.items():
+                with self.subTest(command=name):
+                    output = io.StringIO()
+                    argv = ["--url", url, "--rehearsal", "--state-dir", str(root / name), *command]
+                    with contextlib.redirect_stdout(output):
+                        self.assertEqual(deploy.main(argv), 1)
+                    self.assertIn("redirect refused", output.getvalue())
+            self.assertEqual(GenesisHandler.requests, 0, "redirect target must never receive an RPC request")
+
     def test_wrong_binary_hash_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -93,6 +194,13 @@ class SafetyTests(unittest.TestCase):
             args = argparse.Namespace(so=so, expect_sha256="0" * 64)
             with self.assertRaisesRegex(deploy.DeployError, "sha256 mismatch"):
                 deploy.cmd_build_check(args, state)
+
+    def test_state_file_must_be_a_json_object(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "state.json").write_text("[]\n")
+            with self.assertRaisesRegex(deploy.DeployError, "JSON object"):
+                deploy.State(root)
 
     def test_solana_buffer_recovery_phrase_is_redacted(self):
         stderr = (
@@ -128,6 +236,122 @@ class SafetyTests(unittest.TestCase):
                     state,
                     FakeRpc(genesis=deploy.DEVNET_GENESIS, url=deploy.DEVNET_RPC),
                 )
+
+    def test_program_data_trailing_bytes_are_refused(self):
+        reviewed = b"reviewed program bytes"
+        rpc = AccountRpc(program_accounts(reviewed + b"trailing bytes"))
+        with self.assertRaisesRegex(deploy.DeployError, "length"):
+            deploy.inspect_program(rpc, len(reviewed))
+
+    def test_program_report_includes_complete_code_length(self):
+        reviewed = b"reviewed program bytes"
+        report = deploy.inspect_program(AccountRpc(program_accounts(reviewed)), len(reviewed))
+        self.assertEqual(report["code_length"], len(reviewed))
+        self.assertEqual(report["code_sha256"], hashlib.sha256(reviewed).hexdigest())
+
+    def test_same_length_program_difference_is_refused_by_verify(self):
+        reviewed = b"reviewed program bytes"
+        changed = reviewed[:-1] + bytes([reviewed[-1] ^ 1])
+        multisig_address = deploy.ASSOCIATED_TOKEN_PROGRAM_ID
+        vault = deploy.b58encode(deploy.squads_vault_pda(deploy.pubkey(multisig_address)))
+        members = [deploy.SYSTEM_PROGRAM_ID, deploy.TOKEN_PROGRAM_ID, deploy.PROGRAM_ID]
+        with tempfile.TemporaryDirectory() as directory:
+            state = deploy.State(Path(directory))
+            state.data = {
+                "expected_sha256": hashlib.sha256(reviewed).hexdigest(), "so_size": len(reviewed),
+                "multisig": multisig_address, "members": members, "vault": vault,
+                "mint": deploy.DEVNET_USDC_MINT, "time_lock": 172800,
+            }
+            config = {"mint": deploy.DEVNET_USDC_MINT, "fee_bps": 300, "authority": vault, "pending_authority": None}
+            multisig = {"threshold": 2, "time_lock": 172800, "members": [{"key": key, "permissions": 7} for key in members]}
+            with patch.object(deploy, "read_config", return_value=config), patch.object(deploy, "read_multisig", return_value=multisig):
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                    deploy.cmd_verify(
+                        argparse.Namespace(url=deploy.DEVNET_RPC, rehearsal=False), state,
+                        AccountRpc(program_accounts(changed, vault)),
+                    )
+
+    def _verify_with(self, state_values, program_authority, config, multisig, rehearsal=False):
+        with tempfile.TemporaryDirectory() as directory:
+            state = deploy.State(Path(directory))
+            state.data = {
+                "expected_sha256": "ab" * 32, "so_size": 10,
+                "multisig": deploy.ASSOCIATED_TOKEN_PROGRAM_ID,
+                "members": [deploy.SYSTEM_PROGRAM_ID, deploy.TOKEN_PROGRAM_ID, deploy.PROGRAM_ID],
+                **state_values,
+            }
+            program = {
+                "program": deploy.PROGRAM_ID, "program_data": deploy.SYSTEM_PROGRAM_ID, "executable": True,
+                "slot": 7, "upgrade_authority": program_authority, "code_sha256": "ab" * 32, "code_length": 10,
+            }
+            printed = []
+            with patch.object(deploy, "inspect_program", return_value=program), patch.object(deploy, "read_config", return_value=config), \
+                    patch.object(deploy, "read_multisig", return_value=multisig), patch.object(deploy, "json_print", side_effect=printed.append):
+                try:
+                    report = deploy.cmd_verify(
+                        argparse.Namespace(url=deploy.DEVNET_RPC, rehearsal=rehearsal), state,
+                        FakeRpc(genesis=deploy.DEVNET_GENESIS, url=deploy.DEVNET_RPC),
+                    )
+                except SystemExit:
+                    report = printed[-1]
+            return report
+
+    def _valid_verify_values(self):
+        multisig_address = deploy.ASSOCIATED_TOKEN_PROGRAM_ID
+        vault = deploy.b58encode(deploy.squads_vault_pda(deploy.pubkey(multisig_address)))
+        members = [deploy.SYSTEM_PROGRAM_ID, deploy.TOKEN_PROGRAM_ID, deploy.PROGRAM_ID]
+        config = {"mint": deploy.DEVNET_USDC_MINT, "fee_bps": 300, "authority": vault, "pending_authority": None}
+        multisig = {"threshold": 2, "time_lock": 172800, "members": [{"key": key, "permissions": 7} for key in members]}
+        return vault, config, multisig
+
+    def test_production_verify_does_not_require_state_policy_fields(self):
+        vault, config, multisig = self._valid_verify_values()
+        report = self._verify_with({}, vault, config, multisig)
+        self.assertTrue(report["ok"], report)
+
+    def test_production_verify_refuses_state_substituted_mint(self):
+        vault, config, multisig = self._valid_verify_values()
+        config = {**config, "mint": deploy.TOKEN_PROGRAM_ID}
+        report = self._verify_with(
+            {"vault": vault, "mint": deploy.TOKEN_PROGRAM_ID, "time_lock": 172800}, vault, config, multisig,
+        )
+        self.assertFalse(report["ok"], report)
+        self.assertIn("config_mint", report["mismatches"])
+
+    def test_production_verify_refuses_state_substituted_time_lock(self):
+        vault, config, multisig = self._valid_verify_values()
+        multisig = {**multisig, "time_lock": 5}
+        report = self._verify_with(
+            {"vault": vault, "mint": deploy.DEVNET_USDC_MINT, "time_lock": 5}, vault, config, multisig,
+        )
+        self.assertFalse(report["ok"], report)
+        self.assertIn("multisig_time_lock", report["mismatches"])
+
+    def test_production_verify_refuses_state_substituted_vault(self):
+        canonical_vault, config, multisig = self._valid_verify_values()
+        unrelated = deploy.TOKEN_PROGRAM_ID
+        config = {**config, "authority": unrelated}
+        report = self._verify_with(
+            {"vault": unrelated, "mint": deploy.DEVNET_USDC_MINT, "time_lock": 172800}, unrelated, config, multisig,
+        )
+        self.assertFalse(report["ok"], report)
+        self.assertIn("upgrade_authority", report["mismatches"])
+        self.assertIn("config_authority", report["mismatches"])
+        self.assertNotEqual(canonical_vault, unrelated)
+
+    def test_verify_reports_canonical_config_authority_as_pending(self):
+        vault, config, multisig = self._valid_verify_values()
+        config = {**config, "authority": deploy.SYSTEM_PROGRAM_ID, "pending_authority": vault}
+        report = self._verify_with({}, vault, config, multisig)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["config"]["authority_status"], "pending")
+
+    def test_rehearsal_script_checks_specific_upgrade_authority_error(self):
+        rehearsal = SCRIPT.with_name("rehearse_devnet_deploy.sh").read_text()
+        self.assertIn(
+            'expect_failure_output_contains deployer-upgrade "does not match authority provided"',
+            rehearsal,
+        )
 
 
 if __name__ == "__main__":

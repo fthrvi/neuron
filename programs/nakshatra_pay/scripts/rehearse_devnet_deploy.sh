@@ -71,6 +71,16 @@ value = json.load(open(sys.argv[1]))
 assert value.get("ok") is False and sys.argv[2] in value.get("error", ""), value
 PY
 }
+expect_failure_output_contains() {
+    local name="$1"
+    local needle="$2"
+    shift 2
+    expect_failure "$name" "$@"
+    if ! grep -Fq -- "$needle" "$rehearsal_tmp/results/$name.json"; then
+        echo "failure for $name did not contain the required error: $needle" >&2
+        return 1
+    fi
+}
 run_step() {
     local name="$1"
     shift
@@ -202,7 +212,7 @@ sleep 1
 expect_failure_contains wrong-genesis "not devnet" python3 "$deploy_tool" --url http://127.0.0.1:18898 --state-dir "$rehearsal_tmp/state" \
     deploy --so "$so_path" --program-keypair "$program_keypair" --payer "$rehearsal_tmp/payer.json"
 
-expect_failure deployer-upgrade "$solana" --url "$rpc" --keypair "$rehearsal_tmp/payer.json" --output json program deploy "$so_path" \
+expect_failure_output_contains deployer-upgrade "does not match authority provided" "$solana" --url "$rpc" --keypair "$rehearsal_tmp/payer.json" --output json program deploy "$so_path" \
     --program-id "$program_id" --upgrade-authority "$rehearsal_tmp/payer.json" \
     --fee-payer "$rehearsal_tmp/payer.json" --buffer "$rehearsal_tmp/upgrade-buffer.json" \
     --max-len "$(stat -c %s "$so_path")" \
