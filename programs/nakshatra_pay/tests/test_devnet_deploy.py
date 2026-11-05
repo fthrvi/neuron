@@ -7,10 +7,12 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -142,8 +144,59 @@ def stateful_307_rpc():
             thread.join()
 
 
-def redirect_following_cli(args):
+@contextlib.contextmanager
+def deadline_rpc(drip_response=False):
+    class DeadlineHandler(QuietHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            request = json.loads(self.rfile.read(length))
+            if request.get("method") == "getGenesisHash":
+                body = json.dumps(
+                    {"jsonrpc": "2.0", "id": request.get("id"), "result": "local-test-genesis"}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if drip_response:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "16")
+                self.end_headers()
+                for _ in range(16):
+                    try:
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    time.sleep(0.05)
+                return
+            body = b'{}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DeadlineHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def redirect_following_cli(args, timeout=None):
     """Model the installed Rust CLI's POST-preserving 307 behavior."""
+    del timeout
     command = [str(arg) for arg in args]
     url = command[command.index("--url") + 1]
     body = json.dumps({"jsonrpc": "2.0", "id": 9, "method": "getLatestBlockhash", "params": []}).encode()
@@ -414,6 +467,47 @@ class SafetyTests(unittest.TestCase):
                 deploy.run_cli(["solana", "program", "deploy"])
         self.assertNotIn("secret words", str(raised.exception))
         self.assertIn("[REDACTED]", str(raised.exception))
+
+    def test_forwarder_partial_client_body_is_bounded_by_request_deadline(self):
+        with deadline_rpc() as upstream:
+            rpc = deploy.Rpc(upstream, timeout=0.2)
+            with deploy.CliRpcProxy(rpc, True) as proxy:
+                parsed = urllib.parse.urlparse(proxy)
+                started = time.monotonic()
+                with socket.create_connection((parsed.hostname, parsed.port), timeout=0.75) as client:
+                    client.settimeout(0.75)
+                    client.sendall(
+                        b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                        b"Content-Type: application/json\r\nContent-Length: 1\r\n\r\n"
+                    )
+                    response = client.recv(4096)
+                elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.65)
+        self.assertRegex(response, br"HTTP/1\.1 (408|502) ")
+        self.assertIn(b"Connection: close", response)
+
+    def test_forwarder_drip_feed_is_cut_off_by_total_deadline(self):
+        with deadline_rpc(drip_response=True) as upstream:
+            rpc = deploy.Rpc(upstream, timeout=0.2)
+            with deploy.CliRpcProxy(rpc, True) as proxy:
+                body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getSlot"}).encode()
+                request = urllib.request.Request(
+                    proxy, data=body, headers={"Content-Type": "application/json"}
+                )
+                started = time.monotonic()
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=0.75)
+                elapsed = time.monotonic() - started
+                raised.exception.close()
+        self.assertEqual(raised.exception.code, 502)
+        self.assertLess(elapsed, 0.65)
+
+    def test_hanging_subprocess_is_killed_at_its_timeout(self):
+        started = time.monotonic()
+        with patch.object(deploy, "CLI_TIMEOUT", 0.1):
+            with self.assertRaisesRegex(deploy.DeployError, "timed out"):
+                deploy.run_cli([sys.executable, "-c", "import time; time.sleep(0.4)"])
+        self.assertLess(time.monotonic() - started, 0.3)
 
     def test_multisig_threshold_duplicate_and_lock_validation(self):
         base = dict(

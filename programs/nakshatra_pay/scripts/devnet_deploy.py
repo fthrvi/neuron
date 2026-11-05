@@ -39,6 +39,9 @@ DEVNET_USDC_MINT = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
 DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
 DEVNET_RPC = "https://api.devnet.solana.com"
 MAX_RPC_BODY = 8 * 1024 * 1024
+RPC_IO_CHUNK = 64 * 1024
+CLI_TIMEOUT = 120.0
+DEPLOY_CLI_TIMEOUT = 900.0
 
 SOLANA_BIN = Path("/home/prithvi/.local/share/solana/install/active_release/bin")
 SOLANA = SOLANA_BIN / "solana"
@@ -60,6 +63,10 @@ I = pow(2, (Q - 1) // 4, Q)
 
 
 class DeployError(RuntimeError):
+    pass
+
+
+class CliTimeoutError(DeployError):
     pass
 
 
@@ -255,9 +262,14 @@ def json_print(value: dict[str, Any]) -> None:
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
 
 
-def run_cli(args: Sequence[str | os.PathLike[str]]) -> str:
+def run_cli(args: Sequence[str | os.PathLike[str]], timeout: float | None = None) -> str:
     command = [str(arg) for arg in args]
-    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    limit = CLI_TIMEOUT if timeout is None else timeout
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=limit)
+    except subprocess.TimeoutExpired as exc:
+        # subprocess.run kills and waits for the child before raising TimeoutExpired.
+        raise CliTimeoutError(f"command timed out after {limit:g} seconds") from exc
     if result.returncode:
         message = result.stderr.strip() or result.stdout.strip() or "command failed"
         # `solana program deploy` prints a randomly generated buffer recovery
@@ -337,19 +349,70 @@ class CliRpcProxy:
             def log_message(self, _format: str, *_args: Any) -> None:
                 pass
 
-            def _failure(self, message: str) -> None:
+            def _failure(self, message: str, status: int = 502) -> None:
                 body = json.dumps(
                     {"jsonrpc": "2.0", "id": None, "error": {"code": -32000, "message": message}},
                     separators=(",", ":"),
                 ).encode()
-                self.send_response(502)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(body)
+                self.close_connection = True
+                try:
+                    self.connection.settimeout(forwarder.rpc.timeout)
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(body)
+                except OSError:
+                    pass
+
+            @staticmethod
+            def _remaining(deadline: float) -> float:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("RPC request deadline exceeded")
+                return remaining
+
+            def _read_client_body(self, length: int, deadline: float) -> bytes:
+                chunks: list[bytes] = []
+                unread = length
+                while unread:
+                    self.connection.settimeout(self._remaining(deadline))
+                    chunk = self.rfile.read1(min(unread, RPC_IO_CHUNK))
+                    if not chunk:
+                        raise EOFError("RPC request body ended before Content-Length")
+                    chunks.append(chunk)
+                    unread -= len(chunk)
+                return b"".join(chunks)
+
+            @staticmethod
+            def _set_upstream_timeout(response: Any, timeout: float) -> None:
+                fp = getattr(response, "fp", None)
+                raw = getattr(fp, "raw", None)
+                sock = getattr(raw, "_sock", None)
+                if sock is None:
+                    # http.client drops fp after consuming a zero-length
+                    # response; there is then no remaining I/O to constrain.
+                    if response.isclosed():
+                        return
+                    raise DeployError("upstream RPC socket cannot enforce the request deadline")
+                sock.settimeout(timeout)
+
+            def _read_upstream_body(self, response: Any, deadline: float) -> bytes:
+                chunks: list[bytes] = []
+                size = 0
+                while size <= MAX_RPC_BODY:
+                    remaining = self._remaining(deadline)
+                    self._set_upstream_timeout(response, remaining)
+                    chunk = response.read1(min(RPC_IO_CHUNK, MAX_RPC_BODY + 1 - size))
+                    if not chunk:
+                        return b"".join(chunks)
+                    chunks.append(chunk)
+                    size += len(chunk)
+                raise DeployError("RPC response body is too large")
 
             def do_POST(self) -> None:
+                deadline = time.monotonic() + forwarder.rpc.timeout
                 length_text = self.headers.get("Content-Length")
                 if length_text is None or not length_text.isdigit():
                     self._failure("RPC request requires Content-Length")
@@ -358,7 +421,11 @@ class CliRpcProxy:
                 if length > MAX_RPC_BODY:
                     self._failure("RPC request body is too large")
                     return
-                body = self.rfile.read(length)
+                try:
+                    body = self._read_client_body(length, deadline)
+                except (EOFError, OSError, TimeoutError) as exc:
+                    self._failure(str(exc), status=408)
+                    return
                 request = urllib.request.Request(
                     forwarder.rpc.url,
                     data=body,
@@ -366,12 +433,10 @@ class CliRpcProxy:
                     method="POST",
                 )
                 try:
-                    with forwarder.rpc._opener.open(request, timeout=forwarder.rpc.timeout) as response:
+                    with forwarder.rpc._opener.open(request, timeout=self._remaining(deadline)) as response:
                         if 300 <= response.status < 400:
                             raise DeployError(f"RPC redirect refused (HTTP {response.status})")
-                        response_body = response.read(MAX_RPC_BODY + 1)
-                        if len(response_body) > MAX_RPC_BODY:
-                            raise DeployError("RPC response body is too large")
+                        response_body = self._read_upstream_body(response, deadline)
                         content_type = response.headers.get("Content-Type", "application/json")
                         status = response.status
                 except urllib.error.HTTPError as exc:
@@ -383,12 +448,17 @@ class CliRpcProxy:
                 except (OSError, urllib.error.URLError, DeployError) as exc:
                     self._failure(str(exc))
                     return
-                self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(response_body)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(response_body)
+                try:
+                    self.connection.settimeout(self._remaining(deadline))
+                    self.send_response(status)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(response_body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(response_body)
+                    self.close_connection = True
+                except (OSError, TimeoutError) as exc:
+                    self._failure(str(exc))
 
             def do_GET(self) -> None:
                 # Websocket upgrades and all non-JSON-RPC traffic fail closed.
@@ -842,11 +912,16 @@ def ensure_fee_wallet(
     if rpc.account(ata) is not None:
         assert_token_account(rpc, ata, mint, payer_text)
         return ata, None
-    with CliRpcProxy(rpc, rehearsal) as cli_url:
-        output = run_cli(
-            [SPL_TOKEN, "--url", cli_url, "--output", "json", "--fee-payer", payer_path,
-             "create-account", mint, "--owner", payer_text]
-        )
+    output = ""
+    timeout_error = None
+    try:
+        with CliRpcProxy(rpc, rehearsal) as cli_url:
+            output = run_cli(
+                [SPL_TOKEN, "--url", cli_url, "--output", "json", "--fee-payer", payer_path,
+                 "create-account", mint, "--owner", payer_text]
+            )
+    except CliTimeoutError as exc:
+        timeout_error = exc
     signature = None
     try:
         result = json.loads(output)
@@ -856,6 +931,8 @@ def ensure_fee_wallet(
     # The CLI exit code is not authoritative. Re-read the account through the
     # fenced Python client and validate its owner, mint and wallet authority.
     assert_token_account(rpc, ata, mint, payer_text)
+    if timeout_error is not None:
+        raise timeout_error
     return ata, signature
 
 
@@ -897,16 +974,22 @@ def cmd_deploy(args: argparse.Namespace, state: State, rpc: Rpc) -> dict[str, An
         buffer_path = state.directory / "deploy-buffer-keypair.json"
         if not buffer_path.exists():
             create_keypair(buffer_path)
-        with CliRpcProxy(rpc, args.rehearsal) as cli_url:
-            output = run_cli(
-                [
-                    SOLANA, "--url", cli_url, "--ws", cli_url.replace("http://", "ws://", 1),
-                    "--keypair", args.payer, "--output", "json", "program", "deploy", so,
-                    "--program-id", args.program_keypair, "--upgrade-authority", args.payer,
-                    "--fee-payer", args.payer, "--buffer", buffer_path,
-                    "--max-len", str(so.stat().st_size), "--use-rpc",
-                ]
-            )
+        output = ""
+        timeout_error = None
+        try:
+            with CliRpcProxy(rpc, args.rehearsal) as cli_url:
+                output = run_cli(
+                    [
+                        SOLANA, "--url", cli_url, "--ws", cli_url.replace("http://", "ws://", 1),
+                        "--keypair", args.payer, "--output", "json", "program", "deploy", so,
+                        "--program-id", args.program_keypair, "--upgrade-authority", args.payer,
+                        "--fee-payer", args.payer, "--buffer", buffer_path,
+                        "--max-len", str(so.stat().st_size), "--use-rpc",
+                    ],
+                    timeout=DEPLOY_CLI_TIMEOUT,
+                )
+        except CliTimeoutError as exc:
+            timeout_error = exc
         try:
             parsed = json.loads(output)
             signature = parsed.get("signature")
@@ -917,6 +1000,8 @@ def cmd_deploy(args: argparse.Namespace, state: State, rpc: Rpc) -> dict[str, An
             raise DeployError("deployed ProgramData authority does not match the deployer")
         if existing["code_sha256"] != state.data["expected_sha256"]:
             raise DeployError("deployed ProgramData bytes do not match the reviewed binary")
+        if timeout_error is not None:
+            raise timeout_error
         action = "deployed"
     if existing is None or existing["code_sha256"] != state.data["expected_sha256"]:
         raise DeployError("on-chain program bytes do not match the reviewed binary")
@@ -1062,20 +1147,33 @@ def cmd_handover(args: argparse.Namespace, state: State, rpc: Rpc) -> dict[str, 
     if program["upgrade_authority"] != state.data["vault"]:
         if program["upgrade_authority"] != b58encode(payer):
             raise DeployError("deployer no longer controls the program upgrade authority")
-        with CliRpcProxy(rpc, args.rehearsal) as cli_url:
-            output = run_cli(
-                [
-                    SOLANA, "--url", cli_url, "--ws", cli_url.replace("http://", "ws://", 1),
-                    "--keypair", args.payer, "--output", "json", "program", "set-upgrade-authority", PROGRAM_ID,
-                    "--upgrade-authority", args.payer, "--new-upgrade-authority", state.data["vault"],
-                    "--skip-new-upgrade-authority-signer-check",
-                ]
-            )
+        output = ""
+        timeout_error = None
+        try:
+            with CliRpcProxy(rpc, args.rehearsal) as cli_url:
+                output = run_cli(
+                    [
+                        SOLANA, "--url", cli_url, "--ws", cli_url.replace("http://", "ws://", 1),
+                        "--keypair", args.payer, "--output", "json", "program", "set-upgrade-authority", PROGRAM_ID,
+                        "--upgrade-authority", args.payer, "--new-upgrade-authority", state.data["vault"],
+                        "--skip-new-upgrade-authority-signer-check",
+                    ]
+                )
+        except CliTimeoutError as exc:
+            timeout_error = exc
         try:
             authority_signature = json.loads(output).get("signature")
         except json.JSONDecodeError:
             pass
         program = inspect_program(rpc, state.data["so_size"])
+        if timeout_error is not None:
+            if (
+                program is None
+                or program["upgrade_authority"] != state.data["vault"]
+                or program["code_sha256"] != state.data["expected_sha256"]
+            ):
+                raise DeployError("program upgrade authority handover state is invalid after command timeout") from timeout_error
+            raise timeout_error
     if (
         program is None
         or program["upgrade_authority"] != state.data["vault"]
