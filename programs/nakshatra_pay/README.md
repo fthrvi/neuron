@@ -36,10 +36,21 @@ the reviewed hash.
 
 ## Devnet deployment under Squads v4
 
-`scripts/devnet_deploy.py` is devnet-only. Every chain mutation first checks `getGenesisHash` and
-refuses any cluster except devnet; `--rehearsal` additionally permits only a validator whose URL
-uses literal `127.0.0.1`. It uses Python's standard library and the pinned Solana command-line
-tools, and hand-encodes the Squads v4 Anchor/Borsh instructions.
+`scripts/devnet_deploy.py` is devnet-only. Production accepts only the exact RPC URL
+`https://api.devnet.solana.com`; userinfo, alternate ports, paths, queries and every other URL are
+rejected during argument parsing. `--rehearsal` instead accepts only
+`http://127.0.0.1:<port>`. Every chain mutation also checks `getGenesisHash` and refuses any
+cluster except devnet or the literal-loopback rehearsal validator.
+
+The tool never gives an external CLI that allowlisted upstream URL. Before each `solana` or
+`spl-token` write, it starts an ephemeral in-process `127.0.0.1` JSON-RPC forwarder, repeats the
+genesis check, and relays POST bodies with redirects disabled. The `solana` CLI also receives the
+same proxy as a `ws://127.0.0.1:<ephemeral>` URL, where websocket GET/upgrade requests are rejected
+without forwarding; `spl-token` has no websocket option. Confirmation is therefore authoritative
+only after the Python client re-reads the ProgramData or token account and
+checks its owner, exact code length and hash, and expected authority. The implementation uses only
+Python's standard library and the pinned Solana command-line tools, and hand-encodes the Squads v4
+Anchor/Borsh instructions.
 
 Set local shell variables to public or local-path values, then run this exact sequence. The three
 member key files stay on their respective operators' machines; they are shown together only to make

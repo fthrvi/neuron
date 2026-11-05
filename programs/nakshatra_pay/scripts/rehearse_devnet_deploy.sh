@@ -18,10 +18,8 @@ squads_config=BSTq9w3kZwNwpBXJEvTZz2G9ZTNyKBvoSeXMvwb4cNZr
 rehearsal_tmp="$(mktemp -d)"
 validator_pid=""
 fake_rpc_pid=""
-devnet_rpc_pid=""
 cleanup() {
     local status=$?
-    if [[ -n "$devnet_rpc_pid" ]]; then kill "$devnet_rpc_pid" 2>/dev/null || true; fi
     if [[ -n "$fake_rpc_pid" ]]; then kill "$fake_rpc_pid" 2>/dev/null || true; fi
     if [[ -n "$validator_pid" ]]; then kill "$validator_pid" 2>/dev/null || true; fi
     if [[ $status -ne 0 ]]; then
@@ -198,19 +196,28 @@ expect_failure_contains threshold-1 threshold "${common[@]}" multisig-create \
 expect_failure_contains duplicate-members distinct "${common[@]}" multisig-create \
     --member "$member1_pub" --member "$member1_pub" --member "$member3_pub" \
     --threshold 2 --time-lock 5 --payer "$rehearsal_tmp/payer.json"
-python3 "$workspace_dir/tests/fake_genesis_rpc.py" --port 18897 --genesis EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG \
-    >"$rehearsal_tmp/fake-devnet-rpc.log" 2>&1 &
-devnet_rpc_pid=$!
-sleep 1
-expect_failure_contains production-short-lock time-lock python3 "$deploy_tool" --url http://127.0.0.1:18897 --state-dir "$rehearsal_tmp/state" multisig-create \
+expect_failure_contains production-short-lock time-lock python3 "$deploy_tool" --url https://api.devnet.solana.com \
+    --state-dir "$rehearsal_tmp/state" multisig-create \
     --member "$member1_pub" --member "$member2_pub" --member "$member3_pub" \
     --threshold 2 --time-lock 6 --payer "$rehearsal_tmp/payer.json"
+
+expect_failure_output_contains non-allowlisted-production-url "production --url must be exactly" \
+    python3 "$deploy_tool" --url http://127.0.0.1:18897 --state-dir "$rehearsal_tmp/state" \
+    deploy --so "$so_path" --program-keypair "$program_keypair" --payer "$rehearsal_tmp/payer.json"
 
 python3 "$workspace_dir/tests/fake_genesis_rpc.py" --port 18898 >"$rehearsal_tmp/fake-rpc.log" 2>&1 &
 fake_rpc_pid=$!
 sleep 1
-expect_failure_contains wrong-genesis "not devnet" python3 "$deploy_tool" --url http://127.0.0.1:18898 --state-dir "$rehearsal_tmp/state" \
-    deploy --so "$so_path" --program-keypair "$program_keypair" --payer "$rehearsal_tmp/payer.json"
+expect_failure_output_contains wrong-genesis "not devnet" python3 - "$deploy_tool" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("nak_pay_devnet_deploy_rehearsal", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.cluster_guard(module.Rpc("http://127.0.0.1:18898"), False)
+PY
 
 expect_failure_output_contains deployer-upgrade "does not match authority provided" "$solana" --url "$rpc" --keypair "$rehearsal_tmp/payer.json" --output json program deploy "$so_path" \
     --program-id "$program_id" --upgrade-authority "$rehearsal_tmp/payer.json" \
@@ -226,8 +233,8 @@ summary = {
     "rehearsal": "PASS",
     "flow_steps": 11,
     "idempotency_checks": 9,
-    "negative_tests": 7,
-    "total_assertions": 27,
+    "negative_tests": 8,
+    "total_assertions": 28,
     "program": verify["program"]["program"],
     "program_data": verify["program"]["program_data"],
     "code_sha256": sys.argv[2],

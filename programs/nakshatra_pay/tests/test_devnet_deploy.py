@@ -6,17 +6,20 @@ import http.server
 import importlib.util
 import io
 import json
+import os
 import struct
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "devnet_deploy.py"
+SCRIPT = Path(os.environ.get("NAK_PAY_DEPLOY_TOOL", Path(__file__).resolve().parents[1] / "scripts" / "devnet_deploy.py"))
 SPEC = importlib.util.spec_from_file_location("nak_pay_devnet_deploy", SCRIPT)
 deploy = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = deploy
@@ -80,13 +83,83 @@ def redirecting_rpc():
     for thread in threads:
         thread.start()
     try:
-        yield f"http://127.0.0.1:{source.server_port}/"
+        yield f"http://127.0.0.1:{source.server_port}"
     finally:
         for server in (source, target):
             server.shutdown()
             server.server_close()
         for thread in threads:
             thread.join()
+
+
+@contextlib.contextmanager
+def stateful_307_rpc():
+    counts = {"source": 0, "target": 0}
+
+    class Target(QuietHandler):
+        def do_POST(self):
+            counts["target"] += 1
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Target)
+
+    class Source(QuietHandler):
+        def do_POST(self):
+            counts["source"] += 1
+            length = int(self.headers.get("Content-Length", "0"))
+            request = json.loads(self.rfile.read(length))
+            if request.get("method") == "getGenesisHash":
+                body = json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": "local-test-genesis"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(307)
+            self.send_header("Location", f"http://127.0.0.1:{target.server_port}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    source = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Source)
+    threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in (target, source)]
+    for thread in threads:
+        thread.start()
+    try:
+        yield f"http://127.0.0.1:{source.server_port}", counts
+    finally:
+        for server in (source, target):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join()
+
+
+def redirect_following_cli(args):
+    """Model the installed Rust CLI's POST-preserving 307 behavior."""
+    command = [str(arg) for arg in args]
+    url = command[command.index("--url") + 1]
+    body = json.dumps({"jsonrpc": "2.0", "id": 9, "method": "getLatestBlockhash", "params": []}).encode()
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code != 307:
+            raise deploy.DeployError(f"simulated CLI RPC failed: HTTP {exc.code}") from exc
+        redirected = urllib.request.Request(
+            exc.headers["Location"], data=body, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(redirected, timeout=2) as response:
+            response.read()
+    return json.dumps({"signature": "simulated", "transactionSignature": "simulated"})
 
 
 def program_accounts(code, authority=deploy.SYSTEM_PROGRAM_ID):
@@ -145,9 +218,136 @@ class CodecTests(unittest.TestCase):
 
 
 class SafetyTests(unittest.TestCase):
+    def _assert_url_parse_refused(self, url, rehearsal=False):
+        argv = ["--url", url]
+        if rehearsal:
+            argv.append("--rehearsal")
+        argv += ["build-check", "--so", "/tmp/not-read-during-parse.so", "--expect-sha256", "0" * 64]
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            deploy.parser().parse_args(argv)
+        self.assertEqual(raised.exception.code, 2)
+
+    def _assert_cli_path_redirect_fenced(self, path):
+        payer = deploy.pubkey(deploy.SYSTEM_PROGRAM_ID)
+        program_key = deploy.pubkey(deploy.PROGRAM_ID)
+        with tempfile.TemporaryDirectory() as directory, stateful_307_rpc() as (url, counts):
+            root = Path(directory)
+            state = deploy.State(root / "state")
+            rpc = deploy.Rpc(url)
+
+            def fake_load(key_path):
+                public = program_key if Path(key_path).name == "program.json" else payer
+                return b"\0" * 32, public
+
+            common_patches = (
+                patch.object(deploy, "load_keypair", side_effect=fake_load),
+                patch.object(deploy, "run_cli", side_effect=redirect_following_cli),
+            )
+            with common_patches[0], common_patches[1]:
+                try:
+                    if path == "deploy":
+                        so = root / "program.so"
+                        so.write_bytes(b"reviewed program")
+                        state.data = {
+                            "expected_sha256": hashlib.sha256(so.read_bytes()).hexdigest(),
+                            "so_size": so.stat().st_size,
+                        }
+                        args = argparse.Namespace(
+                            url=url, rehearsal=True, so=so, program_keypair=root / "program.json",
+                            payer=root / "payer.json",
+                        )
+                        with patch.object(deploy, "inspect_program", return_value=None), \
+                                patch.object(deploy, "create_keypair", return_value=b"\1" * 32):
+                            deploy.cmd_deploy(args, state, rpc)
+                    elif path == "fee-wallet":
+                        mint = deploy.TOKEN_PROGRAM_ID
+                        payer_text = deploy.b58encode(payer)
+                        ata = deploy.b58encode(
+                            deploy.find_pda(
+                                [payer, deploy.pubkey(deploy.TOKEN_PROGRAM_ID), deploy.pubkey(mint)],
+                                deploy.ASSOCIATED_TOKEN_PROGRAM_ID,
+                            )[0]
+                        )
+                        ata_reads = 0
+
+                        def fake_account(address):
+                            nonlocal ata_reads
+                            if address == mint:
+                                return {"owner": deploy.TOKEN_PROGRAM_ID, "data_raw": b"mint"}
+                            if address == ata:
+                                ata_reads += 1
+                                if ata_reads == 1:
+                                    return None
+                                return {
+                                    "owner": deploy.TOKEN_PROGRAM_ID,
+                                    "data_raw": deploy.pubkey(mint) + payer + b"\0" * 101,
+                                }
+                            return None
+
+                        state.data = {
+                            "expected_sha256": "ab" * 32, "so_size": 16, "deployer": payer_text,
+                        }
+                        config = {
+                            "authority": payer_text, "pending_authority": None, "mint": mint,
+                            "fee_bps": 300, "fee_wallet": ata,
+                        }
+                        args = argparse.Namespace(
+                            url=url, rehearsal=True, fee_bps=300, payer=root / "payer.json",
+                            mint=mint, fee_wallet=None,
+                        )
+                        with patch.object(rpc, "account", side_effect=fake_account), \
+                                patch.object(deploy, "read_config", side_effect=[None, config]), \
+                                patch.object(deploy, "send_instructions", return_value="config-signature"):
+                            deploy.cmd_config_init(args, state, rpc)
+                    elif path == "set-upgrade-authority":
+                        payer_text = deploy.b58encode(payer)
+                        vault = deploy.TOKEN_PROGRAM_ID
+                        state.data = {
+                            "deployer": payer_text, "vault": vault, "so_size": 16,
+                            "expected_sha256": "ab" * 32,
+                        }
+                        config = {"authority": payer_text, "pending_authority": vault}
+                        before = {
+                            "upgrade_authority": payer_text, "program_data": deploy.SYSTEM_PROGRAM_ID,
+                            "code_sha256": "ab" * 32, "code_length": 16,
+                        }
+                        after = {**before, "upgrade_authority": vault}
+                        args = argparse.Namespace(url=url, rehearsal=True, payer=root / "payer.json")
+                        with patch.object(deploy, "read_config", return_value=config), \
+                                patch.object(deploy, "inspect_program", side_effect=[before, after]):
+                            deploy.cmd_handover(args, state, rpc)
+                    else:
+                        raise AssertionError(path)
+                except deploy.DeployError:
+                    pass
+            self.assertEqual(counts["source"], 3, "command guard, proxy guard and CLI request must all run")
+            self.assertEqual(counts["target"], 0, f"redirect target received a {path} CLI request")
+
     def test_devnet_genesis_is_accepted(self):
         rpc = FakeRpc(genesis=deploy.DEVNET_GENESIS, url=deploy.DEVNET_RPC)
         self.assertEqual(deploy.cluster_guard(rpc, False), deploy.DEVNET_GENESIS)
+
+    def test_production_url_with_userinfo_is_refused_at_parse(self):
+        self._assert_url_parse_refused("https://operator@api.devnet.solana.com")
+
+    def test_production_url_with_another_port_is_refused_at_parse(self):
+        self._assert_url_parse_refused("https://api.devnet.solana.com:443")
+
+    def test_production_url_with_trailing_path_is_refused_at_parse(self):
+        self._assert_url_parse_refused("https://api.devnet.solana.com/rpc")
+
+    def test_rehearsal_url_must_be_exact_literal_loopback_at_parse(self):
+        self._assert_url_parse_refused("http://localhost:8899", rehearsal=True)
+        self._assert_url_parse_refused("http://127.0.0.1:8899/", rehearsal=True)
+
+    def test_cli_deploy_redirect_target_receives_zero_requests(self):
+        self._assert_cli_path_redirect_fenced("deploy")
+
+    def test_cli_fee_wallet_redirect_target_receives_zero_requests(self):
+        self._assert_cli_path_redirect_fenced("fee-wallet")
+
+    def test_cli_set_authority_redirect_target_receives_zero_requests(self):
+        self._assert_cli_path_redirect_fenced("set-upgrade-authority")
 
     def test_non_devnet_genesis_is_refused(self):
         with self.assertRaisesRegex(deploy.DeployError, "not devnet"):

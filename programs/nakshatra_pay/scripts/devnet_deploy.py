@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.server
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import secrets
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -36,6 +38,7 @@ SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
 DEVNET_USDC_MINT = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
 DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
 DEVNET_RPC = "https://api.devnet.solana.com"
+MAX_RPC_BODY = 8 * 1024 * 1024
 
 SOLANA_BIN = Path("/home/prithvi/.local/share/solana/install/active_release/bin")
 SOLANA = SOLANA_BIN / "solana"
@@ -71,6 +74,20 @@ class RefuseRedirectHandler(urllib.request.HTTPRedirectHandler):
             headers,
             fp,
         )
+
+
+def validate_rpc_url(url: str, rehearsal: bool) -> None:
+    """Accept only the one production endpoint or a literal rehearsal loopback."""
+    if not rehearsal:
+        if url != DEVNET_RPC:
+            raise DeployError(f"production --url must be exactly {DEVNET_RPC}")
+        return
+    match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]+)", url)
+    if match is None:
+        raise DeployError("rehearsal --url must be exactly http://127.0.0.1:<port>")
+    port = int(match.group(1))
+    if port < 1 or port > 65535:
+        raise DeployError("rehearsal --url port must be between 1 and 65535")
 
 
 def b58encode(raw: bytes) -> str:
@@ -296,6 +313,99 @@ class Rpc:
         value = dict(value)
         value["data_raw"] = base64.b64decode(data[0], validate=True)
         return value
+
+
+class CliRpcProxy:
+    """Loopback-only, no-redirect JSON-RPC forwarder for untrusted CLI clients."""
+
+    def __init__(self, rpc: Rpc, rehearsal: bool):
+        self.rpc = rpc
+        self.rehearsal = rehearsal
+        self.server: http.server.ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+
+    def __enter__(self) -> str:
+        # Intentionally repeat the guard immediately before each external CLI.
+        # A stateful endpoint cannot pass the command guard and then pivot the
+        # CLI to another cluster.
+        cluster_guard(self.rpc, self.rehearsal)
+        forwarder = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                pass
+
+            def _failure(self, message: str) -> None:
+                body = json.dumps(
+                    {"jsonrpc": "2.0", "id": None, "error": {"code": -32000, "message": message}},
+                    separators=(",", ":"),
+                ).encode()
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                length_text = self.headers.get("Content-Length")
+                if length_text is None or not length_text.isdigit():
+                    self._failure("RPC request requires Content-Length")
+                    return
+                length = int(length_text)
+                if length > MAX_RPC_BODY:
+                    self._failure("RPC request body is too large")
+                    return
+                body = self.rfile.read(length)
+                request = urllib.request.Request(
+                    forwarder.rpc.url,
+                    data=body,
+                    headers={"Content-Type": self.headers.get("Content-Type", "application/json")},
+                    method="POST",
+                )
+                try:
+                    with forwarder.rpc._opener.open(request, timeout=forwarder.rpc.timeout) as response:
+                        if 300 <= response.status < 400:
+                            raise DeployError(f"RPC redirect refused (HTTP {response.status})")
+                        response_body = response.read(MAX_RPC_BODY + 1)
+                        if len(response_body) > MAX_RPC_BODY:
+                            raise DeployError("RPC response body is too large")
+                        content_type = response.headers.get("Content-Type", "application/json")
+                        status = response.status
+                except urllib.error.HTTPError as exc:
+                    if 300 <= exc.code < 400:
+                        self._failure(f"RPC redirect refused (HTTP {exc.code})")
+                    else:
+                        self._failure(f"upstream RPC HTTP error {exc.code}")
+                    return
+                except (OSError, urllib.error.URLError, DeployError) as exc:
+                    self._failure(str(exc))
+                    return
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(response_body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(response_body)
+
+            def do_GET(self) -> None:
+                # Websocket upgrades and all non-JSON-RPC traffic fail closed.
+                self._failure("only JSON-RPC POST requests are allowed")
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        if self.server is not None:
+            self.server.shutdown()
+            self.server.server_close()
+        if self.thread is not None:
+            self.thread.join()
 
 
 def cluster_guard(rpc: Rpc, rehearsal: bool) -> str:
@@ -708,27 +818,44 @@ def program_config(rpc: Rpc) -> tuple[str, int]:
     return b58encode(data[48:80]), struct.unpack_from("<Q", data, 40)[0]
 
 
-def ensure_fee_wallet(rpc: Rpc, url: str, payer_path: Path, mint: str, explicit: str | None) -> tuple[str, str | None]:
+def assert_token_account(rpc: Rpc, address: str, mint: str, owner: str) -> None:
+    account = rpc.account(address)
+    if account is None:
+        raise DeployError("fee wallet is missing")
+    if account.get("owner") != TOKEN_PROGRAM_ID:
+        raise DeployError("fee wallet account owner is not the classic SPL Token program")
+    data: bytes = account["data_raw"]
+    if len(data) != 165 or b58encode(data[:32]) != mint or b58encode(data[32:64]) != owner:
+        raise DeployError("fee wallet does not match the requested mint and owner")
+
+
+def ensure_fee_wallet(
+    rpc: Rpc, rehearsal: bool, payer_path: Path, mint: str, explicit: str | None
+) -> tuple[str, str | None]:
     payer = load_keypair(payer_path)[1]
+    payer_text = b58encode(payer)
     if explicit:
         pubkey(explicit)
-        if rpc.account(explicit) is None:
-            raise DeployError("specified fee wallet does not exist")
+        assert_token_account(rpc, explicit, mint, payer_text)
         return explicit, None
     ata = b58encode(find_pda([payer, pubkey(TOKEN_PROGRAM_ID), pubkey(mint)], ASSOCIATED_TOKEN_PROGRAM_ID)[0])
     if rpc.account(ata) is not None:
+        assert_token_account(rpc, ata, mint, payer_text)
         return ata, None
-    output = run_cli(
-        [SPL_TOKEN, "--url", url, "--output", "json", "--fee-payer", payer_path, "create-account", mint, "--owner", b58encode(payer)]
-    )
+    with CliRpcProxy(rpc, rehearsal) as cli_url:
+        output = run_cli(
+            [SPL_TOKEN, "--url", cli_url, "--output", "json", "--fee-payer", payer_path,
+             "create-account", mint, "--owner", payer_text]
+        )
     signature = None
     try:
         result = json.loads(output)
         signature = result.get("transactionSignature") or result.get("signature")
     except json.JSONDecodeError:
         pass
-    if rpc.account(ata) is None:
-        raise DeployError("failed to create fee wallet")
+    # The CLI exit code is not authoritative. Re-read the account through the
+    # fenced Python client and validate its owner, mint and wallet authority.
+    assert_token_account(rpc, ata, mint, payer_text)
     return ata, signature
 
 
@@ -770,20 +897,26 @@ def cmd_deploy(args: argparse.Namespace, state: State, rpc: Rpc) -> dict[str, An
         buffer_path = state.directory / "deploy-buffer-keypair.json"
         if not buffer_path.exists():
             create_keypair(buffer_path)
-        output = run_cli(
-            [
-                SOLANA, "--url", args.url, "--keypair", args.payer, "--output", "json", "program", "deploy", so,
-                "--program-id", args.program_keypair, "--upgrade-authority", args.payer,
-                "--fee-payer", args.payer, "--buffer", buffer_path,
-                "--max-len", str(so.stat().st_size), "--use-rpc",
-            ]
-        )
+        with CliRpcProxy(rpc, args.rehearsal) as cli_url:
+            output = run_cli(
+                [
+                    SOLANA, "--url", cli_url, "--ws", cli_url.replace("http://", "ws://", 1),
+                    "--keypair", args.payer, "--output", "json", "program", "deploy", so,
+                    "--program-id", args.program_keypair, "--upgrade-authority", args.payer,
+                    "--fee-payer", args.payer, "--buffer", buffer_path,
+                    "--max-len", str(so.stat().st_size), "--use-rpc",
+                ]
+            )
         try:
             parsed = json.loads(output)
             signature = parsed.get("signature")
         except json.JSONDecodeError:
             pass
         existing = inspect_program(rpc, so.stat().st_size)
+        if existing is None or existing["upgrade_authority"] != b58encode(payer):
+            raise DeployError("deployed ProgramData authority does not match the deployer")
+        if existing["code_sha256"] != state.data["expected_sha256"]:
+            raise DeployError("deployed ProgramData bytes do not match the reviewed binary")
         action = "deployed"
     if existing is None or existing["code_sha256"] != state.data["expected_sha256"]:
         raise DeployError("on-chain program bytes do not match the reviewed binary")
@@ -819,7 +952,7 @@ def cmd_config_init(args: argparse.Namespace, state: State, rpc: Rpc) -> dict[st
     if existing is None:
         if rpc.account(mint) is None:
             raise DeployError("mint account does not exist")
-        fee_wallet, wallet_signature = ensure_fee_wallet(rpc, args.url, args.payer, mint, args.fee_wallet)
+        fee_wallet, wallet_signature = ensure_fee_wallet(rpc, args.rehearsal, args.payer, mint, args.fee_wallet)
         config = config_pda()
         accounts = [
             Meta(payer, True, True), Meta(config, False, True), Meta(program_data_pda()), Meta(pubkey(mint)),
@@ -845,7 +978,6 @@ def cmd_config_init(args: argparse.Namespace, state: State, rpc: Rpc) -> dict[st
 
 
 def cmd_multisig_create(args: argparse.Namespace, state: State, rpc: Rpc) -> dict[str, Any]:
-    genesis = cluster_guard(rpc, args.rehearsal)
     if args.threshold != 2:
         raise DeployError("threshold must be exactly 2")
     if len(args.member) != 3 or len(set(args.member)) != 3:
@@ -853,6 +985,7 @@ def cmd_multisig_create(args: argparse.Namespace, state: State, rpc: Rpc) -> dic
     members = [pubkey(value) for value in args.member]
     if args.time_lock != 172800 and not (args.rehearsal and args.time_lock == 5):
         raise DeployError("time-lock must be 172800 (only --rehearsal permits 5)")
+    genesis = cluster_guard(rpc, args.rehearsal)
     _, payer = load_keypair(args.payer)
     if state.data.get("multisig_create_key"):
         create_path = Path(state.data["multisig_create_key"])
@@ -905,7 +1038,7 @@ def cmd_multisig_create(args: argparse.Namespace, state: State, rpc: Rpc) -> dic
 
 def cmd_handover(args: argparse.Namespace, state: State, rpc: Rpc) -> dict[str, Any]:
     genesis = cluster_guard(rpc, args.rehearsal)
-    require_state(state, "deployer", "vault", "so_size")
+    require_state(state, "deployer", "vault", "so_size", "expected_sha256")
     _, payer = load_keypair(args.payer)
     if b58encode(payer) != state.data["deployer"]:
         raise DeployError("handover payer is not the recorded deployer")
@@ -929,19 +1062,25 @@ def cmd_handover(args: argparse.Namespace, state: State, rpc: Rpc) -> dict[str, 
     if program["upgrade_authority"] != state.data["vault"]:
         if program["upgrade_authority"] != b58encode(payer):
             raise DeployError("deployer no longer controls the program upgrade authority")
-        output = run_cli(
-            [
-                SOLANA, "--url", args.url, "--keypair", args.payer, "--output", "json", "program", "set-upgrade-authority", PROGRAM_ID,
-                "--upgrade-authority", args.payer, "--new-upgrade-authority", state.data["vault"],
-                "--skip-new-upgrade-authority-signer-check",
-            ]
-        )
+        with CliRpcProxy(rpc, args.rehearsal) as cli_url:
+            output = run_cli(
+                [
+                    SOLANA, "--url", cli_url, "--ws", cli_url.replace("http://", "ws://", 1),
+                    "--keypair", args.payer, "--output", "json", "program", "set-upgrade-authority", PROGRAM_ID,
+                    "--upgrade-authority", args.payer, "--new-upgrade-authority", state.data["vault"],
+                    "--skip-new-upgrade-authority-signer-check",
+                ]
+            )
         try:
             authority_signature = json.loads(output).get("signature")
         except json.JSONDecodeError:
             pass
         program = inspect_program(rpc, state.data["so_size"])
-    if program is None or program["upgrade_authority"] != state.data["vault"]:
+    if (
+        program is None
+        or program["upgrade_authority"] != state.data["vault"]
+        or program["code_sha256"] != state.data["expected_sha256"]
+    ):
         raise DeployError("program upgrade authority handover failed")
     state.data["genesis"] = genesis
     state.save()
@@ -1166,8 +1305,20 @@ def cmd_verify(args: argparse.Namespace, state: State, rpc: Rpc) -> dict[str, An
     return report
 
 
+class DeployArgumentParser(argparse.ArgumentParser):
+    def parse_args(
+        self, args: Sequence[str] | None = None, namespace: argparse.Namespace | None = None
+    ) -> argparse.Namespace:
+        parsed = super().parse_args(args, namespace)
+        try:
+            validate_rpc_url(parsed.url, parsed.rehearsal)
+        except DeployError as exc:
+            self.error(str(exc))
+        return parsed
+
+
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description=__doc__)
+    result = DeployArgumentParser(description=__doc__)
     result.add_argument("--url", default=DEVNET_RPC, help="Solana JSON-RPC URL")
     result.add_argument("--rehearsal", action="store_true", help="allow a 127.0.0.1 validator and five-second lock")
     result.add_argument(
